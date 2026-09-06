@@ -86,6 +86,29 @@ renders commits after the previous reachable tag. This is intentional: the
 workflow adds the generated `CHANGELOG.md` in a commit after the tag, so reading
 the tagged tree alone would otherwise return the previous release's changelog.
 
+## Published npm packages
+
+The same `publish` job also publishes six npm packages per release:
+`@shukelabs/baton` (the install shim) and one native package per platform —
+`@shukelabs/baton-linux-x64`, `-linux-arm64`, `-darwin-x64`, `-darwin-arm64`
+and `-win32-x64`. Each is packed with `npm pack` into `npm-tarballs/`, checked
+against `npm-SHA256SUMS` (published alongside `SHA256SUMS`), and published
+with `npm publish "./npm-tarballs/<tarball>"`. The `./` prefix is required: a
+bare `<dir>/<file>` path (no `./` or other unambiguous prefix) is parsed by
+npm as GitHub shorthand rather than a local file, which fails the publish
+before it ever reaches the registry. `tests/release_test.sh` guards this
+contract directly against the workflow file.
+
+## Backfilling an existing tag
+
+If a release is tagged but a later step (npm publish, the GitHub Release)
+fails or is skipped, don't re-run `release.yml` — it only tags whatever is
+currently at `HEAD` and cannot retarget a past tag. Instead add a temporary
+`workflow_dispatch` workflow (`backfill-<tag>.yml`) that reuses `release.yml`'s
+build/publish steps against the existing tag, dispatch it, verify the
+packages and release, then remove the temporary workflow in a follow-up PR.
+This was done for `v0.5.1`.
+
 ## Baseline and no-retag boundary
 
 v0.1.0 is the historical baseline. The next feature release from it is v0.2.0;

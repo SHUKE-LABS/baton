@@ -201,6 +201,58 @@ test_npm_pack_checksums() (
         "one npm tarball per package"
 )
 
+test_npm_publish_path_is_unambiguous() (
+    set -euo pipefail
+    local workflow publish_line repo version tarball path_expr broken_path_expr status output
+
+    workflow="${ROOT}/.github/workflows/release.yml"
+    assert_eq "1" \
+        "$(grep -c 'npm publish --access public --ignore-scripts' "${workflow}")" \
+        "exactly one npm publish invocation in release.yml"
+
+    publish_line="$(grep 'npm publish --access public --ignore-scripts' "${workflow}")"
+    path_expr="${publish_line#*--ignore-scripts }"
+    path_expr="${path_expr%%;*}"
+    read -r path_expr <<<"${path_expr}"
+    assert_eq '"./npm-tarballs/${tarball}"' "${path_expr}" \
+        "release.yml publishes an unambiguous local path"
+    broken_path_expr="$(printf '%s' "${path_expr}" | sed 's#^"\./#"#')"
+
+    # npm resolves a publish/pack argument through the same shorthand-detection
+    # stage before any command-specific or registry logic runs, so `npm pack
+    # --dry-run` reproduces the exact same misparse as `npm publish` with no
+    # network dependency: a bare "npm-tarballs/${tarball}" path is read as
+    # GitHub shorthand (repo "npm-tarballs", file "<tarball>") and npm tries a
+    # `git ls-remote` instead of reading the local file. This keeps the test
+    # fast, offline, and portable (no `timeout`/mock registry needed) while
+    # still executing release.yml's real path expression, not a rewritten copy.
+    repo="$(mktemp -d)"
+    trap 'rm -rf "${repo}"' EXIT
+    version="0.4.25"
+    make_npm_archive_fixture "${repo}" "${version}"
+    release_npm_stage_packages "${version}" "${repo}/dist" "${repo}/npm-packages"
+
+    mkdir -p "${repo}/npm-tarballs"
+    (cd "${repo}/npm-packages/baton" && \
+        npm pack --ignore-scripts --pack-destination "${repo}/npm-tarballs" >/dev/null)
+    tarball="$(cd "${repo}/npm-tarballs" && ls -1)"
+
+    output="$(cd "${repo}" && eval "GIT_SSH_COMMAND=false npm pack --dry-run --ignore-scripts ${path_expr}" 2>&1)" || true
+    if grep -qF 'ls-remote' <<<"${output}"; then
+        fail "release.yml's real path expression must not be parsed as GitHub shorthand: ${output}"
+    fi
+    if grep -qF 'ENOENT' <<<"${output}"; then
+        fail "release.yml's real path expression must resolve to the real fixture tarball: ${output}"
+    fi
+
+    status=0
+    output="$(cd "${repo}" && eval "GIT_SSH_COMMAND=false npm pack --dry-run --ignore-scripts ${broken_path_expr}" 2>&1)" || status="$?"
+    assert_eq "128" "${status}" \
+        "negative control: dropping the ./ prefix still reproduces the git-shorthand failure"
+    grep -qF 'ls-remote' <<<"${output}" || \
+        fail "negative control must show the ls-remote shorthand signature: ${output}"
+)
+
 test_npm_install_verb() (
     set -euo pipefail
     local repo version shim host_platform expected_version prefix status output before after
@@ -914,6 +966,7 @@ tests=(
     test_invalid_tags_and_bump_kinds_fail
     test_npm_platform_matrix_and_staging
     test_npm_pack_checksums
+    test_npm_publish_path_is_unambiguous
     test_npm_install_verb
     test_npm_install_hint
     test_release_docs_consistency_and_stale_detection
