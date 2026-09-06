@@ -1,76 +1,18 @@
-name: release
+name: backfill-v060
 
 on:
-  push:
-    branches: [main, master]
-
-concurrency:
-  group: release-${{ github.ref_name }}
-  cancel-in-progress: false
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing release tag to backfill (e.g. v0.6.0)
+        required: true
+        default: v0.6.0
 
 permissions:
   contents: write
 
 jobs:
-  tag:
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    outputs:
-      tag: ${{ steps.release.outputs.tag }}
-    steps:
-      - uses: actions/checkout@v5
-        with:
-          fetch-depth: 0
-
-      - name: Fetch tags
-        run: git fetch --force --tags origin
-
-      - name: Configure release identity
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-
-      - name: Calculate and apply release version
-        id: release
-        shell: bash
-        run: |
-          tag="$(bash scripts/release.sh create-tag)"
-          version="${tag#v}"
-          manifest_version="$(bash scripts/release.sh manifest-version)"
-          lockfile_version="$(bash scripts/release.sh lockfile-version)"
-          test "${manifest_version}" = "${version}"
-          test "${lockfile_version}" = "${version}"
-          bash scripts/release.sh verify-docs
-          cargo metadata --locked --no-deps --format-version 1 >/dev/null
-          printf 'tag=%s\n' "${tag}" >> "${GITHUB_OUTPUT}"
-
-      # The changelog is its own commit layered on the tagged release commit,
-      # so its parent carries the tag and the single push below ships both.
-      # [skip ci] keeps that push from re-triggering this workflow and keeps the
-      # commit out of the next release's entries.
-      - name: Regenerate changelog and release notes
-        shell: bash
-        run: |
-          tag="${{ steps.release.outputs.tag }}"
-          bash scripts/release.sh generate-changelog CHANGELOG.md
-          bash scripts/release.sh generate-release-notes "${tag}" > release-notes.md
-          if ! git diff --quiet -- CHANGELOG.md; then
-            git add CHANGELOG.md
-            git commit -m "docs: regenerate changelog [skip ci]" >/dev/null
-          fi
-
-      - name: Upload release notes
-        uses: actions/upload-artifact@v6
-        with:
-          name: release-notes
-          path: release-notes.md
-          if-no-files-found: error
-
-      - name: Push release commit and tag
-        run: git push origin "HEAD:${GITHUB_REF_NAME}" "refs/tags/${{ steps.release.outputs.tag }}"
-
   build:
-    needs: tag
     strategy:
       fail-fast: false
       matrix:
@@ -93,12 +35,12 @@ jobs:
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
     env:
-      RELEASE_TAG: ${{ needs.tag.outputs.tag }}
+      RELEASE_TAG: ${{ github.event.inputs.tag }}
       TARGET: ${{ matrix.target }}
     steps:
       - uses: actions/checkout@v5
         with:
-          ref: ${{ needs.tag.outputs.tag }}
+          ref: ${{ github.event.inputs.tag }}
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -150,15 +92,16 @@ jobs:
           if-no-files-found: error
 
   publish:
-    needs: [tag, build]
+    needs: build
     runs-on: ubuntu-latest
     timeout-minutes: 15
     env:
-      RELEASE_TAG: ${{ needs.tag.outputs.tag }}
+      RELEASE_TAG: ${{ github.event.inputs.tag }}
     steps:
       - uses: actions/checkout@v5
         with:
-          ref: ${{ needs.tag.outputs.tag }}
+          ref: ${{ github.event.inputs.tag }}
+          fetch-depth: 0
 
       - name: Set up Node.js and npm registry
         uses: actions/setup-node@v4
@@ -166,11 +109,12 @@ jobs:
           node-version: 22
           registry-url: https://registry.npmjs.org
 
-      - name: Download release notes
-        uses: actions/download-artifact@v7
-        with:
-          name: release-notes
-          path: release-notes
+      - name: Generate release notes
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p release-notes
+          bash scripts/release.sh generate-release-notes "${RELEASE_TAG}" > release-notes/release-notes.md
 
       - name: Download target archives
         uses: actions/download-artifact@v7
@@ -264,6 +208,14 @@ jobs:
         run: |
           set -euo pipefail
           version="${RELEASE_TAG#v}"
+          npm_packages=(
+            "@shukelabs/baton-linux-x64"
+            "@shukelabs/baton-linux-arm64"
+            "@shukelabs/baton-darwin-x64"
+            "@shukelabs/baton-darwin-arm64"
+            "@shukelabs/baton-win32-x64"
+            "@shukelabs/baton"
+          )
           npm_tarballs=(
             "shukelabs-baton-linux-x64-${version}.tgz"
             "shukelabs-baton-linux-arm64-${version}.tgz"
@@ -277,13 +229,33 @@ jobs:
             exit 1
           }
 
-          # npm has no multi-package transaction. All six packages and their
-          # checksums are preflighted before this loop; publish the root last
-          # so an early failure never exposes an installable root without its
-          # native platform packages. A failure reports exactly what was
-          # published so the release can be repaired without guessing.
+          # A backfill may be re-dispatched after a partial failure, so each
+          # package is checked against the registry first: a confirmed E404
+          # ("not published yet") is the only case that proceeds to publish.
+          # Any other npm-view outcome (auth, network, registry error) fails
+          # closed instead of guessing whether it is safe to publish.
+          npm_package_already_published() {
+            local spec="$1" output
+            if output="$(npm view "${spec}" version 2>&1)"; then
+              return 0
+            fi
+            if grep -q 'code E404' <<<"${output}"; then
+              return 1
+            fi
+            echo "::error::could not determine npm publish status for ${spec}" >&2
+            printf '%s\n' "${output}" >&2
+            exit 1
+          }
+
           published=()
-          for tarball in "${npm_tarballs[@]}"; do
+          skipped=()
+          for i in "${!npm_tarballs[@]}"; do
+            tarball="${npm_tarballs[${i}]}"
+            package="${npm_packages[${i}]}@${version}"
+            if npm_package_already_published "${package}"; then
+              skipped+=("${package}")
+              continue
+            fi
             if npm publish --access public --ignore-scripts "./npm-tarballs/${tarball}"; then
               published+=("${tarball}")
             else
@@ -292,6 +264,8 @@ jobs:
               exit 1
             fi
           done
+          printf 'published: %s\n' "${published[*]:-none}"
+          printf 'already on the registry (skipped): %s\n' "${skipped[*]:-none}"
 
       - name: Stage and publish release
         shell: bash
@@ -312,8 +286,19 @@ jobs:
             upload_paths+=("dist/${asset}")
           done
 
-          # Keep the release draft until every asset upload succeeds; a failed
-          # upload therefore cannot expose an incomplete release to consumers.
+          # Fail closed if a release for this tag already exists rather than
+          # guessing whether it is safe to recreate it: a confirmed
+          # "release not found" is the only case that proceeds.
+          release_view_output="$(gh release view "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" 2>&1)" && {
+            echo "::error::release ${RELEASE_TAG} already exists; refusing to recreate it"
+            exit 1
+          }
+          if ! grep -qi 'release not found' <<<"${release_view_output}"; then
+            echo "::error::could not determine release status for ${RELEASE_TAG}" >&2
+            printf '%s\n' "${release_view_output}" >&2
+            exit 1
+          fi
+
           gh release create "${RELEASE_TAG}" \
             --repo "${GITHUB_REPOSITORY}" \
             --verify-tag \

@@ -201,6 +201,59 @@ test_npm_pack_checksums() (
         "one npm tarball per package"
 )
 
+test_npm_publish_path_is_unambiguous() (
+    set -euo pipefail
+    local workflow repo version package_dir tarball path_expr status output
+    local unreachable_registry='http://127.0.0.1:1/'
+
+    workflow="${ROOT}/.github/workflows/release.yml"
+    assert_eq "1" \
+        "$(grep -c 'npm publish --access public --ignore-scripts' "${workflow}")" \
+        "exactly one npm publish invocation in release.yml"
+
+    path_expr="$(grep -oP '(?<=npm publish --access public --ignore-scripts )"[^"]*"' "${workflow}")"
+    assert_eq '"./npm-tarballs/${tarball}"' "${path_expr}" \
+        "release.yml publishes an unambiguous local path"
+
+    # A bare "npm-tarballs/${tarball}" path is misparsed by npm as GitHub
+    # shorthand (repo "npm-tarballs", file "<tarball>"), so it tries a
+    # `git ls-remote` instead of reading the local file. Exercise the real
+    # command from release.yml against a real tarball to prove it is not
+    # misparsed, using GIT_SSH_COMMAND=false and an unreachable registry so
+    # this stays fast and offline either way: the shorthand path fails within
+    # git before any registry call, so it still reproduces rc 128 here.
+    repo="$(mktemp -d)"
+    trap 'rm -rf "${repo}"' EXIT
+    version="0.4.25"
+    make_npm_archive_fixture "${repo}" "${version}"
+    release_npm_stage_packages "${version}" "${repo}/dist" "${repo}/npm-packages"
+
+    mkdir -p "${repo}/npm-tarballs"
+    package_dir="baton"
+    (cd "${repo}/npm-packages/${package_dir}" && \
+        npm pack --ignore-scripts --pack-destination "${repo}/npm-tarballs" >/dev/null)
+    tarball="$(find "${repo}/npm-tarballs" -maxdepth 1 -type f -name '*.tgz' -printf '%f\n')"
+
+    output="$(cd "${repo}" && GIT_SSH_COMMAND=false timeout 5 \
+        npm publish --dry-run --registry="${unreachable_registry}" \
+            --access public --ignore-scripts "./npm-tarballs/${tarball}" 2>&1)" || true
+    if grep -qF 'ls-remote' <<<"${output}"; then
+        fail "the fixed (./) path must not be parsed as GitHub shorthand: ${output}"
+    fi
+    if grep -qF 'ENOENT' <<<"${output}"; then
+        fail "the fixed (./) path must resolve to the real fixture tarball: ${output}"
+    fi
+
+    status=0
+    output="$(cd "${repo}" && GIT_SSH_COMMAND=false timeout 5 \
+        npm publish --dry-run --registry="${unreachable_registry}" \
+            --access public --ignore-scripts "npm-tarballs/${tarball}" 2>&1)" || status="$?"
+    assert_eq "128" "${status}" \
+        "negative control: the bare path still reproduces the git-shorthand failure"
+    grep -qF 'ls-remote' <<<"${output}" || \
+        fail "negative control must show the ls-remote shorthand signature: ${output}"
+)
+
 test_npm_install_verb() (
     set -euo pipefail
     local repo version shim host_platform expected_version prefix status output before after
@@ -914,6 +967,7 @@ tests=(
     test_invalid_tags_and_bump_kinds_fail
     test_npm_platform_matrix_and_staging
     test_npm_pack_checksums
+    test_npm_publish_path_is_unambiguous
     test_npm_install_verb
     test_npm_install_hint
     test_release_docs_consistency_and_stale_detection
