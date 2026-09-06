@@ -107,7 +107,7 @@ currently at `HEAD` and cannot retarget a past tag. Instead add a temporary
 `workflow_dispatch` workflow (`backfill-<tag>.yml`) that reuses `release.yml`'s
 build/publish steps against the existing tag, dispatch it, verify the
 packages and release, then remove the temporary workflow in a follow-up PR.
-This was done for `v0.5.1` and `v0.6.0`.
+This was done for `v0.5.1`.
 
 ## Baseline and no-retag boundary
 
