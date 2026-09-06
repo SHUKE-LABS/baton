@@ -10,6 +10,11 @@ versioning.
 
 _Generated from release tags with `bash scripts/release.sh generate-changelog`._
 
+## v0.6.1 (2026-09-06)
+
+### Fixes
+- fix(release): use unambiguous local path for npm publish (#346)
+
 ## v0.6.0 … v0.5.0 (2026-09-05)
 
 ### Features
