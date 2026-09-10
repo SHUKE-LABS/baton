@@ -10,6 +10,11 @@ versioning.
 
 _Generated from release tags with `bash scripts/release.sh generate-changelog`._
 
+## v0.6.2 (2026-09-10)
+
+### Docs
+- docs: add reciprocal pointer to leg CLI client (#344)
+
 ## v0.6.1 (2026-09-06)
 
 ### Fixes
