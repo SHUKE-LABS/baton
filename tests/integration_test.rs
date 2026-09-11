@@ -6017,8 +6017,17 @@ fn service_stop_serializes_task_admission_and_reaps_owned_tasks() {
         "rejected racing task must not spawn"
     );
 
+    // `service stop`'s own kill ladder (session STOP_GRACE_MS/KILL_GRACE_MS,
+    // then the admitted task's KILL_GRACE_MS ladder) already ran inside the
+    // awaited command above, but full convergence — the daemon's own
+    // supervisor tick reconciling any residue left by that bounded ladder —
+    // is eventually consistent, not guaranteed by the time this loop starts.
+    // 100 * 50ms (5s) undersizes it relative to the documented worst case
+    // (STOP_GRACE_MS + 2×KILL_GRACE_MS for the session, then 2×KILL_GRACE_MS
+    // for the task) under CI scheduling load; widen to the 10s budget already
+    // used for other eventually-consistent daemon waits in this file.
     let mut admitted_reaped = false;
-    for _ in 0..100 {
+    for _ in 0..200 {
         let status = Command::new(env!("CARGO_BIN_EXE_baton"))
             .args(["task", "status", "--control", control_str])
             .output()
