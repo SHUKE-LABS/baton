@@ -10,6 +10,11 @@ versioning.
 
 _Generated from release tags with `bash scripts/release.sh generate-changelog`._
 
+## v0.7.0 (2026-09-11)
+
+### Features
+- feat!: slim baton to a harness-only default build (#339) (#348)
+
 ## v0.6.2 (2026-09-10)
 
 ### Docs
