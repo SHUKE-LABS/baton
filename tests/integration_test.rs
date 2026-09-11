@@ -18,6 +18,9 @@ use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+// Every `thread` user is either a Unix process-parentage test or a local-mode
+// fake, so a Windows default-feature build has no use for the import.
+#[cfg(any(unix, feature = "local"))]
 use std::thread;
 use std::time::Duration;
 
@@ -2138,6 +2141,7 @@ fn spawn_ring_serve(member_root: &Path, stub: &Path) -> std::process::Child {
 }
 
 /// Cooperatively stops the `serve` daemon consuming `<root>/inbox`.
+#[cfg(unix)]
 fn stop_ring_serve(member_root: &Path) {
     let _ = Command::new(env!("CARGO_BIN_EXE_baton"))
         .args([
@@ -7907,11 +7911,14 @@ fn log_merge_nonexistent_path_is_stat_error() {
 // fails here rather than shipping silently.
 // ---------------------------------------------------------------------------
 
-/// A unique self-cleaning temp `BATON_HOME` root, keyed by pid + tag.
+/// A unique self-cleaning temp `BATON_HOME` root, keyed by pid + tag. Only the
+/// Unix external-agent and local-mode `--role` tests use it.
+#[cfg(any(unix, feature = "local"))]
 struct TempHome {
     path: PathBuf,
 }
 
+#[cfg(any(unix, feature = "local"))]
 impl TempHome {
     fn new(tag: &str) -> Self {
         let path = std::env::temp_dir().join(format!("baton-home-{}-{}", std::process::id(), tag));
@@ -7939,6 +7946,7 @@ impl TempHome {
     }
 }
 
+#[cfg(any(unix, feature = "local"))]
 impl Drop for TempHome {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.path);
@@ -8034,6 +8042,7 @@ printf '%s' '{reply}'
 
 /// Sends one request into `inbox` and awaits its reply from `outbox`, with a
 /// hermetic (cleared) environment — `send` needs no provider configuration.
+#[cfg(any(unix, feature = "local"))]
 fn send_awaiting_reply(
     inbox: &Path,
     outbox: &Path,
@@ -8065,6 +8074,7 @@ fn send_awaiting_reply(
 
 /// Stops a live `serve` daemon and reaps it, returning both outputs. Called
 /// before any assertion so a failure cannot leave a daemon behind.
+#[cfg(any(unix, feature = "local"))]
 fn stop_and_reap(
     inbox: &Path,
     serve_child: std::process::Child,
