@@ -10,12 +10,15 @@ versioning.
 
 _Generated from release tags with `bash scripts/release.sh generate-changelog`._
 
-## v0.9.0 … v0.7.0 (2026-09-11)
+## v0.9.1 … v0.7.0 (2026-09-11)
 
 ### Features
 - feat!: slim baton to a harness-only default build (#339) (#348)
 - feat: grouped per-command help and bare-invocation help (#347) (#349)
 - feat(service status): publish live daemon's exe and version (#351)
+
+### Fixes
+- fix(tests): widen service-stop reap wait budget to cover documented worst case (#354)
 
 ## v0.6.2 (2026-09-10)
 
