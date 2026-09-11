@@ -139,7 +139,15 @@ baton service teardown [--control <dir>] [--force]
   failure to deliver a response at all leaves the request unanswered; `run`
   warns and keeps polling, and the client falls back to the await timeout.
 - **`service status`** reports the service's own liveness plus every session's
-  (or just `--session <id>`'s). A session record that fails to parse as JSON
+  (or just `--session <id>`'s). While a daemon is live, it also reports its
+  self-recorded identity as `daemon.exe` (its absolute, OS-native, unnormalized
+  executable path) and `daemon.version` (`"baton X.Y.Z"`), letting a client
+  detect "the service owns this endpoint but is not my binary" without
+  attempting `service start`. `daemon` is omitted entirely — not `null` —
+  when `service_running` is `false`, and also when a live daemon's identity
+  file is missing or unreadable (e.g. a crash between acquiring the control
+  lock and finishing that write); either way `service status` still succeeds.
+  A session record that fails to parse as JSON
   (e.g. truncated by a crash mid-write) is skipped with a `warning: skipping
   malformed session record ...` line on stderr; the remaining healthy records
   are still reported. Each record retains the compatibility boolean

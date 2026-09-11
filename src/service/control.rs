@@ -73,6 +73,11 @@ pub(super) const CONTROL_PROBE_LOCK_FILE: &str = "service.probe.lock";
 /// Name of the cooperative-stop sentinel at the control root, mirroring
 /// [`mailbox`]'s `serve.stop`.
 pub(super) const CONTROL_STOP_FILE: &str = "service.stop";
+/// Name of the live daemon's self-recorded identity file at the control
+/// root, written by [`run_service`] and read by [`execute_status`] so a
+/// client can tell "the service owns this endpoint but is not my binary"
+/// without attempting `service start`.
+pub(super) const CONTROL_INFO_FILE: &str = "service.info.json";
 /// Interval between `Run`'s request-directory scans, and between polls of
 /// a pending await (start response, stop/kill grace).
 pub(super) const POLL_INTERVAL_MS: u64 = 100;
@@ -153,6 +158,13 @@ pub(super) fn run_service<P: ServicePlatform>(
         ))
     })?;
     let lock = acquire_control_lock(control)?;
+    let info = DaemonInfo {
+        exe: current_baton_exe()?.display().to_string(),
+        version: format!("baton {}", env!("CARGO_PKG_VERSION")),
+    };
+    let info_json = serde_json::to_string(&info)
+        .map_err(|err| BatonError::Io(format!("could not serialize daemon info: {err}")))?;
+    mailbox::atomic_write(control, CONTROL_INFO_FILE, &info_json)?;
     // Discard any stale sentinel a prior instance left, so a fresh start
     // is never killed by a stop meant for an earlier run.
     let _ = fs::remove_file(control.join(CONTROL_STOP_FILE));
@@ -239,6 +251,9 @@ pub(super) fn run_service<P: ServicePlatform>(
         }
     }
 
+    // A subsequent `service_running:false` status must never report a
+    // stale daemon identity from this exited instance.
+    let _ = fs::remove_file(control.join(CONTROL_INFO_FILE));
     // `service teardown` waits for this lock to be released before it
     // snapshots and stops session records. Waiting for children here would
     // delay that admission barrier while the sessions are still live; the
@@ -1611,11 +1626,31 @@ struct SessionStatusView<'a> {
     stderr_path: &'a str,
 }
 
+/// A live daemon's self-recorded identity, written by [`run_service`] into
+/// [`CONTROL_INFO_FILE`] and surfaced by [`execute_status`] so a client can
+/// diff it against its own resolved binary.
+#[derive(Serialize, Deserialize)]
+struct DaemonInfo {
+    exe: String,
+    version: String,
+}
+
 #[derive(Serialize)]
 struct ServiceStatusView<'a> {
     service_running: bool,
     control: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    daemon: Option<DaemonInfo>,
     sessions: Vec<SessionStatusView<'a>>,
+}
+
+/// Reads and parses [`CONTROL_INFO_FILE`], returning `None` on any failure
+/// (missing file, truncated/invalid JSON) rather than erroring — a daemon
+/// that crashed between acquiring the control lock and finishing this
+/// write must never turn `service status` into a hard failure.
+fn read_daemon_info(control: &Path) -> Option<DaemonInfo> {
+    let contents = fs::read_to_string(control.join(CONTROL_INFO_FILE)).ok()?;
+    serde_json::from_str(&contents).ok()
 }
 
 pub(super) fn execute_status(
@@ -1624,6 +1659,7 @@ pub(super) fn execute_status(
     mut out: impl Write,
 ) -> Result<()> {
     let service_running = probe_control(control)? == ControlLiveness::Live;
+    let daemon = service_running.then(|| read_daemon_info(control)).flatten();
     let records = match session {
         Some(id) => read_session_record(control, id)?.into_iter().collect(),
         None => list_session_records(control)?,
@@ -1646,6 +1682,7 @@ pub(super) fn execute_status(
     let view = ServiceStatusView {
         service_running,
         control: control.display().to_string(),
+        daemon,
         sessions,
     };
     let json = serde_json::to_string(&view)
