@@ -182,6 +182,37 @@ fn global_help_and_version_flags_succeed_without_configuration() {
     }
 }
 
+#[test]
+fn bare_invocation_prints_help_and_succeeds() {
+    let bare = Command::new(env!("CARGO_BIN_EXE_baton"))
+        .env_remove("ANTHROPIC_API_KEY")
+        .env_remove("ANTHROPIC_AUTH_TOKEN")
+        .env_remove("CLAUDE_CODE_OAUTH_TOKEN")
+        .output()
+        .expect("run bare baton");
+    assert!(
+        bare.status.success(),
+        "bare invocation should succeed; stderr: {}",
+        String::from_utf8_lossy(&bare.stderr)
+    );
+    assert!(
+        bare.stderr.is_empty(),
+        "bare invocation stderr must be empty"
+    );
+
+    let help = Command::new(env!("CARGO_BIN_EXE_baton"))
+        .arg("--help")
+        .env_remove("ANTHROPIC_API_KEY")
+        .env_remove("ANTHROPIC_AUTH_TOKEN")
+        .env_remove("CLAUDE_CODE_OAUTH_TOKEN")
+        .output()
+        .expect("run baton --help");
+    assert_eq!(
+        bare.stdout, help.stdout,
+        "bare invocation must match --help"
+    );
+}
+
 /// A single-shot mock HTTP server bound to a kernel-assigned port on
 /// `127.0.0.1`. The first request receives `status` + `body` and the
 /// connection is closed. `hold_open` controls whether the connection is

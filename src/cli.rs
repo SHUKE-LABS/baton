@@ -62,8 +62,73 @@ use crate::transport::claude::ClaudeClient;
 /// recording is disabled.
 pub const EVENT_LOG_ENV: &str = "BATON_EVENT_LOG";
 
-/// One-line usage summary, appended to argument errors.
-pub const USAGE: &str = "usage: baton ask -p|--prompt <text> | baton session [--role <name>] [--resume <file> [--session <id>]] | baton exchange [--in <path>] [--out <path>] | baton converse [--a-system <path>] [--b-system <path>] [--a-model <id>] [--b-model <id>] [--b-mailbox --b-inbox <dir> --b-outbox <dir> [--b-await-ms <n>]] (--seed <text> | --seed-file <path>) [--out <path>] | baton converse-ring --registry <path> --roster <a,b,c> (--seed <text> | --seed-file <path>) [--await-ms <n>] [--out <path>] | baton serve --inbox <dir> --outbox <dir> [--poll-ms <n>] [--once] [--agent-cmd <program> [--agent-arg <arg>]... [--agent-cwd <dir>] [--agent-timeout-ms <n>] [--agent-output raw|json [--agent-result-key <key>]]] [--role <name>] | baton serve --stop --inbox <dir> | baton send (--inbox <dir> | --registry <path>) (--body <text> [--to <role>] | --in <path>) [--from <id>] [--conversation <id>] [--await [--outbox <dir>] [--timeout-ms <n>]] | baton status (--mailbox <root> | --registry <path> --role <role>) [--max-runtime-ms <n>] | baton mailbox prune --mailbox <root> --older-than <duration> | baton log show [--file <path>] | baton log replay [--file <path>] [--index <N>] | baton log merge --conversation <id> <trail>... | baton roles | baton role show <name> | baton service run [--control <dir>] [--task-retention <duration>] | baton service start [--control <dir>] --inbox <dir> --outbox <dir> [--poll-ms <n>] [--agent-cmd <program> [--agent-arg <arg>]... [--agent-cwd <dir>] [--agent-timeout-ms <n>] [--agent-output raw|json [--agent-result-key <key>]]] [--role <name>] | baton service status [--control <dir>] [--session <id>] | baton service stop [--control <dir>] --session <id> [--force] | baton service teardown [--control <dir>] [--force] | baton task start [--control <dir>] --session <id> --command <program> [--arg <arg>]... [--cwd <dir>] [--env KEY=VALUE]... [--milestone-ms <n>]... --max-duration-ms <n> --callback-inbox <dir> [--callback-role <name>] | baton task status [--control <dir>] [--task <id>] | baton task cancel [--control <dir>] --task <id>";
+/// Grouped per-command usage reference, printed by `baton --help` / bare
+/// `baton` and appended to argument errors. One block per command: its
+/// synopsis line(s), then a one-sentence description. A command whose
+/// dispatch is gated by `#[cfg(feature = "local")]` unconditionally (not just
+/// under a specific flag combination, e.g. `serve --agent-cmd`) says so.
+pub const USAGE: &str = concat!(
+    "usage: baton <command> [options]\n",
+    "\n",
+    "baton ask -p|--prompt <text>\n",
+    "    Send a single prompt and print the assistant reply. Requires the `local` feature.\n",
+    "\n",
+    "baton session [--role <name>] [--resume <file> [--session <id>]]\n",
+    "    Run an interactive multi-turn REPL, optionally resuming a prior session. Requires the `local` feature.\n",
+    "\n",
+    "baton exchange [--in <path>] [--out <path>]\n",
+    "    Run one A2A envelope exchange, reading a request and writing a response. Requires the `local` feature.\n",
+    "\n",
+    "baton converse [--a-system <path>] [--b-system <path>] [--a-model <id>] [--b-model <id>] [--b-mailbox --b-inbox <dir> --b-outbox <dir> [--b-await-ms <n>]] (--seed <text> | --seed-file <path>) [--out <path>]\n",
+    "    Drive a governed two-participant conversation from a seed. Requires the `local` feature.\n",
+    "\n",
+    "baton converse-ring --registry <path> --roster <a,b,c> (--seed <text> | --seed-file <path>) [--await-ms <n>] [--out <path>]\n",
+    "    Drive an N-party round-robin conversation across registry-resolved mailbox peers.\n",
+    "\n",
+    "baton serve --inbox <dir> --outbox <dir> [--poll-ms <n>] [--once] [--agent-cmd <program> [--agent-arg <arg>]... [--agent-cwd <dir>] [--agent-timeout-ms <n>] [--agent-output raw|json [--agent-result-key <key>]]] [--role <name>]\n",
+    "baton serve --stop --inbox <dir>\n",
+    "    Drain a mailbox with an external agent (`--agent-cmd`) or in-process provider; `--stop` requests a cooperative shutdown of a running daemon.\n",
+    "\n",
+    "baton send (--inbox <dir> | --registry <path>) (--body <text> [--to <role>] | --in <path>) [--from <id>] [--conversation <id>] [--await [--outbox <dir>] [--timeout-ms <n>]]\n",
+    "    Deliver one message to a mailbox or registry-resolved role, optionally awaiting the reply.\n",
+    "\n",
+    "baton status (--mailbox <root> | --registry <path> --role <role>) [--max-runtime-ms <n>]\n",
+    "    Report a mailbox's claim and health status.\n",
+    "\n",
+    "baton mailbox prune --mailbox <root> --older-than <duration>\n",
+    "    Delete done mailbox entries older than a duration.\n",
+    "\n",
+    "baton log show [--file <path>]\n",
+    "    Print the recorded exchanges from a log.\n",
+    "baton log replay [--file <path>] [--index <N>]\n",
+    "    Re-run a recorded exchange against the current credential. Requires the `local` feature.\n",
+    "baton log merge --conversation <id> <trail>...\n",
+    "    Merge and print multiple message trails.\n",
+    "\n",
+    "baton roles\n",
+    "    List configured role names.\n",
+    "\n",
+    "baton role show <name>\n",
+    "    Print one role's resolved identity.\n",
+    "\n",
+    "baton service run [--control <dir>] [--task-retention <duration>]\n",
+    "    Run the service control-plane loop.\n",
+    "baton service start [--control <dir>] --inbox <dir> --outbox <dir> [--poll-ms <n>] [--agent-cmd <program> [--agent-arg <arg>]... [--agent-cwd <dir>] [--agent-timeout-ms <n>] [--agent-output raw|json [--agent-result-key <key>]]] [--role <name>]\n",
+    "    Start a supervised service session.\n",
+    "baton service status [--control <dir>] [--session <id>]\n",
+    "    Report a service session's status.\n",
+    "baton service stop [--control <dir>] --session <id> [--force]\n",
+    "    Stop a service session.\n",
+    "baton service teardown [--control <dir>] [--force]\n",
+    "    Tear down the service control plane.\n",
+    "\n",
+    "baton task start [--control <dir>] --session <id> --command <program> [--arg <arg>]... [--cwd <dir>] [--env KEY=VALUE]... [--milestone-ms <n>]... --max-duration-ms <n> --callback-inbox <dir> [--callback-role <name>]\n",
+    "    Start a supervised task under a service session.\n",
+    "baton task status [--control <dir>] [--task <id>]\n",
+    "    Report a task's status.\n",
+    "baton task cancel [--control <dir>] --task <id>\n",
+    "    Cancel a running task."
+);
 
 /// Default `baton serve` inbox poll interval, in milliseconds, when `--poll-ms`
 /// is unset.
@@ -2109,7 +2174,13 @@ fn open_append_sink(path: &str) -> Result<Box<dyn EventSink>> {
 /// Pure and environment-free so every branch is unit-testable.
 fn parse_args(args: &[String]) -> Result<Command> {
     let mut iter = args.iter();
-    let command = iter.next().ok_or_else(|| usage("no command given"))?;
+    // A bare `baton` invocation prints help and exits 0, matching `--help`,
+    // rather than erroring — there is nothing to correct, so a usage error
+    // would be misleading.
+    let command = match iter.next() {
+        Some(command) => command,
+        None => return Ok(Command::Help),
+    };
     match command.as_str() {
         "--help" | "-h" => Ok(Command::Help),
         "--version" | "-V" => Ok(Command::Version),
@@ -3651,9 +3722,13 @@ fn parse_poll_ms(raw: &str) -> Result<u64> {
     parse_positive_ms(raw, "--poll-ms")
 }
 
-/// Builds a usage error carrying `detail` and the one-line usage summary.
+/// Builds a usage error carrying `detail` and a pointer to full help.
+///
+/// The grouped, multi-line [`USAGE`] reference is deliberately not embedded
+/// here: dumping the full reference on every malformed flag would bury
+/// `detail` and read like `--help` output rather than an error.
 fn usage(detail: &str) -> BatonError {
-    BatonError::Usage(format!("{detail}\n{USAGE}"))
+    BatonError::Usage(format!("{detail}\nrun 'baton --help' for usage."))
 }
 
 /// Builds the error a provider-backed verb returns under the default,
@@ -3738,7 +3813,7 @@ mod tests {
         // `log show|replay [--file <path>] [--index <N>]`, advertising an
         // `--index` that `show` rejects (see `index_flag_on_show_is_usage_error`).
         assert!(
-            USAGE.contains("baton log show [--file <path>] |"),
+            USAGE.contains("baton log show [--file <path>]\n"),
             "{USAGE}"
         );
         assert!(
@@ -3757,6 +3832,16 @@ mod tests {
         for alias in ["-h", "--help", "-V", "--version"] {
             assert!(help.contains(alias), "help documents {alias}: {help}");
         }
+        // Every command block has its own synopsis + description; spot-check
+        // a representative sample rather than every one of them.
+        for header in [
+            "baton ask -p|--prompt <text>",
+            "baton serve --stop --inbox <dir>",
+            "baton service teardown [--control <dir>] [--force]",
+            "baton task cancel [--control <dir>] --task <id>",
+        ] {
+            assert!(help.contains(header), "help documents {header}: {help}");
+        }
 
         let mut version = Vec::new();
         execute_version(&mut version).expect("render version");
@@ -3767,11 +3852,11 @@ mod tests {
     }
 
     #[test]
-    fn no_command_is_usage_error() {
-        assert!(matches!(
-            parse_args(&argv(&[])).unwrap_err(),
-            BatonError::Usage(_)
-        ));
+    fn no_command_prints_help() {
+        assert_eq!(
+            parse_args(&argv(&[])).expect("bare invocation"),
+            Command::Help
+        );
     }
 
     #[test]
