@@ -2546,14 +2546,18 @@ fn service_liveness_keys_ignore_supervisor_and_client_environment() {
         thread::sleep(Duration::from_millis(50));
     }
     let live_status_json = live_status_json.expect("macOS service run did not report live in time");
+    // Canonicalize only the test's own expected literal, to absorb macOS's
+    // `/tmp` -> `/private/tmp` symlink in `CARGO_BIN_EXE_baton`'s path — the
+    // production `daemon.exe` value itself must stay exactly what the
+    // running process's own `current_exe()` reported, uncanonicalized, per
+    // the unnormalized-path contract.
     let expected_exe = std::fs::canonicalize(env!("CARGO_BIN_EXE_baton"))
         .expect("canonicalize CARGO_BIN_EXE_baton");
-    let actual_exe = std::fs::canonicalize(
+    let actual_exe = std::path::PathBuf::from(
         live_status_json["daemon"]["exe"]
             .as_str()
             .expect("live status reports daemon.exe"),
-    )
-    .expect("canonicalize daemon.exe");
+    );
     assert_eq!(
         actual_exe, expected_exe,
         "live daemon.exe must resolve to the spawned baton binary"
