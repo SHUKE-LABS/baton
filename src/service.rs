@@ -226,11 +226,11 @@ mod imp {
     };
     #[cfg(test)]
     use super::control::{
-        AdmissionGuard, CONTROL_STOP_FILE, ControlLiveness, KILL_GRACE_MS, SessionStopGuard,
-        SessionStopMarker, TASK_CONFIRM_READS, TASK_FULL_LISTINGS, acquire_control_lock,
-        await_start_response, execute_teardown_with_timeout, handle_start_request, probe_control,
-        reap_session_tasks_with_wait, request_control_stop, session_logs_dir,
-        stop_session_record_with_wait, take_task_start_response,
+        AdmissionGuard, CONTROL_INFO_FILE, CONTROL_STOP_FILE, ControlLiveness, KILL_GRACE_MS,
+        SessionStopGuard, SessionStopMarker, TASK_CONFIRM_READS, TASK_FULL_LISTINGS,
+        acquire_control_lock, await_start_response, execute_teardown_with_timeout,
+        handle_start_request, probe_control, reap_session_tasks_with_wait, request_control_stop,
+        session_logs_dir, stop_session_record_with_wait, take_task_start_response,
         wait_for_control_release_with_timeout,
     };
     use super::control::{
@@ -3048,6 +3048,58 @@ mod imp {
             assert_eq!(sessions[0]["id"], "svc-1");
             assert_eq!(sessions[0]["live"], false);
             assert_eq!(sessions[0]["liveness"], "dead");
+        }
+
+        /// A stray `service.info.json` with no lock held must not surface a
+        /// `daemon` field: the read is gated on liveness, not merely on the
+        /// file's presence.
+        #[test]
+        fn execute_status_omits_stale_daemon_info_when_not_live() {
+            let _guard = serialize_forks_and_locks();
+            let dir = TempDir::new("status-stale-daemon-info");
+            let info = serde_json::json!({"exe": "/old/baton", "version": "baton 0.1.0"});
+            mailbox::atomic_write(&dir.path, CONTROL_INFO_FILE, &info.to_string())
+                .expect("write stale info");
+
+            let mut out = Vec::new();
+            execute_status(&dir.path, None, &mut out).expect("status");
+            let json: serde_json::Value = serde_json::from_slice(&out).expect("json");
+            assert_eq!(json["service_running"], false);
+            assert!(json.get("daemon").is_none());
+        }
+
+        /// A live daemon whose info file was never written (crash between
+        /// acquiring the control lock and finishing the write) must still
+        /// answer `service status` successfully, with `daemon` omitted.
+        #[test]
+        fn execute_status_omits_daemon_when_info_file_missing() {
+            let _guard = serialize_forks_and_locks();
+            let dir = TempDir::new("status-daemon-info-missing");
+            let _held = acquire_control_lock(&dir.path).expect("lock");
+
+            let mut out = Vec::new();
+            execute_status(&dir.path, None, &mut out).expect("status");
+            let json: serde_json::Value = serde_json::from_slice(&out).expect("json");
+            assert_eq!(json["service_running"], true);
+            assert!(json.get("daemon").is_none());
+        }
+
+        /// A live daemon whose info file was written mid-truncation (a
+        /// parse-failure race) must still answer `service status`
+        /// successfully, with `daemon` omitted rather than an error.
+        #[test]
+        fn execute_status_omits_daemon_when_info_file_invalid() {
+            let _guard = serialize_forks_and_locks();
+            let dir = TempDir::new("status-daemon-info-invalid");
+            let _held = acquire_control_lock(&dir.path).expect("lock");
+            mailbox::atomic_write(&dir.path, CONTROL_INFO_FILE, "{\"exe\": \"/broken")
+                .expect("write invalid info");
+
+            let mut out = Vec::new();
+            execute_status(&dir.path, None, &mut out).expect("status");
+            let json: serde_json::Value = serde_json::from_slice(&out).expect("json");
+            assert_eq!(json["service_running"], true);
+            assert!(json.get("daemon").is_none());
         }
 
         /// A non-force `service stop` with only terminal task history

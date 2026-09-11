@@ -2532,20 +2532,45 @@ fn service_liveness_keys_ignore_supervisor_and_client_environment() {
         "--control".to_string(),
         control_str.clone(),
     ];
-    let mut service_live = false;
+    let mut live_status_json: Option<serde_json::Value> = None;
     for _ in 0..100 {
         let status = cli(&status_args);
-        if status.status.success()
-            && String::from_utf8_lossy(&status.stdout).contains("\"service_running\":true")
-        {
-            service_live = true;
-            break;
+        if status.status.success() {
+            let json: serde_json::Value =
+                serde_json::from_slice(&status.stdout).expect("live status is JSON");
+            // `service_running:true` can be observed before `run_service`
+            // finishes writing `service.info.json` (the lock is taken first);
+            // keep polling through that startup race until `daemon` itself
+            // is populated, not just liveness.
+            if json["service_running"] == true && json["daemon"].is_object() {
+                live_status_json = Some(json);
+                break;
+            }
         }
         thread::sleep(Duration::from_millis(50));
     }
-    assert!(
-        service_live,
-        "macOS service run did not report live in time"
+    let live_status_json =
+        live_status_json.expect("macOS service run did not report a live daemon identity in time");
+    // Canonicalize only the test's own expected literal, to absorb macOS's
+    // `/tmp` -> `/private/tmp` symlink in `CARGO_BIN_EXE_baton`'s path — the
+    // production `daemon.exe` value itself must stay exactly what the
+    // running process's own `current_exe()` reported, uncanonicalized, per
+    // the unnormalized-path contract.
+    let expected_exe = std::fs::canonicalize(env!("CARGO_BIN_EXE_baton"))
+        .expect("canonicalize CARGO_BIN_EXE_baton");
+    let actual_exe = std::path::PathBuf::from(
+        live_status_json["daemon"]["exe"]
+            .as_str()
+            .expect("live status reports daemon.exe"),
+    );
+    assert_eq!(
+        actual_exe, expected_exe,
+        "live daemon.exe must resolve to the spawned baton binary"
+    );
+    assert_eq!(
+        live_status_json["daemon"]["version"],
+        format!("baton {}", env!("CARGO_PKG_VERSION")),
+        "live daemon.version must match the crate's own version"
     );
 
     let start_args = vec![
@@ -2792,6 +2817,10 @@ fn service_liveness_keys_ignore_supervisor_and_client_environment() {
     let final_json: serde_json::Value =
         serde_json::from_slice(&final_status.stdout).expect("final status is JSON");
     assert_eq!(final_json["service_running"], false);
+    assert!(
+        final_json.get("daemon").is_none(),
+        "teardown must clear the daemon identity from a subsequent status"
+    );
     assert!(
         final_json["sessions"].as_array().unwrap().is_empty(),
         "cross-environment teardown removes every session record"
