@@ -9,6 +9,7 @@
 ///
 /// Maps 1:1 onto the Messages API `role` field; [`Role::as_str`] is the wire
 /// value the transport serializes.
+#[cfg(feature = "local")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Role {
     /// A turn authored by the user / calling agent.
@@ -17,6 +18,7 @@ pub enum Role {
     Assistant,
 }
 
+#[cfg(feature = "local")]
 impl Role {
     /// The Messages API wire value for this role.
     pub fn as_str(self) -> &'static str {
@@ -28,6 +30,7 @@ impl Role {
 }
 
 /// A single role-tagged turn in a conversation.
+#[cfg(feature = "local")]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Message {
     /// Who authored this turn.
@@ -36,6 +39,7 @@ pub struct Message {
     pub content: String,
 }
 
+#[cfg(feature = "local")]
 impl Message {
     /// Creates a user turn from anything string-like.
     pub fn user(content: impl Into<String>) -> Self {
@@ -60,11 +64,13 @@ impl Message {
 /// in order, and [`Conversation::messages`] returns the full history that is
 /// resent with every request. It deliberately holds no provider state — it is
 /// pure data the transport reads.
+#[cfg(feature = "local")]
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Conversation {
     messages: Vec<Message>,
 }
 
+#[cfg(feature = "local")]
 impl Conversation {
     /// Creates an empty conversation.
     pub fn new() -> Self {
@@ -107,12 +113,14 @@ impl Conversation {
 }
 
 /// A single user prompt to send to the provider.
+#[cfg(feature = "local")]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Prompt {
     /// The prompt text.
     pub text: String,
 }
 
+#[cfg(feature = "local")]
 impl Prompt {
     /// Creates a prompt from anything string-like.
     pub fn new(text: impl Into<String>) -> Self {
@@ -179,15 +187,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn prompt_new_accepts_str_and_string() {
-        assert_eq!(Prompt::new("hi"), Prompt::new(String::from("hi")));
-        assert_eq!(Prompt::new("hi").text, "hi");
-    }
-
-    #[test]
     fn reply_new_stores_text() {
         assert_eq!(AssistantReply::new("ok").text, "ok");
         assert_eq!(AssistantReply::new("ok").stop_reason, None);
+    }
+}
+
+#[cfg(all(test, feature = "local"))]
+mod local_tests {
+    use super::*;
+
+    #[test]
+    fn prompt_new_accepts_str_and_string() {
+        assert_eq!(Prompt::new("hi"), Prompt::new(String::from("hi")));
+        assert_eq!(Prompt::new("hi").text, "hi");
     }
 
     #[test]

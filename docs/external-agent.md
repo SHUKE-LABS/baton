@@ -1,11 +1,16 @@
 # External-agent role (`--agent-cmd`)
 
-By default a served reply is a single Messages-API call. `--agent-cmd` instead
-backs the role with a **full-tooled native agent CLI run headless** — one that
-edits files and runs git/bash/MCP — driven entirely through the mailbox, with
-**no tmux and no live TUI**. This is the tmux-free launch leaf for a non-tmux
-team role: `baton serve --agent-cmd …` has no `TMAT_PANE` / `tmux` / pane-title
-dependency anywhere.
+`--agent-cmd` backs a served role with a **full-tooled native agent CLI run
+headless** — one that edits files and runs git/bash/MCP — driven entirely
+through the mailbox, with **no tmux and no live TUI**. This is the tmux-free
+launch leaf for a non-tmux team role: `baton serve --agent-cmd …` has no
+`TMAT_PANE` / `tmux` / pane-title dependency anywhere.
+
+It is also the **only** participant path a default (harness-only) build has:
+such a build carries no provider client, so every `baton serve` /
+`service start` session must pass `--agent-cmd` (the in-process provider
+fallback exists only in legacy `--features local` builds, scheduled for
+removal).
 
 Baton is a **pure backend-agnostic transport** here: it spawns `--agent-cmd`,
 feeds the request body on stdin, reads the reply on stdout, and does nothing

@@ -10,11 +10,19 @@ description = "An AI-to-AI harness focused on structured agent communication."
 readme = "README.md"
 license-file = "LICENSE"
 
+[features]
+default = []
+# The in-process, provider-backed local participant path (`ask`/`session`/
+# `exchange`/plain `converse`/`serve`'s no-`--agent-cmd` fallback/`log
+# replay`), kept as an opt-in escape hatch pending its removal next minor.
+# The harness-only default build never links a provider HTTP client.
+local = ["dep:ureq"]
+
 [dependencies]
 libc = "0.2.186"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
-ureq = "3.3.0"
+ureq = { version = "3.3.0", optional = true }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.52.0", features = [

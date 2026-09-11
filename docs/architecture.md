@@ -31,9 +31,14 @@ Two facts follow from that stance and frame everything below:
 
 ## The two participant paths
 
-This is the central architectural fact, and it is the frame for the
-provider-config work (#84/#86): **Baton has two participant paths, and only one
-of them makes Baton own an LLM client.**
+This is the central architectural fact: **Baton has two participant paths, and
+only one of them makes Baton own an LLM client.** Which one a build ships is a
+compile-time choice: the default, **harness-only** build compiles only the
+external-agent path (plus the mailbox peer over it) and carries no provider
+client at all; the local path is gated behind the opt-in `local` Cargo feature
+(`cargo build --features local`) as a legacy escape hatch, scheduled for
+removal — the chat verbs it powers live on in
+[`SHUKE-LABS/leg`](https://github.com/SHUKE-LABS/leg).
 
 ### Phase 1 — external-agent path (`ExternalAgentParticipant`)
 
@@ -54,9 +59,9 @@ thread, prior mailbox history) — headless-per-message, no in-memory session.
 Wired at the CLI by `baton serve --agent-cmd` (see
 [external-agent.md](external-agent.md#external-agent-role---agent-cmd)).
 
-### Phase 2 — local path (`LocalParticipant` + `Transport`)
+### Phase 2 — local path (`LocalParticipant` + `Transport`; `--features local`)
 
-Baton **owns the Messages-API client**. A `LocalParticipant` is a system prompt
+The legacy path: Baton **owns the Messages-API client**. A `LocalParticipant` is a system prompt
 plus a `Transport` (`src/transport/`), and the production `Transport` is
 `ClaudeClient` — a non-streaming Claude-compatible Messages client. One reply is
 exactly one provider exchange, whose token usage is stamped into the nested
@@ -86,8 +91,8 @@ concern:
 
 | Concern | Modules |
 |---|---|
-| **Participant seam** | `participant` — the envelope-in/out boundary and its four impls (local, subprocess, mailbox, external-agent) |
-| **Provider transport** | `transport` (boundary + `claude` Messages client + `http` execution seam), `model` (typed prompt/reply/session), `config` (env-backed runtime config: credential, base URL, model, timeout) |
+| **Participant seam** | `participant` — the envelope-in/out boundary and its impls (external-agent and mailbox by default; local/subprocess under `--features local`) |
+| **Provider transport** (`--features local`) | `transport` (boundary + `claude` Messages client + `http` execution seam), `model` (typed prompt/reply/session), `config` (env-backed runtime config: credential, base URL, model, timeout) |
 | **A2A envelope & driver** | `message` (the `baton.message/v1` envelope), `converse` (the governed N≥2 participant conversation driver), `registry` (static name → mailbox routing) |
 | **Mailbox** | `mailbox` — the addressable, crash-safe on-disk queue backing `baton serve` |
 | **Session ownership** | `service` — the host-owned supervisor spawning `baton serve` sessions as its own children (see [`docs/service.md`](service.md)) |
@@ -104,12 +109,12 @@ is the map from verb to concept.
 
 | Verb | A2A concept |
 |---|---|
-| `ask` | **Single-turn** — one first-prompt → first-reply against the provider. The shallow end. |
-| `session` | **Multi-turn** — an interactive REPL accumulating conversation history across turns; resumable. |
-| `exchange` | **Structured exchange** — one `baton.message/v1` request → correlated response round-trip, with the provider call nested in-band. The unit the subprocess path spawns. |
-| `converse` | **Governed conversation** — drive two participants to a terminal condition (turn cap, token budget, unilateral `done`). Side B may be local or mailbox-backed. |
-| `converse-ring` | **N-party ring** — the round-robin generalisation of `converse` over a static routing registry (name → mailbox). |
-| `serve` | **Mailbox responder** — a long-lived daemon answering `baton.message/v1` requests from a file-mailbox; `--agent-cmd` selects the external-agent path. |
+| `ask` | **Single-turn** — one first-prompt → first-reply against the provider. The shallow end. *Local-only (`--features local`); standalone in [leg](https://github.com/SHUKE-LABS/leg).* |
+| `session` | **Multi-turn** — an interactive REPL accumulating conversation history across turns; resumable. *Local-only; standalone in leg.* |
+| `exchange` | **Structured exchange** — one `baton.message/v1` request → correlated response round-trip, with the provider call nested in-band. The unit the subprocess path spawns. *Local-only; standalone in leg.* |
+| `converse` | **Governed conversation** — drive two participants to a terminal condition (turn cap, token budget, unilateral `done`). *Local-only (`--features local`): side A is always an in-process provider participant. The harness-only equivalent is `converse-ring` over a two-name roster.* |
+| `converse-ring` | **N-party ring** — the round-robin generalisation of `converse` over a static routing registry (name → mailbox). Harness-only: every peer is an external-agent `serve`. |
+| `serve` | **Mailbox responder** — a long-lived daemon answering `baton.message/v1` requests from a file-mailbox; `--agent-cmd` selects the external-agent path (the only path a default build has). |
 | `send` | **Mailbox client** — post a request into a mailbox (by path or by role name via the registry) and consume the correlated reply. |
 | `status` | **Liveness** — report a mailbox's state (`idle-done` / `busy` / `crashed-stale`) plus queue depth. |
 | `log` | **Trail** — inspect, merge, and replay the recorded `baton.exchange/v1` / `baton.message/v1` trail. |
@@ -124,7 +129,8 @@ you go to change it:
   a synthesized `kind: "error"` envelope via `synthesize_error_response`, nesting
   no record). Test doubles live in `participant::testing`, compiled only under
   `cargo test`.
-- **Adding/altering a provider** → `src/transport/`. `Transport` is the
+- **Adding/altering a provider** → `src/transport/` (compiled under
+  `--features local`). `Transport` is the
   boundary; `claude.rs` is the concrete client; `http.rs` is the injectable HTTP
   seam that lets client tests run without a network (`HttpClient` fakes).
 - **Changing the envelope or its recording** → `src/message.rs` (the wire shape)

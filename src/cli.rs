@@ -25,10 +25,13 @@
 //! Streaming and tool execution remain out of scope.
 
 use std::fs::{File, OpenOptions};
-use std::io::{self, BufRead, Read, Write};
+#[cfg(feature = "local")]
+use std::io::BufRead;
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+#[cfg(feature = "local")]
 use crate::config::BatonConfig;
 use crate::converse::{self, Governance, RingMember, Transcript};
 use crate::error::{BatonError, Result};
@@ -38,15 +41,21 @@ use crate::events::{
 use crate::log::{self, Exchange};
 use crate::mailbox::{self, Mailbox, MailboxState, MailboxStatus};
 use crate::message::{MessageEnvelope, MessageKind};
-use crate::model::{AssistantReply, Conversation, Prompt, TokenUsage};
+use crate::model::TokenUsage;
+#[cfg(feature = "local")]
+use crate::model::{AssistantReply, Conversation, Prompt};
+#[cfg(feature = "local")]
+use crate::participant::LocalParticipant;
 use crate::participant::{
-    ExternalAgentParticipant, LocalParticipant, MailboxParticipant, OutputAdapter, Participant,
+    ExternalAgentParticipant, MailboxParticipant, OutputAdapter, Participant,
 };
 use crate::registry::Registry;
 use crate::roles::{Identity, RolesHome};
 use crate::service::{self, SessionSpec};
 use crate::task::{self, TaskCallback, TaskSpec};
+#[cfg(feature = "local")]
 use crate::transport::Transport;
+#[cfg(feature = "local")]
 use crate::transport::claude::ClaudeClient;
 
 /// Environment variable naming the JSONL event-log file. Unset or blank ⇒
@@ -94,6 +103,7 @@ const SEND_POLL_INTERVAL_MS: u64 = 50;
 const DEFAULT_MAX_RUNTIME_MS: u64 = 900_000;
 
 /// The in-session command that ends the REPL cleanly (alongside EOF).
+#[cfg(feature = "local")]
 const SESSION_EXIT_COMMAND: &str = "/exit";
 
 /// A parsed CLI invocation.
@@ -317,6 +327,7 @@ pub fn run() -> Result<()> {
             let stdout = std::io::stdout();
             execute_version(stdout.lock())
         }
+        #[cfg(feature = "local")]
         Command::Ask { prompt } => {
             let config = BatonConfig::from_env()?;
             let meta = exchange_meta(&config);
@@ -326,6 +337,9 @@ pub fn run() -> Result<()> {
             println!("{reply}");
             Ok(())
         }
+        #[cfg(not(feature = "local"))]
+        Command::Ask { .. } => Err(local_feature_required("ask", "leg ask")),
+        #[cfg(feature = "local")]
         Command::Session { resume, role } => {
             let stdin = std::io::stdin();
             let stdout = std::io::stdout();
@@ -396,6 +410,9 @@ pub fn run() -> Result<()> {
                 }
             }
         }
+        #[cfg(not(feature = "local"))]
+        Command::Session { .. } => Err(local_feature_required("session", "leg session")),
+        #[cfg(feature = "local")]
         Command::Exchange { in_path, out_path } => {
             let config = BatonConfig::from_env()?;
             let meta = exchange_meta(&config);
@@ -411,6 +428,9 @@ pub fn run() -> Result<()> {
             let response = execute_exchange(&participant, sink.as_mut(), &meta, &request);
             write_response_envelope(&response, open_output(out_path.as_deref())?)
         }
+        #[cfg(not(feature = "local"))]
+        Command::Exchange { .. } => Err(local_feature_required("exchange", "leg exchange")),
+        #[cfg(feature = "local")]
         Command::Converse {
             a_system,
             b_system,
@@ -465,6 +485,11 @@ pub fn run() -> Result<()> {
             eprintln!("conversation ended: {:?}", transcript.reason);
             write_transcript(&transcript, open_output(out_path.as_deref())?)
         }
+        #[cfg(not(feature = "local"))]
+        Command::Converse { .. } => Err(local_feature_required(
+            "converse",
+            "converse-ring (mailbox/external-agent two-party equivalent)",
+        )),
         Command::ConverseRing {
             registry,
             roster,
@@ -584,6 +609,7 @@ pub fn run() -> Result<()> {
                     .with_stderr_dir(stderr_dir);
                     (Box::new(participant), meta)
                 }
+                #[cfg(feature = "local")]
                 None => {
                     // Local in-process provider: a `--role` feeds its layered
                     // lookup (env > role > defaults > built-in) to the config
@@ -595,6 +621,13 @@ pub fn run() -> Result<()> {
                     let meta = exchange_meta(&config);
                     let client = ClaudeClient::from_config(config);
                     (Box::new(LocalParticipant::new(client, meta.clone())), meta)
+                }
+                #[cfg(not(feature = "local"))]
+                None => {
+                    return Err(local_feature_required(
+                        "serve without --agent-cmd",
+                        "serve --agent-cmd \"leg exchange\"",
+                    ));
                 }
             };
 
@@ -744,6 +777,7 @@ pub fn run() -> Result<()> {
             let stdout = std::io::stdout();
             execute_log_show(&exchanges, stdout.lock())
         }
+        #[cfg(feature = "local")]
         Command::LogReplay { file, index } => {
             let exchanges = read_log(file.as_deref())?;
             let request = &select_exchange(&exchanges, index)?.request;
@@ -764,6 +798,8 @@ pub fn run() -> Result<()> {
             println!("{reply}");
             Ok(())
         }
+        #[cfg(not(feature = "local"))]
+        Command::LogReplay { .. } => Err(local_feature_required("log replay", "leg log replay")),
         Command::LogMerge {
             paths,
             conversation,
@@ -938,6 +974,7 @@ fn resolve_log_path(file: Option<&str>) -> Result<String> {
 ///
 /// An empty log, or an index outside `1..=len`, is an error naming the valid
 /// range so the user can correct it.
+#[cfg(feature = "local")]
 fn select_exchange(exchanges: &[Exchange], index: Option<usize>) -> Result<&Exchange> {
     if exchanges.is_empty() {
         return Err(BatonError::Usage(
@@ -970,6 +1007,7 @@ fn execute_log_show(exchanges: &[Exchange], mut output: impl Write) -> Result<()
 
 /// Builds the replay-relevant [`ExchangeMeta`] shared by every exchange in a
 /// command run.
+#[cfg(feature = "local")]
 fn exchange_meta(config: &BatonConfig) -> ExchangeMeta {
     ExchangeMeta {
         model: config.model.clone(),
@@ -985,6 +1023,7 @@ fn exchange_meta(config: &BatonConfig) -> ExchangeMeta {
 /// trail can both be exercised with fakes, without a network or real config. A
 /// failed event write is reported on stderr but never changes the exchange
 /// result.
+#[cfg(feature = "local")]
 fn execute_ask(
     transport: &impl Transport,
     sink: &mut dyn EventSink,
@@ -997,6 +1036,7 @@ fn execute_ask(
 }
 
 /// Testable form of [`execute_ask`] with an injected warning sink.
+#[cfg(feature = "local")]
 fn execute_ask_with_warning(
     transport: &impl Transport,
     sink: &mut dyn EventSink,
@@ -1429,6 +1469,7 @@ fn resolve_seed(seed: &SeedSource) -> Result<String> {
 /// system-prompt file and model laid over the top. The credential and base URL
 /// stay shared, so the two sides differ only in identity and model — the point
 /// of the per-side flags.
+#[cfg(feature = "local")]
 fn participant_config(
     base: &BatonConfig,
     system_path: Option<&str>,
@@ -1470,6 +1511,7 @@ fn build_output_adapter(
 /// to B. Ids are derived from the emission time so a run needs no external id
 /// source; `baton.message/v1` places no format constraint on them beyond
 /// uniqueness.
+#[cfg(feature = "local")]
 fn build_seed_envelope(body: &str) -> MessageEnvelope {
     build_ring_seed_envelope(body, "agent-a", "agent-b")
 }
@@ -1570,6 +1612,7 @@ fn write_truncation_warning(mut output: impl Write, stop_reason: &str) -> io::Re
 /// Parameterised over [`BufRead`]/[`Write`] so the whole loop — history
 /// accumulation, exit conditions, and error rollback — is unit-testable with
 /// in-memory buffers and a fake transport, without a terminal or a network.
+#[cfg(feature = "local")]
 fn execute_session(
     transport: &impl Transport,
     sink: &mut dyn EventSink,
@@ -1613,6 +1656,7 @@ fn execute_session(
 /// `session_id` (see [`crate::log::parse_sessions`]), so the resumed run reuses
 /// that id and continues its `turn_index`. The preloaded [`Conversation`] means
 /// the first new request already carries every prior user + assistant turn.
+#[cfg(feature = "local")]
 fn execute_session_resumed(
     transport: &impl Transport,
     sink: &mut dyn EventSink,
@@ -1666,6 +1710,7 @@ fn execute_session_resumed(
 /// Parameterised over [`BufRead`]/[`Write`] so the whole loop — history
 /// accumulation, exit conditions, and error rollback — is unit-testable with
 /// in-memory buffers and a fake transport, without a terminal or a network.
+#[cfg(feature = "local")]
 #[allow(clippy::too_many_arguments)]
 fn run_session_repl(
     transport: &impl Transport,
@@ -1693,6 +1738,7 @@ fn run_session_repl(
 }
 
 /// Testable form of [`run_session_repl`] with an injected warning sink.
+#[cfg(feature = "local")]
 #[allow(clippy::too_many_arguments)]
 fn run_session_repl_with_warning(
     transport: &impl Transport,
@@ -1763,6 +1809,7 @@ fn run_session_repl_with_warning(
 /// resumed run extends one coherent session), the [`Conversation`] reconstructed
 /// from the recorded turns, and the next `turn_index` (continuing monotonically
 /// past the last recorded turn).
+#[cfg(feature = "local")]
 #[derive(Debug)]
 struct ResumedSession {
     /// The original session's id, reused for every resumed turn.
@@ -1780,6 +1827,7 @@ struct ResumedSession {
 /// [`select_and_rehydrate`]. All of this runs *before* the caller opens the
 /// append sink, so a parse or selection failure exits non-zero having written
 /// nothing — the same contract as the `--in`/parse-error path.
+#[cfg(feature = "local")]
 fn load_resume(file: &str, session_id: Option<&str>) -> Result<ResumedSession> {
     let handle = File::open(file)
         .map_err(|err| BatonError::Io(format!("failed to open --resume file {file:?}: {err}")))?;
@@ -1806,6 +1854,7 @@ fn load_resume(file: &str, session_id: Option<&str>) -> Result<ResumedSession> {
 ///
 /// Pure over its inputs (no I/O), so selection and rehydration are unit-testable
 /// without a trail file.
+#[cfg(feature = "local")]
 fn select_and_rehydrate(
     sessions: Vec<log::SessionRecord>,
     session_id: Option<&str>,
@@ -1864,6 +1913,7 @@ fn select_and_rehydrate(
 /// `session` process runs one session, so `(pid, start-ms)` cannot collide with
 /// another live session on the same host, and the value carries no format
 /// constraint beyond uniqueness.
+#[cfg(feature = "local")]
 fn new_session_id() -> String {
     format!("sess-{}-{}", std::process::id(), now_ms())
 }
@@ -1875,11 +1925,13 @@ fn new_session_id() -> String {
 /// `BATON_EVENT_LOG` (#203). Derived from the process id and timestamp — like
 /// [`new_session_id`], dependency-free and unique across concurrent writers (a
 /// distinct `pid` per process; one `ask` exchange per invocation).
+#[cfg(feature = "local")]
 fn new_ask_message_id() -> String {
     format!("ask-{}-{}", std::process::id(), now_ms())
 }
 
 /// Testable form of the timed exchange used by the `ask` and session paths.
+#[cfg(feature = "local")]
 fn timed_exchange_with_warning(
     sink: &mut dyn EventSink,
     meta: &ExchangeMeta,
@@ -2008,6 +2060,7 @@ fn open_event_sink() -> Result<Box<dyn EventSink>> {
 /// `roles/<role>/sessions/<session_id>.jsonl` (#82), creating the `sessions/`
 /// directory lazily. A `--role` session was explicitly requested, so an open
 /// failure is surfaced rather than silently dropped.
+#[cfg(feature = "local")]
 fn open_session_home_sink(
     home: &RolesHome,
     role: &str,
@@ -2041,6 +2094,7 @@ fn open_session_home_sink(
 /// [`EVENT_LOG_ENV`]), so the resumed run extends the same session file. The file
 /// already exists — [`load_resume`] read it first — so a failure here is a real
 /// I/O error worth surfacing rather than silently dropping.
+#[cfg(feature = "local")]
 fn open_append_sink(path: &str) -> Result<Box<dyn EventSink>> {
     let file = OpenOptions::new()
         .create(true)
@@ -2713,6 +2767,20 @@ impl SessionSpecFlags {
 
     /// Validates the shared agent-run flag relationships.
     fn validate(&self) -> Result<()> {
+        // Under the default, harness-only feature set there is no in-process
+        // provider to fall back to: `serve`/`service start` without
+        // `--agent-cmd` must fail here, before a session is registered or
+        // spawned, rather than silently starting a session that immediately
+        // dies (the CLI dispatch itself would still reject it, but only after
+        // a real subprocess spawn).
+        #[cfg(not(feature = "local"))]
+        if self.agent_cmd.is_none() {
+            return Err(local_feature_required(
+                "serve/service start without --agent-cmd",
+                "serve --agent-cmd \"leg exchange\"",
+            ));
+        }
+
         // The agent-run flags only qualify `--agent-cmd`; without it they
         // would be silently ignored, so reject them rather than mislead.
         if self.agent_cmd.is_none() && self.has_agent_run_flags() {
@@ -3588,12 +3656,26 @@ fn usage(detail: &str) -> BatonError {
     BatonError::Usage(format!("{detail}\n{USAGE}"))
 }
 
+/// Builds the error a provider-backed verb returns under the default,
+/// harness-only feature set: `local` is the intentional escape hatch this
+/// verb needs, and `alternative` names the harness-only replacement.
+#[cfg(not(feature = "local"))]
+fn local_feature_required(verb: &str, alternative: &str) -> BatonError {
+    BatonError::Usage(format!(
+        "baton {verb} requires the crate's `local` feature (disabled by default in this \
+harness-only build); use `{alternative}` instead"
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::message::MessageKind;
+    #[cfg(feature = "local")]
     use crate::model::Message;
+    #[cfg(feature = "local")]
     use std::cell::RefCell;
+    #[cfg(feature = "local")]
     use std::io::Cursor;
 
     fn argv(parts: &[&str]) -> Vec<String> {
@@ -3734,11 +3816,13 @@ mod tests {
 
     /// A transport that returns a canned reply and records the conversation it
     /// last saw (the single-turn `ask` path sends a one-message conversation).
+    #[cfg(feature = "local")]
     struct OkTransport {
         text: String,
         seen: RefCell<Vec<Message>>,
     }
 
+    #[cfg(feature = "local")]
     impl OkTransport {
         fn new(text: &str) -> Self {
             Self {
@@ -3748,6 +3832,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "local")]
     impl Transport for OkTransport {
         fn send_conversation(&self, messages: &[Message]) -> Result<AssistantReply> {
             *self.seen.borrow_mut() = messages.to_vec();
@@ -3757,10 +3842,12 @@ mod tests {
 
     /// A transport that returns a reply with a provider stop reason, for
     /// exercising the warning paths without a real provider call.
+    #[cfg(feature = "local")]
     struct StopReasonTransport {
         stop_reason: Option<String>,
     }
 
+    #[cfg(feature = "local")]
     impl StopReasonTransport {
         fn new(stop_reason: Option<&str>) -> Self {
             Self {
@@ -3769,6 +3856,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "local")]
     impl Transport for StopReasonTransport {
         fn send_conversation(&self, _messages: &[Message]) -> Result<AssistantReply> {
             Ok(AssistantReply::with_usage_and_stop_reason(
@@ -3780,8 +3868,10 @@ mod tests {
     }
 
     /// A transport that always fails at the transport layer.
+    #[cfg(feature = "local")]
     struct ErrTransport;
 
+    #[cfg(feature = "local")]
     impl Transport for ErrTransport {
         fn send_conversation(&self, _messages: &[Message]) -> Result<AssistantReply> {
             Err(BatonError::Transport("network down".to_string()))
@@ -3791,10 +3881,12 @@ mod tests {
     /// A transport that records every conversation it is sent and returns a
     /// distinct reply per call (`reply1`, `reply2`, …), so a session test can
     /// assert both the accumulated history and the per-turn replies.
+    #[cfg(feature = "local")]
     struct RecordingTransport {
         calls: RefCell<Vec<Vec<Message>>>,
     }
 
+    #[cfg(feature = "local")]
     impl RecordingTransport {
         fn new() -> Self {
             Self {
@@ -3803,6 +3895,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "local")]
     impl Transport for RecordingTransport {
         fn send_conversation(&self, messages: &[Message]) -> Result<AssistantReply> {
             let mut calls = self.calls.borrow_mut();
@@ -3813,10 +3906,12 @@ mod tests {
 
     /// A transport whose first call fails and whose later calls succeed, to
     /// prove a failed turn is rolled back and the session keeps going.
+    #[cfg(feature = "local")]
     struct FailFirstTransport {
         calls: RefCell<Vec<Vec<Message>>>,
     }
 
+    #[cfg(feature = "local")]
     impl FailFirstTransport {
         fn new() -> Self {
             Self {
@@ -3825,6 +3920,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "local")]
     impl Transport for FailFirstTransport {
         fn send_conversation(&self, messages: &[Message]) -> Result<AssistantReply> {
             let mut calls = self.calls.borrow_mut();
@@ -3857,8 +3953,10 @@ mod tests {
 
     /// An [`EventSink`] whose every write fails, to prove recording errors are
     /// swallowed rather than aborting the exchange.
+    #[cfg(feature = "local")]
     struct FailingSink;
 
+    #[cfg(feature = "local")]
     impl EventSink for FailingSink {
         fn record(&mut self, _event: &ExchangeEvent) -> std::io::Result<()> {
             Err(std::io::Error::other("sink is broken"))
@@ -3872,6 +3970,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "local")]
     #[test]
     fn execute_ask_returns_only_reply_text_and_forwards_prompt() {
         let transport = OkTransport::new("the answer");
@@ -3886,6 +3985,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "local")]
     #[test]
     fn execute_ask_propagates_transport_error() {
         let mut sink = NoopSink;
@@ -3895,6 +3995,7 @@ mod tests {
         ));
     }
 
+    #[cfg(feature = "local")]
     #[test]
     fn execute_ask_records_request_then_success_outcome() {
         let transport = OkTransport::new("the answer");
@@ -3915,6 +4016,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "local")]
     #[test]
     fn execute_ask_stamps_matching_message_id_on_request_and_outcome() {
         // #203: the `ask` path has no envelope, so it mints a per-exchange
@@ -3943,6 +4045,7 @@ mod tests {
         assert!(req_id.starts_with("ask-"), "ask id shape: {req_id}");
     }
 
+    #[cfg(feature = "local")]
     #[test]
     fn execute_ask_records_token_usage_from_reply() {
         use crate::model::TokenUsage;
@@ -3976,6 +4079,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "local")]
     #[test]
     fn execute_ask_records_stop_reason_from_reply() {
         let transport = StopReasonTransport::new(Some("max_tokens"));
@@ -3992,6 +4096,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "local")]
     #[test]
     fn execute_ask_warns_on_max_tokens_reply() {
         let transport = StopReasonTransport::new(Some("max_tokens"));
@@ -4030,6 +4135,7 @@ mod tests {
         assert!(output.is_empty());
     }
 
+    #[cfg(feature = "local")]
     #[test]
     fn execute_ask_records_error_outcome_even_on_failure() {
         let mut sink = RecordingSink::new();
@@ -4043,6 +4149,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "local")]
     #[test]
     fn execute_ask_succeeds_even_when_event_recording_fails() {
         let transport = OkTransport::new("the answer");
@@ -4218,6 +4325,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "local")]
     #[test]
     fn select_exchange_defaults_to_last() {
         let exchanges = vec![ok_exchange("first"), ok_exchange("second")];
@@ -4225,6 +4333,7 @@ mod tests {
         assert_eq!(selected.request.prompt, "second");
     }
 
+    #[cfg(feature = "local")]
     #[test]
     fn select_exchange_is_one_based() {
         let exchanges = vec![ok_exchange("first"), ok_exchange("second")];
@@ -4244,6 +4353,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "local")]
     #[test]
     fn select_exchange_out_of_range_names_the_valid_range() {
         let exchanges = vec![ok_exchange("only")];
@@ -4253,6 +4363,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "local")]
     #[test]
     fn select_exchange_on_empty_log_errors() {
         assert!(matches!(
@@ -4391,6 +4502,7 @@ mod tests {
         ));
     }
 
+    #[cfg(feature = "local")]
     #[test]
     fn session_accumulates_history_across_turns_and_exits_on_eof() {
         let transport = RecordingTransport::new();
@@ -4480,6 +4592,7 @@ mod tests {
         assert!(printed.contains("reply2"), "got: {printed}");
     }
 
+    #[cfg(feature = "local")]
     #[test]
     fn session_exit_command_stops_before_consuming_later_input() {
         let transport = RecordingTransport::new();
@@ -4503,6 +4616,7 @@ mod tests {
         assert_eq!(calls[0], vec![Message::user("hi")]);
     }
 
+    #[cfg(feature = "local")]
     #[test]
     fn session_skips_blank_lines() {
         let transport = RecordingTransport::new();
@@ -4526,6 +4640,7 @@ mod tests {
         assert_eq!(calls[0], vec![Message::user("hi")]);
     }
 
+    #[cfg(feature = "local")]
     #[test]
     fn session_repl_warns_on_max_tokens_reply() {
         let transport = StopReasonTransport::new(Some("max_tokens"));
@@ -4625,6 +4740,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "local")]
     #[test]
     fn session_rolls_back_failed_turn_and_continues() {
         let transport = FailFirstTransport::new();
@@ -4700,6 +4816,7 @@ mod tests {
     // -- baton session --resume --------------------------------------------
 
     /// Builds a `RequestRecord` for a session turn at `turn_index`.
+    #[cfg(feature = "local")]
     fn resume_request(session_id: &str, turn_index: u64, prompt: &str) -> log::RequestRecord {
         log::RequestRecord {
             ts_ms: 1,
@@ -4712,6 +4829,7 @@ mod tests {
     }
 
     /// A completed session turn (`Ok` outcome carrying `reply`).
+    #[cfg(feature = "local")]
     fn ok_turn(session_id: &str, turn_index: u64, prompt: &str, reply: &str) -> log::SessionTurn {
         log::SessionTurn {
             request: resume_request(session_id, turn_index, prompt),
@@ -4727,6 +4845,7 @@ mod tests {
     }
 
     /// A session record wrapping the given turns (start marker seen, no end).
+    #[cfg(feature = "local")]
     fn session_record(session_id: &str, turns: Vec<log::SessionTurn>) -> log::SessionRecord {
         log::SessionRecord {
             session_id: session_id.to_string(),
@@ -4737,6 +4856,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "local")]
     #[test]
     fn rehydrate_builds_user_assistant_pairs_and_continues_turn_index() {
         let record = session_record(
@@ -4761,6 +4881,7 @@ mod tests {
         assert_eq!(resumed.next_turn_index, 2);
     }
 
+    #[cfg(feature = "local")]
     #[test]
     fn rehydrate_skips_torn_final_turn_but_advances_past_it() {
         // A torn final turn — its `request` landed (turn_index 1) but the outcome
@@ -4783,6 +4904,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "local")]
     #[test]
     fn rehydrate_skips_errored_turn() {
         let errored = log::SessionTurn {
@@ -4804,6 +4926,7 @@ mod tests {
         assert_eq!(resumed.next_turn_index, 2);
     }
 
+    #[cfg(feature = "local")]
     #[test]
     fn rehydrate_selects_named_session_from_many() {
         let sessions = vec![
@@ -4815,6 +4938,7 @@ mod tests {
         assert_eq!(resumed.conversation.messages()[0], Message::user("b"));
     }
 
+    #[cfg(feature = "local")]
     #[test]
     fn rehydrate_unknown_session_id_is_usage_error() {
         let sessions = vec![session_record(
@@ -4827,6 +4951,7 @@ mod tests {
         ));
     }
 
+    #[cfg(feature = "local")]
     #[test]
     fn rehydrate_ambiguous_selection_is_usage_error() {
         let sessions = vec![
@@ -4845,6 +4970,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "local")]
     #[test]
     fn rehydrate_empty_trail_is_usage_error() {
         assert!(matches!(
@@ -4853,6 +4979,7 @@ mod tests {
         ));
     }
 
+    #[cfg(feature = "local")]
     #[test]
     fn resumed_session_first_request_carries_prior_history_and_continues_frame() {
         // A prior session with two completed turns, rehydrated and resumed.
@@ -5323,6 +5450,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "local")]
     #[test]
     fn build_seed_envelope_is_an_a_to_b_request() {
         let seed = build_seed_envelope("kick off");
@@ -5348,10 +5476,12 @@ mod tests {
 
     /// Wraps a transport as the in-process participant `baton exchange` uses,
     /// so the wiring tests exercise the same delegation as production.
+    #[cfg(feature = "local")]
     fn participant_over(transport: impl Transport) -> LocalParticipant<impl Transport> {
         LocalParticipant::new(transport, test_meta())
     }
 
+    #[cfg(feature = "local")]
     #[test]
     fn execute_exchange_returns_the_participants_response() {
         let mut sink = NoopSink;
@@ -5373,6 +5503,7 @@ mod tests {
         assert!(response.exchange.is_some(), "provider call nested in-band");
     }
 
+    #[cfg(feature = "local")]
     #[test]
     fn execute_exchange_records_request_then_ok_outcome_pair() {
         let mut sink = RecordingSink::new();
@@ -5390,6 +5521,7 @@ mod tests {
         assert!(matches!(sink.events[1], ExchangeEvent::ResponseOk { .. }));
     }
 
+    #[cfg(feature = "local")]
     #[test]
     fn execute_exchange_stamps_envelope_correlation_on_request_and_outcome() {
         // #203: the serve/exchange path stamps the request envelope's
@@ -5423,6 +5555,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "local")]
     #[test]
     fn execute_exchange_records_request_then_error_outcome_pair() {
         let mut sink = RecordingSink::new();
@@ -5453,6 +5586,7 @@ mod tests {
         ));
     }
 
+    #[cfg(feature = "local")]
     #[test]
     fn write_then_read_response_envelope_round_trips() {
         let mut sink = NoopSink;
@@ -5517,6 +5651,7 @@ mod tests {
             "serve",
             "--inbox=/tmp/in",
             "--outbox=/tmp/out",
+            "--agent-cmd=/bin/true",
             "--role=alice",
         ]))
         .expect("parses");
@@ -5596,13 +5731,19 @@ mod tests {
     #[test]
     fn parse_serve_requires_inbox_and_outbox() {
         assert_eq!(
-            parse_args(&argv(&["serve", "--inbox=/tmp/in", "--outbox=/tmp/out"])).expect("parses"),
+            parse_args(&argv(&[
+                "serve",
+                "--inbox=/tmp/in",
+                "--outbox=/tmp/out",
+                "--agent-cmd=/bin/true",
+            ]))
+            .expect("parses"),
             Command::Serve {
                 inbox: "/tmp/in".to_string(),
                 outbox: "/tmp/out".to_string(),
                 poll_ms: DEFAULT_SERVE_POLL_MS,
                 once: false,
-                agent_cmd: None,
+                agent_cmd: Some("/bin/true".to_string()),
                 agent_args: vec![],
                 agent_cwd: None,
                 agent_timeout_ms: None,
@@ -5861,6 +6002,8 @@ mod tests {
                 "--poll-ms",
                 "50",
                 "--once",
+                "--agent-cmd",
+                "/bin/true",
             ]))
             .expect("parses"),
             Command::Serve {
@@ -5868,7 +6011,7 @@ mod tests {
                 outbox: "/tmp/out".to_string(),
                 poll_ms: 50,
                 once: true,
-                agent_cmd: None,
+                agent_cmd: Some("/bin/true".to_string()),
                 agent_args: vec![],
                 agent_cwd: None,
                 agent_timeout_ms: None,
@@ -6007,7 +6150,14 @@ mod tests {
             BatonError::Usage(_)
         ));
         match parse_args(&argv(&[
-            "service", "start", "--inbox", "/tmp/in", "--outbox", "/tmp/out",
+            "service",
+            "start",
+            "--inbox",
+            "/tmp/in",
+            "--outbox",
+            "/tmp/out",
+            "--agent-cmd",
+            "/bin/true",
         ]))
         .expect("omitted control uses the runtime default")
         {
@@ -6019,6 +6169,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "local")]
     fn parse_service_start_parses_minimal_spec() {
         let cwd = std::env::current_dir().expect("read current directory");
         let inbox = cwd
@@ -6664,10 +6815,10 @@ mod tests {
             .unwrap_or_default()
     }
 
-    /// End-to-end drain over a real mailbox and the in-process participant: one
+    /// End-to-end drain over a real mailbox and a scripted participant: one
     /// request in `pending/` yields one correlated reply in the outbox keyed by
     /// the request id, moves the request to `done/`, and a second drain is a
-    /// no-op (dedup). Network-free — `OkTransport` stands in for the provider.
+    /// no-op (dedup). Network-free — `ScriptedParticipant` stands in for the peer.
     #[test]
     fn drain_mailbox_answers_and_dedups() {
         let root = TempRoot::new("drain");
@@ -6677,7 +6828,7 @@ mod tests {
         let mailbox = Mailbox::open(&inbox).expect("open mailbox");
         mailbox.deliver(&request_envelope()).expect("deliver");
 
-        let participant = participant_over(OkTransport::new("four"));
+        let participant = crate::participant::testing::ScriptedParticipant::new(["four"]);
         let mut sink = NoopSink;
 
         let drained = drain_mailbox(
@@ -6730,7 +6881,7 @@ mod tests {
         // A cooperative stop arrives before the daemon claims the message.
         mailbox::request_stop(&inbox).expect("request stop");
 
-        let participant = participant_over(OkTransport::new("four"));
+        let participant = crate::participant::testing::ScriptedParticipant::new(["four"]);
         let mut sink = NoopSink;
 
         let drained = drain_mailbox(
@@ -6760,7 +6911,7 @@ mod tests {
         let outbox = root.path.join("outbox");
 
         let mailbox = Mailbox::open(&inbox).expect("open mailbox");
-        let participant = participant_over(OkTransport::new("four"));
+        let participant = crate::participant::testing::ScriptedParticipant::new(["four", "four"]);
         let mut sink = NoopSink;
 
         // First delivery + drain writes one reply.
@@ -7686,6 +7837,7 @@ mod tests {
     /// AC2: `session --role` records the #76-shaped human↔agent trail (a
     /// user+assistant turn) under the role's home, with the role identity stamped
     /// on the opening marker, and it reads back via `parse_sessions`.
+    #[cfg(feature = "local")]
     #[test]
     fn session_role_records_identity_framed_trail_under_home() {
         let (root, home) = temp_role_home("sess-role");

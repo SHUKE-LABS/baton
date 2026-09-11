@@ -12,6 +12,9 @@ use crate::task::TaskRecord;
 
 static SEQ: AtomicU64 = AtomicU64::new(0);
 
+// Poll cadence for the debug-only test-admission barriers below; release
+// builds compile them out, so the constant follows.
+#[cfg(debug_assertions)]
 const POLL_INTERVAL_MS: u64 = 100;
 
 /// A durable on-disk record of one session `Run` has spawned. Platform-only

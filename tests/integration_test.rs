@@ -12,24 +12,35 @@
 
 #[cfg(unix)]
 use std::io::{BufRead, BufReader};
+#[cfg(feature = "local")]
 use std::io::{Read, Write};
+#[cfg(feature = "local")]
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+// Every `thread` user is either a Unix process-parentage test or a local-mode
+// fake, so a Windows default-feature build has no use for the import.
+#[cfg(any(unix, feature = "local"))]
 use std::thread;
 use std::time::Duration;
 
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
+#[cfg(feature = "local")]
 use baton::config::{BatonConfig, Credential, DEFAULT_MAX_TOKENS};
+#[cfg(feature = "local")]
 use baton::error::BatonError;
 use baton::message::{MessageEnvelope, MessageKind};
+#[cfg(feature = "local")]
 use baton::model::Prompt;
+#[cfg(feature = "local")]
 use baton::transport::Transport;
+#[cfg(feature = "local")]
 use baton::transport::claude::ANTHROPIC_VERSION;
 
 /// The response body returned by a successful Claude Messages request.
+#[cfg(feature = "local")]
 const SUCCESS_BODY: &str = r#"{
     "id": "msg_int_1",
     "type": "message",
@@ -103,6 +114,7 @@ fn integration_test_deadline_scale_uses_documented_base_and_domain() {
 /// Reads a complete HTTP request before the mock writes a response. Closing a
 /// socket with unread request body bytes can cause Windows to reset the
 /// connection instead of delivering that response.
+#[cfg(feature = "local")]
 fn drain_request(stream: &mut TcpStream) -> Vec<u8> {
     let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
     let mut request = Vec::new();
@@ -175,11 +187,13 @@ fn global_help_and_version_flags_succeed_without_configuration() {
 /// connection is closed. `hold_open` controls whether the connection is
 /// accepted but never written to — used by the timeout test to make ureq
 /// block on read until its own global timeout fires.
+#[cfg(feature = "local")]
 struct MockServer {
     base_url: String,
     handle: Option<thread::JoinHandle<()>>,
 }
 
+#[cfg(feature = "local")]
 impl MockServer {
     fn spawn(status: u16, body: &'static str) -> Self {
         Self::spawn_with(status, body, false)
@@ -187,6 +201,7 @@ impl MockServer {
 
     /// Spawn a server that accepts the connection and never writes a
     /// response, so the client must rely on its own timeout.
+    #[cfg(feature = "local")]
     fn spawn_silent() -> Self {
         Self::spawn_with(0, "", true)
     }
@@ -278,6 +293,7 @@ impl MockServer {
     }
 }
 
+#[cfg(feature = "local")]
 impl Drop for MockServer {
     fn drop(&mut self) {
         // Take the handle so its lifetime is bounded by the test, but we
@@ -289,6 +305,7 @@ impl Drop for MockServer {
 
 /// Maps a status code to the standard reason phrase used by the mock
 /// response. We only need a handful, so a match keeps the surface small.
+#[cfg(feature = "local")]
 fn status_text(status: u16) -> &'static str {
     match status {
         200 => "OK",
@@ -300,6 +317,7 @@ fn status_text(status: u16) -> &'static str {
     }
 }
 
+#[cfg(feature = "local")]
 fn config_for(base_url: &str, timeout_secs: u64) -> BatonConfig {
     config_for_credential(
         base_url,
@@ -308,6 +326,7 @@ fn config_for(base_url: &str, timeout_secs: u64) -> BatonConfig {
     )
 }
 
+#[cfg(feature = "local")]
 fn config_for_credential(base_url: &str, timeout_secs: u64, credential: Credential) -> BatonConfig {
     BatonConfig {
         credential,
@@ -319,6 +338,7 @@ fn config_for_credential(base_url: &str, timeout_secs: u64, credential: Credenti
     }
 }
 
+#[cfg(feature = "local")]
 #[test]
 fn happy_path_round_trip() {
     let server = MockServer::spawn(200, SUCCESS_BODY);
@@ -331,6 +351,7 @@ fn happy_path_round_trip() {
     assert_eq!(reply.text, "hello from the mock server");
 }
 
+#[cfg(feature = "local")]
 #[test]
 fn auth_failure_maps_to_auth_error() {
     let body =
@@ -345,6 +366,7 @@ fn auth_failure_maps_to_auth_error() {
     }
 }
 
+#[cfg(feature = "local")]
 #[test]
 fn rate_limit_maps_to_rate_limited() {
     let body = r#"{"type":"error","error":{"type":"rate_limit_error","message":"slow down"}}"#;
@@ -358,6 +380,7 @@ fn rate_limit_maps_to_rate_limited() {
     }
 }
 
+#[cfg(feature = "local")]
 #[test]
 fn malformed_response_maps_to_decode_error() {
     // 200 OK, but the body is not the JSON shape we expect. The client
@@ -372,6 +395,7 @@ fn malformed_response_maps_to_decode_error() {
     ));
 }
 
+#[cfg(feature = "local")]
 #[test]
 fn timeout_maps_to_transport_error() {
     // Server accepts the connection and never writes a response — ureq's
@@ -400,6 +424,7 @@ fn timeout_maps_to_transport_error() {
 /// `request_uses_configured_endpoint_model_key_and_version` (which captures
 /// the serialized body via the fake `HttpClient`); this integration test
 /// adds confidence that the same headers survive a real `ureq` round-trip.
+#[cfg(feature = "local")]
 #[test]
 fn request_carries_expected_headers() {
     use std::sync::{Arc, Mutex};
@@ -461,6 +486,7 @@ fn request_carries_expected_headers() {
 /// client must emit `Authorization: Bearer <token>` on the wire, and must
 /// not emit an `x-api-key` header. The captured raw request gives us the
 /// same view of the wire the server actually saw.
+#[cfg(feature = "local")]
 #[test]
 fn request_carries_bearer_auth_header_for_oauth_credential() {
     use std::sync::{Arc, Mutex};
@@ -568,6 +594,7 @@ impl Drop for TempEventLog {
 /// a developer's real shell environment cannot leak into the run. `event_log`
 /// controls whether `BATON_EVENT_LOG` is set at all — `None` exercises the
 /// recording-disabled path.
+#[cfg(feature = "local")]
 fn run_baton_ask(base_url: &str, prompt: &str, event_log: Option<&Path>) -> std::process::Output {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_baton"));
     cmd.arg("ask").arg("-p").arg(prompt);
@@ -590,6 +617,7 @@ fn run_baton_ask(base_url: &str, prompt: &str, event_log: Option<&Path>) -> std:
 }
 
 /// Reads a JSONL event file into one parsed `Value` per non-blank line.
+#[cfg(feature = "local")]
 fn read_jsonl(path: &Path) -> Vec<serde_json::Value> {
     let text = std::fs::read_to_string(path).expect("read event log");
     text.lines()
@@ -598,6 +626,7 @@ fn read_jsonl(path: &Path) -> Vec<serde_json::Value> {
         .collect()
 }
 
+#[cfg(feature = "local")]
 #[test]
 fn event_log_records_request_then_response_ok_to_file() {
     let server = MockServer::spawn(200, SUCCESS_BODY);
@@ -647,6 +676,7 @@ fn event_log_records_request_then_response_ok_to_file() {
     );
 }
 
+#[cfg(feature = "local")]
 #[test]
 fn event_log_records_response_error_with_kind_auth_on_401() {
     let body =
@@ -685,6 +715,7 @@ fn event_log_records_response_error_with_kind_auth_on_401() {
     );
 }
 
+#[cfg(feature = "local")]
 #[test]
 fn no_event_file_created_when_env_unset() {
     let server = MockServer::spawn(200, SUCCESS_BODY);
@@ -705,6 +736,7 @@ fn no_event_file_created_when_env_unset() {
     );
 }
 
+#[cfg(feature = "local")]
 #[test]
 fn successive_runs_append_to_event_file() {
     let temp = TempEventLog::new("append");
@@ -749,6 +781,7 @@ fn successive_runs_append_to_event_file() {
 /// Runs the real `baton session` binary against `base_url`, piping `input` to
 /// its stdin (closed after writing, which the REPL sees as EOF). Mirrors the
 /// deterministic environment of [`run_baton_ask`].
+#[cfg(feature = "local")]
 fn run_baton_session(
     base_url: &str,
     input: &str,
@@ -786,6 +819,7 @@ fn run_baton_session(
     child.wait_with_output().expect("wait for baton session")
 }
 
+#[cfg(feature = "local")]
 #[test]
 fn session_runs_multi_turn_and_records_a_pair_per_turn() {
     let server = MockServer::spawn_repeating(200, SUCCESS_BODY);
@@ -934,6 +968,7 @@ fn log_show_without_source_is_usage_error() {
     );
 }
 
+#[cfg(feature = "local")]
 #[test]
 fn log_replay_resends_last_exchange_and_appends_fresh_events() {
     let server = MockServer::spawn(200, SUCCESS_BODY);
@@ -981,6 +1016,7 @@ fn log_replay_resends_last_exchange_and_appends_fresh_events() {
     assert_eq!(lines[1]["reply"], "hello from the mock server");
 }
 
+#[cfg(feature = "local")]
 #[test]
 fn log_replay_out_of_range_index_is_error() {
     let source = TempEventLog::new("replay-range");
@@ -1026,6 +1062,7 @@ fn log_replay_out_of_range_index_is_error() {
 /// Runs the real `baton exchange` binary against `base_url`, piping `request`
 /// (a JSON envelope) to its stdin. Mirrors the deterministic environment of
 /// [`run_baton_ask`].
+#[cfg(feature = "local")]
 fn run_baton_exchange(base_url: &str, request: &str) -> std::process::Output {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_baton"));
     cmd.arg("exchange");
@@ -1051,6 +1088,7 @@ fn run_baton_exchange(base_url: &str, request: &str) -> std::process::Output {
 }
 
 /// A well-formed `request` envelope, addressed a→b, on conversation `conv-1`.
+#[cfg(feature = "local")]
 const REQUEST_ENVELOPE: &str = r#"{
     "schema": "baton.message/v1",
     "message_id": "m-1",
@@ -1064,6 +1102,7 @@ const REQUEST_ENVELOPE: &str = r#"{
     "exchange": null
 }"#;
 
+#[cfg(feature = "local")]
 #[test]
 fn exchange_round_trips_a_response_envelope() {
     let server = MockServer::spawn(200, SUCCESS_BODY);
@@ -1098,6 +1137,7 @@ fn exchange_round_trips_a_response_envelope() {
     assert_eq!(resp["exchange"]["exchange"]["outcome"]["output_tokens"], 3);
 }
 
+#[cfg(feature = "local")]
 #[test]
 fn exchange_delivers_provider_error_as_envelope_and_exits_zero() {
     let body =
@@ -1123,6 +1163,7 @@ fn exchange_delivers_provider_error_as_envelope_and_exits_zero() {
     assert_eq!(resp["exchange"]["exchange"]["outcome"]["kind"], "auth");
 }
 
+#[cfg(feature = "local")]
 #[test]
 fn exchange_malformed_request_exits_non_zero_with_empty_stdout() {
     // No provider call is made, so no server is needed. A malformed request
@@ -1156,6 +1197,7 @@ fn exchange_malformed_request_exits_non_zero_with_empty_stdout() {
 // in-process mock server the other exchange tests use. Credentials/base_url are
 // passed as env overrides (API-key precedence pins the mock), so the spawned
 // child talks only to the mock.
+#[cfg(feature = "local")]
 #[test]
 fn subprocess_participant_round_trips_via_real_binary() {
     use baton::message::{MessageEnvelope, MessageKind};
@@ -1209,6 +1251,7 @@ fn subprocess_participant_round_trips_via_real_binary() {
 // so a bounded conversation runs to a terminal condition with no external
 // network and no in-process trait double — two genuinely independent agents
 // driven over the envelope boundary.
+#[cfg(feature = "local")]
 #[test]
 fn converse_drives_two_independent_processes_to_turn_cap() {
     use baton::converse::{Governance, TerminalReason, converse};
@@ -1291,6 +1334,7 @@ fn converse_drives_two_independent_processes_to_turn_cap() {
 // runs the governed loop against a repeating loopback mock, and writes the
 // JSONL trail to stdout, ending on the turn-cap.
 // ---------------------------------------------------------------------------
+#[cfg(feature = "local")]
 #[test]
 fn converse_command_writes_jsonl_trail_and_ends_on_turn_cap() {
     let server = MockServer::spawn_repeating(200, SUCCESS_BODY);
@@ -1402,6 +1446,7 @@ fn log_show_tolerates_trailing_partial_line() {
 
 /// `baton log replay` also tolerates a truncated trailing line and replays the
 /// complete exchange that precedes it.
+#[cfg(feature = "local")]
 #[test]
 fn log_replay_tolerates_trailing_partial_line() {
     let server = MockServer::spawn(200, SUCCESS_BODY);
@@ -1651,6 +1696,7 @@ printf 'stub response'
     );
 }
 
+#[cfg(feature = "local")]
 #[test]
 fn converse_b_mailbox_drives_multi_turn_against_live_serve() {
     let server = MockServer::spawn_repeating(200, SUCCESS_BODY);
@@ -1774,6 +1820,7 @@ fn converse_b_mailbox_drives_multi_turn_against_live_serve() {
 /// transport-timeout terminal: the driver stops waiting after `--b-await-ms`
 /// and records a `kind:"error"` turn with **no** nested record — distinct in
 /// the trail from a peer-delivered error (which nests the peer's call).
+#[cfg(feature = "local")]
 #[test]
 fn converse_b_mailbox_times_out_when_no_peer_answers() {
     let server = MockServer::spawn_repeating(200, SUCCESS_BODY);
@@ -1842,54 +1889,37 @@ fn converse_b_mailbox_times_out_when_no_peer_answers() {
 }
 
 /// The operator quickstart (`scripts/quickstart.sh`) runs the full A2A loop
-/// against the loopback mock — no network, no credential — and exits 0 having
-/// written both trails. This keeps the shipped demo artifact CI-covered.
+/// with external-agent stubs over `--agent-cmd` — no network, no credential,
+/// no provider at all — and exits 0 having written both trails. This keeps
+/// the shipped demo artifact CI-covered under the default, harness-only
+/// feature set.
 ///
-/// The mock lives under `examples/`, for which cargo exposes no
-/// `CARGO_BIN_EXE_*`; the test builds it explicitly and derives its path from
-/// the `baton` bin's directory, so the run never depends on cargo's example
-/// build-ordering.
-///
-/// Unix-only: `quickstart.sh` is a bash artifact and the mock binary carries no
-/// `.exe` suffix, so the harness assumptions hold on Unix (Linux + macOS) only.
+/// Unix-only: `quickstart.sh` is a bash artifact and the stub agents are
+/// `#!/bin/sh` scripts, so the harness assumptions hold on Unix (Linux +
+/// macOS) only.
 #[cfg(unix)]
 #[test]
-fn quickstart_script_runs_full_loop_against_mock() {
-    // Build the mock example explicitly (idempotent / cached) so its compiled
-    // path is guaranteed present before the script runs.
-    let cargo = option_env!("CARGO").unwrap_or("cargo");
-    let built = Command::new(cargo)
-        .args(["build", "--example", "mock_provider"])
-        .status()
-        .expect("build mock_provider example");
-    assert!(built.success(), "mock_provider example builds");
-
+fn quickstart_script_runs_full_loop() {
     let baton_bin = PathBuf::from(env!("CARGO_BIN_EXE_baton"));
-    // `<target>/<profile>/baton` -> `<target>/<profile>/examples/mock_provider`.
-    let mock_bin = baton_bin
-        .parent()
-        .expect("baton bin has a parent dir")
-        .join("examples")
-        .join("mock_provider");
-    assert!(mock_bin.exists(), "mock_provider at {}", mock_bin.display());
-
     let script = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("scripts")
         .join("quickstart.sh");
 
     let run_quickstart = |out_dir: &Path| {
-        // The script configures its own provider env; strip any host leakage so
-        // every run is deterministic regardless of the developer's shell.
+        // The script needs no provider env and strips it itself; remove host
+        // leakage anyway so every run is deterministic regardless of the
+        // developer's shell.
         Command::new("bash")
             .arg(&script)
             .env("BATON_BIN", &baton_bin)
-            .env("BATON_MOCK_BIN", &mock_bin)
             .env("QUICKSTART_OUT", out_dir)
             .env_remove("ANTHROPIC_API_KEY")
             .env_remove("ANTHROPIC_AUTH_TOKEN")
             .env_remove("CLAUDE_CODE_OAUTH_TOKEN")
             .env_remove("ANTHROPIC_BASE_URL")
             .env_remove("BATON_EVENT_LOG")
+            .env_remove("BATON_MODEL")
+            .env_remove("BATON_MAX_TURNS")
             .output()
             .expect("run quickstart.sh")
     };
@@ -1932,6 +1962,19 @@ fn quickstart_script_runs_full_loop_against_mock() {
             "stdout names the serve+send reply path: {stdout}"
         );
 
+        // The converse trail carries the seed plus one response per governed
+        // turn (the script caps at BATON_MAX_TURNS=3): seed + 3 replies.
+        let converse_text = std::fs::read_to_string(&converse_trail).expect("read converse trail");
+        let converse_lines: Vec<&str> = converse_text.lines().collect();
+        assert_eq!(
+            converse_lines.len(),
+            4,
+            "converse trail is seed + 3 turns: {converse_text}"
+        );
+        let seed: serde_json::Value =
+            serde_json::from_str(converse_lines[0]).expect("seed is one JSON line");
+        assert_eq!(seed["kind"], "request");
+
         // The consumed reply is a well-formed, correlated response envelope;
         // an error envelope must never be accepted as a successful run.
         let reply_line = std::fs::read_to_string(&reply_trail).expect("read reply trail");
@@ -1948,27 +1991,15 @@ fn quickstart_script_runs_full_loop_against_mock() {
 }
 
 /// A serve startup failure must stop the quickstart before it posts the first
-/// request. The wrapper makes that failure deterministic while delegating the
-/// converse half to the real binary, so the test also exercises the script's
-/// real process cleanup and captured-stderr path.
+/// request. The wrapper makes that failure deterministic — every non-`--stop`
+/// `serve` invocation exits 42, so the script's first serve (the interviewer
+/// ring peer) fails its readiness barrier — while delegating everything else
+/// to the real binary, so the test also exercises the script's real process
+/// cleanup and captured-stderr path.
 #[cfg(unix)]
 #[test]
 fn quickstart_reports_serve_startup_failure_before_send() {
-    let cargo = option_env!("CARGO").unwrap_or("cargo");
-    let built = Command::new(cargo)
-        .args(["build", "--example", "mock_provider"])
-        .status()
-        .expect("build mock_provider example");
-    assert!(built.success(), "mock_provider example builds");
-
     let baton_bin = PathBuf::from(env!("CARGO_BIN_EXE_baton"));
-    let mock_bin = baton_bin
-        .parent()
-        .expect("baton bin has a parent dir")
-        .join("examples")
-        .join("mock_provider");
-    assert!(mock_bin.exists(), "mock_provider at {}", mock_bin.display());
-
     let script = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("scripts")
         .join("quickstart.sh");
@@ -2017,7 +2048,6 @@ esac
     let out = Command::new("bash")
         .arg(&script)
         .env("BATON_BIN", &wrapper)
-        .env("BATON_MOCK_BIN", &mock_bin)
         .env("QUICKSTART_OUT", &out_dir)
         .env("REAL_BATON_BIN", &baton_bin)
         .env("SEND_MARKER", &send_marker)
@@ -2035,8 +2065,12 @@ esac
     );
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("quickstart: serve did not become ready"),
+        stderr.contains("serve did not become ready"),
         "stderr names the readiness failure: {stderr}"
+    );
+    assert!(
+        stderr.contains("interviewer"),
+        "the failure is the script's first serve (the interviewer ring peer): {stderr}"
     );
     assert!(
         stderr.contains("controlled serve failure"),
@@ -2056,14 +2090,38 @@ esac
 // The registry maps each participant name to its `{inbox, outbox}` pair; the
 // ring driver resolves every roster name at startup and builds one live,
 // mailbox-backed peer per member. Here three independent `baton serve` daemons
-// (alice / bob / carol) answer over their own mailboxes, all provider calls met
-// by one content-agnostic repeating mock. This is the end-to-end proof that the
-// registry wires an N-party round-robin conversation.
+// (alice / bob / carol) answer over their own mailboxes, each backed by its own
+// external-agent stub script — the harness-only path, with no provider
+// involved. This is the end-to-end proof that the registry wires an N-party
+// round-robin conversation.
 // ---------------------------------------------------------------------------
 
+/// Writes an executable shell stub that discards its stdin request and prints
+/// a fixed `reply` body — a minimal external agent for `serve --agent-cmd`.
+#[cfg(unix)]
+fn write_reply_stub(path: &Path, reply: &str) {
+    std::fs::write(
+        path,
+        format!(
+            r#"#!/bin/sh
+set -eu
+cat > /dev/null
+printf '%s' '{reply}'
+"#
+        ),
+    )
+    .expect("write agent stub");
+    let mut permissions = std::fs::metadata(path)
+        .expect("stat agent stub")
+        .permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(path, permissions).expect("make agent stub executable");
+}
+
 /// Spawns a `baton serve` daemon for one ring member, consuming `<root>/inbox`
-/// and replying into `<root>/outbox`, its provider calls answered by `base_url`.
-fn spawn_ring_serve(member_root: &Path, base_url: &str, model: &str) -> std::process::Child {
+/// and replying into `<root>/outbox`, answered by the external-agent `stub`.
+#[cfg(unix)]
+fn spawn_ring_serve(member_root: &Path, stub: &Path) -> std::process::Child {
     let mut serve = Command::new(env!("CARGO_BIN_EXE_baton"));
     serve.args([
         "serve",
@@ -2073,13 +2131,9 @@ fn spawn_ring_serve(member_root: &Path, base_url: &str, model: &str) -> std::pro
         member_root.join("outbox").to_str().unwrap(),
         "--poll-ms",
         "20",
+        "--agent-cmd",
+        stub.to_str().unwrap(),
     ]);
-    serve.env("ANTHROPIC_API_KEY", "test-key");
-    serve.env("ANTHROPIC_BASE_URL", base_url);
-    serve.env("BATON_MODEL", model);
-    serve.env("BATON_TIMEOUT_SECS", "5");
-    serve.env_remove("ANTHROPIC_AUTH_TOKEN");
-    serve.env_remove("CLAUDE_CODE_OAUTH_TOKEN");
     serve.env_remove("BATON_EVENT_LOG");
     serve.stdout(Stdio::null());
     serve.stderr(Stdio::null());
@@ -2087,6 +2141,7 @@ fn spawn_ring_serve(member_root: &Path, base_url: &str, model: &str) -> std::pro
 }
 
 /// Cooperatively stops the `serve` daemon consuming `<root>/inbox`.
+#[cfg(unix)]
 fn stop_ring_serve(member_root: &Path) {
     let _ = Command::new(env!("CARGO_BIN_EXE_baton"))
         .args([
@@ -2100,13 +2155,23 @@ fn stop_ring_serve(member_root: &Path) {
         .status();
 }
 
+#[cfg(unix)]
 #[test]
 fn converse_ring_drives_three_live_serve_peers() {
-    let server = MockServer::spawn_repeating(200, SUCCESS_BODY);
     let root = TempMailbox::new("ring");
     let alice = root.path.join("alice");
     let bob = root.path.join("bob");
     let carol = root.path.join("carol");
+    std::fs::create_dir_all(&alice).expect("create alice dir");
+    std::fs::create_dir_all(&bob).expect("create bob dir");
+    std::fs::create_dir_all(&carol).expect("create carol dir");
+
+    let alice_stub = alice.join("agent-stub");
+    let bob_stub = bob.join("agent-stub");
+    let carol_stub = carol.join("agent-stub");
+    write_reply_stub(&alice_stub, "ack from alice");
+    write_reply_stub(&bob_stub, "ack from bob");
+    write_reply_stub(&carol_stub, "ack from carol");
 
     // A registry mapping each roster name to its own mailbox pair (a pair, not a
     // single path). Absolute paths so the driver resolves them regardless of cwd.
@@ -2134,9 +2199,9 @@ fn converse_ring_drives_three_live_serve_peers() {
     .expect("write registry");
 
     // Three independent peers; each is a full `baton serve` daemon.
-    let mut alice_child = spawn_ring_serve(&alice, server.base_url(), "model-alice");
-    let mut bob_child = spawn_ring_serve(&bob, server.base_url(), "model-bob");
-    let mut carol_child = spawn_ring_serve(&carol, server.base_url(), "model-carol");
+    let mut alice_child = spawn_ring_serve(&alice, &alice_stub);
+    let mut bob_child = spawn_ring_serve(&bob, &bob_stub);
+    let mut carol_child = spawn_ring_serve(&carol, &carol_stub);
 
     let mut ring = Command::new(env!("CARGO_BIN_EXE_baton"));
     ring.args([
@@ -2185,17 +2250,21 @@ fn converse_ring_drives_three_live_serve_peers() {
     assert_eq!(seed["to"], "bob", "seed is addressed to roster[1]");
 
     // Round-robin order: each reply's authoritative speaker (`from`) advances by
-    // ring position — bob, carol, then alice on the wrap.
+    // ring position — bob, carol, then alice on the wrap. Each reply's body is
+    // its stub's fixed text, proving the external-agent participant (not a
+    // provider call) answered.
     let speakers: Vec<String> = lines[1..]
         .iter()
         .map(|line| {
             let reply: serde_json::Value = serde_json::from_str(line).expect("reply is JSON");
             assert_eq!(reply["kind"], "response", "each peer answers: {line}");
+            let from = reply["from"].as_str().unwrap().to_string();
             assert_eq!(
-                reply["exchange"]["schema"], "baton.exchange/v1",
-                "each served peer nests its provider call in-band"
+                reply["body"],
+                format!("ack from {from}"),
+                "the peer's own stub answered: {line}"
             );
-            reply["from"].as_str().unwrap().to_string()
+            from
         })
         .collect();
     assert_eq!(
@@ -3624,25 +3693,16 @@ fn service_session_survives_submitting_client_and_is_owned_by_run() {
     use baton::mailbox;
     use baton::message::{MessageEnvelope, MessageKind};
 
-    let server = MockServer::spawn_repeating(200, SUCCESS_BODY);
     let root = TempMailbox::new("service");
     let control = root.path.join("control");
     let inbox = root.path.join("inbox");
     let outbox = root.path.join("outbox");
+    let stub = root.path.join("agent-stub");
+    write_reply_stub(&stub, "hello from the agent stub");
 
-    // The long-lived supervisor. The mock provider credentials/model live
-    // here, not on the short-lived `service start` client below — the spawned
-    // `serve` session inherits *this* process's environment, since `Run` is
-    // its real parent.
+    // The long-lived supervisor.
     let mut run = Command::new(env!("CARGO_BIN_EXE_baton"));
     run.args(["service", "run", "--control", control.to_str().unwrap()]);
-    run.env("ANTHROPIC_API_KEY", "test-key");
-    run.env("ANTHROPIC_BASE_URL", server.base_url());
-    run.env("BATON_MODEL", "model-service");
-    run.env("BATON_TIMEOUT_SECS", "5");
-    run.env_remove("ANTHROPIC_AUTH_TOKEN");
-    run.env_remove("CLAUDE_CODE_OAUTH_TOKEN");
-    run.env_remove("BATON_EVENT_LOG");
     run.stdout(Stdio::null());
     run.stderr(Stdio::null());
     let mut run_child = run.spawn().expect("spawn baton service run");
@@ -3682,6 +3742,8 @@ fn service_session_survives_submitting_client_and_is_owned_by_run() {
             outbox.to_str().unwrap(),
             "--poll-ms",
             "20",
+            "--agent-cmd",
+            stub.to_str().unwrap(),
         ])
         .output()
         .expect("run baton service start");
@@ -3739,7 +3801,7 @@ fn service_session_survives_submitting_client_and_is_owned_by_run() {
         thread::sleep(Duration::from_millis(50));
     }
     let reply = reply.expect("the still-running session answers a message from a later sender");
-    assert_eq!(reply.body, "hello from the mock server");
+    assert_eq!(reply.body, "hello from the agent stub");
 
     // Teardown reaps the session and stops `Run` cooperatively; wait it out.
     let teardown = Command::new(env!("CARGO_BIN_EXE_baton"))
@@ -6035,7 +6097,6 @@ fn service_start_resolves_relative_paths_from_submitting_client() {
     use baton::mailbox;
     use baton::message::{MessageEnvelope, MessageKind};
 
-    let server = MockServer::spawn_repeating(200, SUCCESS_BODY);
     let root = TempMailbox::new("service-relative");
     let supervisor_dir = root.path.join("supervisor");
     let client_dir = root.path.join("client");
@@ -6045,17 +6106,12 @@ fn service_start_resolves_relative_paths_from_submitting_client() {
     let control = root.path.join("control");
     let inbox = client_dir.join("inbox");
     let outbox = client_dir.join("outbox");
+    let stub = root.path.join("agent-stub");
+    write_reply_stub(&stub, "hello from the agent stub");
 
     let mut run = Command::new(env!("CARGO_BIN_EXE_baton"));
     run.args(["service", "run", "--control", control.to_str().unwrap()]);
     run.current_dir(&supervisor_dir);
-    run.env("ANTHROPIC_API_KEY", "test-key");
-    run.env("ANTHROPIC_BASE_URL", server.base_url());
-    run.env("BATON_MODEL", "model-service");
-    run.env("BATON_TIMEOUT_SECS", "5");
-    run.env_remove("ANTHROPIC_AUTH_TOKEN");
-    run.env_remove("CLAUDE_CODE_OAUTH_TOKEN");
-    run.env_remove("BATON_EVENT_LOG");
     run.stdout(Stdio::null());
     run.stderr(Stdio::null());
     let mut run_child = run.spawn().expect("spawn baton service run");
@@ -6089,6 +6145,8 @@ fn service_start_resolves_relative_paths_from_submitting_client() {
             "outbox",
             "--poll-ms",
             "20",
+            "--agent-cmd",
+            stub.to_str().unwrap(),
         ])
         .current_dir(&client_dir)
         .output()
@@ -6165,7 +6223,7 @@ fn service_start_resolves_relative_paths_from_submitting_client() {
         thread::sleep(Duration::from_millis(50));
     }
     let reply = reply.expect("the session answers through the client-relative outbox");
-    assert_eq!(reply.body, "hello from the mock server");
+    assert_eq!(reply.body, "hello from the agent stub");
     assert!(
         outbox.is_dir(),
         "the response uses the client-relative outbox"
@@ -6329,6 +6387,8 @@ fn service_teardown_closes_admission_before_draining_sessions() {
             racing_outbox.to_str().unwrap(),
             "--poll-ms",
             "20",
+            "--agent-cmd",
+            "true",
         ])
         .output()
         .expect("run racing baton service start");
@@ -7851,11 +7911,14 @@ fn log_merge_nonexistent_path_is_stat_error() {
 // fails here rather than shipping silently.
 // ---------------------------------------------------------------------------
 
-/// A unique self-cleaning temp `BATON_HOME` root, keyed by pid + tag.
+/// A unique self-cleaning temp `BATON_HOME` root, keyed by pid + tag. Only the
+/// Unix external-agent and local-mode `--role` tests use it.
+#[cfg(any(unix, feature = "local"))]
 struct TempHome {
     path: PathBuf,
 }
 
+#[cfg(any(unix, feature = "local"))]
 impl TempHome {
     fn new(tag: &str) -> Self {
         let path = std::env::temp_dir().join(format!("baton-home-{}-{}", std::process::id(), tag));
@@ -7883,6 +7946,7 @@ impl TempHome {
     }
 }
 
+#[cfg(any(unix, feature = "local"))]
 impl Drop for TempHome {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.path);
@@ -7892,6 +7956,7 @@ impl Drop for TempHome {
 /// A repeating loopback provider that answers every connection with
 /// `SUCCESS_BODY` and records each raw request, so a test can assert *which*
 /// model reached the provider. Returns the base URL and the shared capture.
+#[cfg(feature = "local")]
 fn spawn_recording_provider() -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
     use std::sync::{Arc, Mutex};
 
@@ -7934,6 +7999,7 @@ fn spawn_recording_provider() -> (String, std::sync::Arc<std::sync::Mutex<Vec<St
 /// process without `SystemRoot` cannot initialise networking, so the host
 /// environment is kept and only the variables under test are removed. The caller
 /// sets whatever it wants back afterwards (later `env` calls win).
+#[cfg(feature = "local")]
 fn strip_provider_env(cmd: &mut Command) -> &mut Command {
     for var in [
         "ANTHROPIC_API_KEY",
@@ -7976,6 +8042,7 @@ printf '%s' '{reply}'
 
 /// Sends one request into `inbox` and awaits its reply from `outbox`, with a
 /// hermetic (cleared) environment — `send` needs no provider configuration.
+#[cfg(any(unix, feature = "local"))]
 fn send_awaiting_reply(
     inbox: &Path,
     outbox: &Path,
@@ -8007,6 +8074,7 @@ fn send_awaiting_reply(
 
 /// Stops a live `serve` daemon and reaps it, returning both outputs. Called
 /// before any assertion so a failure cannot leave a daemon behind.
+#[cfg(any(unix, feature = "local"))]
 fn stop_and_reap(
     inbox: &Path,
     serve_child: std::process::Child,
@@ -8120,6 +8188,7 @@ fn serve_role_external_agent_uses_role_cwd_and_records_seat_session() {
 /// The local-provider role host: with no `--agent-cmd`, the role's identity
 /// feeds `BatonConfig::from_lookup`, so the role's `model` and `base_url` from
 /// `config.json` are what the provider actually sees.
+#[cfg(feature = "local")]
 #[test]
 fn serve_role_local_provider_uses_role_model_from_config() {
     let home = TempHome::new("role-provider");
@@ -8270,6 +8339,7 @@ fn serve_role_agent_cwd_flag_overrides_role_config_cwd() {
 /// Precedence over the role layer: `BATON_MODEL` in the environment beats the
 /// role config's `model` (env over role), the layered lookup's own contract seen
 /// end-to-end through `serve --role`.
+#[cfg(feature = "local")]
 #[test]
 fn serve_role_env_model_overrides_role_config_model() {
     let home = TempHome::new("role-model-env");

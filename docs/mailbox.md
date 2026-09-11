@@ -28,11 +28,15 @@ baton serve --stop --inbox <dir>
 - `--poll-ms <n>` — inbox poll interval in milliseconds (default `500`).
 - `--once` — drain everything currently pending, then exit (cron-friendly);
   omitted, `serve` polls the inbox until terminated.
-- `--agent-cmd <program>` — host the role with an **external agent** instead of an
-  in-process provider call (see [External-agent role](external-agent.md#external-agent-role---agent-cmd)).
+- `--agent-cmd <program>` — host the role with an **external agent** (see
+  [External-agent role](external-agent.md#external-agent-role---agent-cmd)).
+  This is the only answering path a default, harness-only build has — `serve`
+  refuses to start without it (an in-process provider fallback exists only in
+  legacy `--features local` builds).
 - `--role <name>` — resolve the answering identity from the role's
   [home directory](configuration.md#role-homes-rolesname) (`roles/<name>/`), so a party is stood
-  up by name instead of hand-assembled env vars. In-process mode feeds the role's
+  up by name instead of hand-assembled env vars. In-process mode (legacy
+  `--features local` builds) feeds the role's
   layered config (model, base URL, credential, system prompt, timeouts) to the
   provider call; agent mode fills `--agent-cwd` from the role's `cwd` when the
   flag is not passed — baton stops there, since it carries no other
@@ -44,11 +48,12 @@ baton serve --stop --inbox <dir>
 - `--stop` — cooperatively stop the `serve` running on `--inbox` (see
   [Shutdown](#shutdown-cooperative-graceful-stop)); takes only `--inbox`.
 
-Without `--agent-cmd`, each side configures the answering participant exactly as
-`exchange`/`ask` do (`BATON_MODEL`, `BATON_SYSTEM_PROMPT`, the credential env,
-`BATON_EVENT_LOG`), so a served message runs the identical exchange and records
-the same trail. A `--role` supplies these same values from the role's home when
-the env leaves them unset.
+Without `--agent-cmd` (legacy `--features local` builds only), each side
+configures the answering participant exactly as `exchange`/`ask` do
+(`BATON_MODEL`, `BATON_SYSTEM_PROMPT`, the credential env, `BATON_EVENT_LOG`),
+so a served message runs the identical exchange and records the same trail. A
+`--role` supplies these same values from the role's home when the env leaves
+them unset.
 
 After participant setup, mailbox lock acquisition, stale-stop handling, and
 stale-claim reclamation all succeed, `serve` writes and flushes the exact line

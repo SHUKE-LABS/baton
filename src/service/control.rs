@@ -764,6 +764,9 @@ pub(super) fn handle_start_request(
     let spec: SessionSpec = serde_json::from_str(&data).map_err(|err| {
         BatonError::Decode(format!("malformed session spec {spec_path:?}: {err}"))
     })?;
+    if let Err(err) = ensure_spawnable(&spec) {
+        return reject_start_request(control, request_id, admission::admission_error_text(&err));
+    }
     let session_id = fresh_session_id();
     let log_dir = session_logs_dir(control, &session_id);
     if let Err(err) = fs::create_dir_all(&log_dir) {
@@ -854,6 +857,9 @@ pub(super) fn handle_start_request(
     let spec: SessionSpec = serde_json::from_str(&data).map_err(|err| {
         BatonError::Decode(format!("malformed session spec {spec_path:?}: {err}"))
     })?;
+    if let Err(err) = ensure_spawnable(&spec) {
+        return reject_start_request(control, request_id, admission::admission_error_text(&err));
+    }
     let job_name = fresh_job_name("session");
     let job = match create_job(&job_name, false) {
         Ok(job) => job,
@@ -989,6 +995,31 @@ pub(super) fn serve_argv(spec: &SessionSpec) -> Vec<String> {
         argv.push(role.clone());
     }
     argv
+}
+
+/// Rejects a claimed start request whose spec has no `agent_cmd` in a
+/// build with no local provider — such a `serve` would still spawn as a
+/// process and only usage-error internally, turning a rejected start into
+/// what looks like a crashed session. Called from both platforms'
+/// [`handle_start_request`], the sole path into [`spawn_serve_child`], so a
+/// legacy `agent_cmd: null` record is rejected the same way as a fresh one.
+#[cfg(not(feature = "local"))]
+pub(super) fn ensure_spawnable(spec: &SessionSpec) -> Result<()> {
+    if spec.agent_cmd.is_none() {
+        return Err(BatonError::Usage(
+            "session spec has no agent_cmd; this build is harness-only (the \
+             `local` feature is disabled) and cannot run the in-process \
+             participant fallback — resubmit with --agent-cmd, or rebuild \
+             with --features local"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(feature = "local")]
+pub(super) fn ensure_spawnable(_spec: &SessionSpec) -> Result<()> {
+    Ok(())
 }
 
 // -- Task control-plane request protocol -------------------------------

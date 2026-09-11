@@ -52,6 +52,52 @@ jobs:
         shell: bash
         run: bash scripts/release.sh verify-docs
 
+  # Verifies the opt-in `local` feature (the in-process provider path kept as
+  # an escape hatch) still builds and tests cleanly on its own — the default
+  # matrix above never enables it, so nothing else would catch a regression.
+  local-feature:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache cargo registry & target
+        uses: Swatinem/rust-cache@v2
+
+      - name: Clippy
+        run: cargo clippy --all-targets --features local -- -D warnings
+
+      - name: Build
+        run: cargo build --verbose --features local
+
+      - name: Test
+        run: cargo test --verbose --features local
+
+  # Verifies the harness-only default build still cross-compiles for a
+  # constrained ARM target now that the provider HTTP client is gated behind
+  # `local` — a regression here would mean the slim build no longer serves
+  # its intended embedded/router-class deployments.
+  cross-armv7:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry & target
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install cross
+        run: cargo install cross --git https://github.com/cross-rs/cross
+
+      - name: Build (armv7-unknown-linux-musleabihf)
+        run: cross build --verbose --target armv7-unknown-linux-musleabihf
+
   # Verifies the declared MSRV floor so `cargo install --tag <tag> --locked`
   # can't silently break for a consumer on the exact rustc the README promises.
   # Build/test only — no fmt/clippy (their output is toolchain-version-specific).

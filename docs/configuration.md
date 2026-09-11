@@ -7,7 +7,12 @@ transport those settings drive.
 
 ## Environment variables
 
-Baton reads its runtime configuration from environment variables:
+Baton reads its runtime configuration from environment variables. The provider
+variables below (credential, base URL, model, timeouts) drive the in-process
+provider path, which ships only in legacy `--features local` builds — a
+default, harness-only build reads none of them, because an external agent owns
+its own configuration (see
+[external-agent.md](external-agent.md#external-agent-role---agent-cmd)):
 
 | Variable                     | Required | Default                     | Purpose                                              |
 | ---------------------------- | -------- | --------------------------- | ---------------------------------------------------- |
