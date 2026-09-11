@@ -182,6 +182,65 @@ fn global_help_and_version_flags_succeed_without_configuration() {
     }
 }
 
+#[test]
+fn bare_invocation_prints_help_and_succeeds() {
+    let bare = Command::new(env!("CARGO_BIN_EXE_baton"))
+        .env_remove("ANTHROPIC_API_KEY")
+        .env_remove("ANTHROPIC_AUTH_TOKEN")
+        .env_remove("CLAUDE_CODE_OAUTH_TOKEN")
+        .output()
+        .expect("run bare baton");
+    assert!(
+        bare.status.success(),
+        "bare invocation should succeed; stderr: {}",
+        String::from_utf8_lossy(&bare.stderr)
+    );
+    assert!(
+        bare.stderr.is_empty(),
+        "bare invocation stderr must be empty"
+    );
+
+    let help = Command::new(env!("CARGO_BIN_EXE_baton"))
+        .arg("--help")
+        .env_remove("ANTHROPIC_API_KEY")
+        .env_remove("ANTHROPIC_AUTH_TOKEN")
+        .env_remove("CLAUDE_CODE_OAUTH_TOKEN")
+        .output()
+        .expect("run baton --help");
+    assert_eq!(
+        bare.stdout, help.stdout,
+        "bare invocation must match --help"
+    );
+}
+
+#[test]
+fn usage_errors_are_terse_with_a_help_pointer() {
+    for args in [vec!["badcmd"], vec!["ask", "-p"]] {
+        let out = Command::new(env!("CARGO_BIN_EXE_baton"))
+            .args(&args)
+            .env_remove("ANTHROPIC_API_KEY")
+            .env_remove("ANTHROPIC_AUTH_TOKEN")
+            .env_remove("CLAUDE_CODE_OAUTH_TOKEN")
+            .output()
+            .expect("run baton with bad args");
+        assert!(!out.status.success(), "{args:?} should fail");
+        assert!(out.stdout.is_empty(), "{args:?} stdout must be empty");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("run 'baton --help' for usage."),
+            "{args:?} stderr should point to --help: {stderr}"
+        );
+        assert!(
+            !stderr.contains("Global options:"),
+            "{args:?} stderr must not dump the full help: {stderr}"
+        );
+        assert!(
+            !stderr.contains("Send a single prompt"),
+            "{args:?} stderr must not include the grouped command reference: {stderr}"
+        );
+    }
+}
+
 /// A single-shot mock HTTP server bound to a kernel-assigned port on
 /// `127.0.0.1`. The first request receives `status` + `body` and the
 /// connection is closed. `hold_open` controls whether the connection is
@@ -5958,8 +6017,17 @@ fn service_stop_serializes_task_admission_and_reaps_owned_tasks() {
         "rejected racing task must not spawn"
     );
 
+    // `service stop`'s own kill ladder (session STOP_GRACE_MS/KILL_GRACE_MS,
+    // then the admitted task's KILL_GRACE_MS ladder) already ran inside the
+    // awaited command above, but full convergence — the daemon's own
+    // supervisor tick reconciling any residue left by that bounded ladder —
+    // is eventually consistent, not guaranteed by the time this loop starts.
+    // 100 * 50ms (5s) undersizes it relative to the documented worst case
+    // (STOP_GRACE_MS + 2×KILL_GRACE_MS for the session, then 2×KILL_GRACE_MS
+    // for the task) under CI scheduling load; widen to the 10s budget already
+    // used for other eventually-consistent daemon waits in this file.
     let mut admitted_reaped = false;
-    for _ in 0..100 {
+    for _ in 0..200 {
         let status = Command::new(env!("CARGO_BIN_EXE_baton"))
             .args(["task", "status", "--control", control_str])
             .output()
