@@ -213,6 +213,34 @@ fn bare_invocation_prints_help_and_succeeds() {
     );
 }
 
+#[test]
+fn usage_errors_are_terse_with_a_help_pointer() {
+    for args in [vec!["badcmd"], vec!["ask", "-p"]] {
+        let out = Command::new(env!("CARGO_BIN_EXE_baton"))
+            .args(&args)
+            .env_remove("ANTHROPIC_API_KEY")
+            .env_remove("ANTHROPIC_AUTH_TOKEN")
+            .env_remove("CLAUDE_CODE_OAUTH_TOKEN")
+            .output()
+            .expect("run baton with bad args");
+        assert!(!out.status.success(), "{args:?} should fail");
+        assert!(out.stdout.is_empty(), "{args:?} stdout must be empty");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("run 'baton --help' for usage."),
+            "{args:?} stderr should point to --help: {stderr}"
+        );
+        assert!(
+            !stderr.contains("Global options:"),
+            "{args:?} stderr must not dump the full help: {stderr}"
+        );
+        assert!(
+            !stderr.contains("Send a single prompt"),
+            "{args:?} stderr must not include the grouped command reference: {stderr}"
+        );
+    }
+}
+
 /// A single-shot mock HTTP server bound to a kernel-assigned port on
 /// `127.0.0.1`. The first request receives `status` + `body` and the
 /// connection is closed. `hold_open` controls whether the connection is

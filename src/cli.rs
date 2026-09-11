@@ -62,11 +62,12 @@ use crate::transport::claude::ClaudeClient;
 /// recording is disabled.
 pub const EVENT_LOG_ENV: &str = "BATON_EVENT_LOG";
 
-/// Grouped per-command usage reference, printed by `baton --help` / bare
-/// `baton` and appended to argument errors. One block per command: its
-/// synopsis line(s), then a one-sentence description. A command whose
-/// dispatch is gated by `#[cfg(feature = "local")]` unconditionally (not just
-/// under a specific flag combination, e.g. `serve --agent-cmd`) says so.
+/// Grouped per-command usage reference, printed by `baton --help` and bare
+/// `baton`. One block per command: its synopsis line(s), then a one-sentence
+/// description. A command whose dispatch is gated by
+/// `#[cfg(feature = "local")]` unconditionally (not just under a specific
+/// flag combination, e.g. `serve --agent-cmd`) says so. Argument errors do
+/// not embed this reference — see [`usage`] — only a pointer to `--help`.
 pub const USAGE: &str = concat!(
     "usage: baton <command> [options]\n",
     "\n",
@@ -3861,10 +3862,13 @@ mod tests {
 
     #[test]
     fn unknown_command_is_usage_error() {
-        assert!(matches!(
-            parse_args(&argv(&["chat", "-p", "hi"])).unwrap_err(),
-            BatonError::Usage(_)
-        ));
+        match parse_args(&argv(&["chat", "-p", "hi"])).unwrap_err() {
+            BatonError::Usage(msg) => {
+                assert!(msg.contains("run 'baton --help' for usage."), "{msg}");
+                assert!(!msg.contains("Global options:"), "{msg}");
+            }
+            other => panic!("expected BatonError::Usage, got {other:?}"),
+        }
     }
 
     #[test]
