@@ -2538,14 +2538,19 @@ fn service_liveness_keys_ignore_supervisor_and_client_environment() {
         if status.status.success() {
             let json: serde_json::Value =
                 serde_json::from_slice(&status.stdout).expect("live status is JSON");
-            if json["service_running"] == true {
+            // `service_running:true` can be observed before `run_service`
+            // finishes writing `service.info.json` (the lock is taken first);
+            // keep polling through that startup race until `daemon` itself
+            // is populated, not just liveness.
+            if json["service_running"] == true && json["daemon"].is_object() {
                 live_status_json = Some(json);
                 break;
             }
         }
         thread::sleep(Duration::from_millis(50));
     }
-    let live_status_json = live_status_json.expect("macOS service run did not report live in time");
+    let live_status_json =
+        live_status_json.expect("macOS service run did not report a live daemon identity in time");
     // Canonicalize only the test's own expected literal, to absorb macOS's
     // `/tmp` -> `/private/tmp` symlink in `CARGO_BIN_EXE_baton`'s path — the
     // production `daemon.exe` value itself must stay exactly what the
