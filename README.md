@@ -8,7 +8,7 @@ center of the design.
 
 ## Status
 
-The current blessed release is `v0.7.0`.
+The current blessed release is `v0.8.0`.
 
 Baton's default build is **harness-only**: it ships the agent-to-agent
 substrate — the `baton.message/v1` envelope, the file mailbox (`baton serve` /
@@ -137,7 +137,7 @@ Put the extracted executable on your `PATH`. On macOS, use
 If a Rust toolchain (≥ 1.89) is available, the from-source alternative is:
 
 ```bash
-cargo install --git https://github.com/shukebeta/baton --tag v0.7.0 --locked
+cargo install --git https://github.com/shukebeta/baton --tag v0.8.0 --locked
 ```
 
 This puts `baton` on your PATH. The `--locked` flag is **required**: without it
