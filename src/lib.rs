@@ -35,4 +35,5 @@ pub mod service;
 pub mod task;
 #[cfg(test)]
 mod test_support;
+#[cfg(feature = "local")]
 pub mod transport;

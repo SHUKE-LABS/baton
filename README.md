@@ -10,22 +10,21 @@ center of the design.
 
 The current blessed release is `v0.6.2`.
 
-Early scaffolding. The crate establishes the module layout and typed runtime
-shape around a non-streaming Claude-compatible Messages client
-(`transport::claude::ClaudeClient`). Its commands wire it to the command line:
-`baton ask` for a single-turn first-prompt / first-reply, `baton session` for an
-interactive multi-turn REPL that accumulates conversation history across turns,
-`baton exchange` for one structured `baton.message/v1` request/reply round-trip,
-`baton converse` for a governed two-participant conversation driven to a terminal
-condition, `baton converse-ring` for the N-party round-robin generalisation over a
-static routing registry, `baton serve` for answering `baton.message/v1` requests
-from a file mailbox, `baton send` for posting a request into a mailbox (by path or
-by **role name** via the registry) and consuming the correlated reply, `baton
-status` for reporting a mailbox's liveness (`idle-done` / `busy` / `crashed-stale`
-plus queue depth), and `baton log` for inspecting and replaying the recorded
-exchange trail. The surface also includes `baton roles` and `baton role show`
-for role identity inspection, `baton service` for host-owned mailbox
-supervision, and `baton task` for asynchronous jobs managed by that service.
+Baton's default build is **harness-only**: it ships the agent-to-agent
+substrate — the `baton.message/v1` envelope, the file mailbox (`baton serve` /
+`send` / `status`), the external-agent seam (`serve --agent-cmd`, where a
+full-tooled agent CLI owns its own provider), the N-party `converse-ring`
+driver, trail recording and replay (`baton log`), role identity
+(`baton roles`), and the host-owned supervisor (`baton service` / `baton
+task`). It carries **no provider client and needs no API key**: every reply is
+produced by an external agent process of your choosing.
+
+The in-process provider path — the Claude-compatible Messages client behind
+`baton ask`, `baton session`, `baton exchange`, and provider-backed `baton
+converse`/`serve` — is kept behind an opt-in `local` Cargo feature as a legacy
+escape hatch and is scheduled for removal; use
+[`SHUKE-LABS/leg`](https://github.com/SHUKE-LABS/leg) (a standalone CLI
+carrying those verbs) or an external agent instead.
 
 ## Documentation
 
@@ -172,54 +171,49 @@ would be reworked.
 
 ## Quickstart
 
-To see the whole A2A loop end-to-end — reproducibly, with no API key and no
-external network — run:
+To see the whole A2A loop end-to-end — with no API key, no network, and no
+provider at all — run:
 
 ```bash
 ./scripts/quickstart.sh
 ```
 
-It launches a loopback mock provider (`examples/mock_provider.rs`), points baton
-at it via `ANTHROPIC_BASE_URL`, and drives both A2A surfaces:
+Every participant is a tiny shell "agent" wired in over `--agent-cmd`, exactly
+like a real external agent CLI (`claude -p`, `codex exec`, `leg exchange`, ...)
+would be. The script drives both A2A surfaces:
 
-1. **`baton converse`** — a governed two-agent conversation between the example
-   identities in `prompts/interviewer.md` and `prompts/candidate.md`, driven to
-   the turn-cap.
-2. **`baton serve` + `baton send --await`** — an asynchronous mailbox
-   round-trip: the script waits for `serve` to report readiness, then `serve`
-   answers a request dropped into an inbox and `send` consumes the correlated
-   reply.
+1. **`baton converse-ring`** — a governed two-party conversation between two
+   independent `serve --agent-cmd` peers (the mailbox/external-agent
+   equivalent of `baton converse`), driven to the turn-cap.
+2. **`baton serve --agent-cmd` + `baton send --await`** — an asynchronous
+   mailbox round-trip: the script waits for `serve` to report readiness, then
+   `serve` answers a request dropped into an inbox and `send` consumes the
+   correlated reply.
 
 The resulting JSONL trails are written under `target/quickstart/`
 (`converse-trail.jsonl` and `serve-send-reply.jsonl`); the script prints each
-path and exits 0. It needs only a Rust toolchain — the mock stands in for the
-provider, so no credential is read and nothing leaves `127.0.0.1`.
+path and exits 0. It needs only a Rust toolchain — nothing leaves your machine
+and no credential is read.
 
-### Mock vs. a real provider
+### Swap in a real agent
 
-The mock run proves **plumbing and reproducibility**: that the commands wire
-together and terminate deterministically. It is *not* a demonstration — every
-reply is the same canned line, so a mock-vs-mock exchange is no substitute for
-the real artifact.
-
-To **demonstrate** baton to a human, run the same two commands against a real
-provider: set a real credential (`ANTHROPIC_API_KEY`), leave `ANTHROPIC_BASE_URL`
-at its default (or point it at your gateway), and keep the two distinct system
-prompts so the agents hold a genuine conversation with real replies:
+The stub agents prove **plumbing and reproducibility**: that the commands wire
+together and terminate deterministically. To make it a real demonstration,
+point `--agent-cmd` at your own agent CLI and give each peer its own identity
+(see [docs/external-agent.md](docs/external-agent.md)):
 
 ```bash
-export ANTHROPIC_API_KEY=sk-...          # a real credential
-unset ANTHROPIC_BASE_URL                  # use the real Messages API
-
-baton converse \
-  --a-system prompts/interviewer.md \
-  --b-system prompts/candidate.md \
-  --seed "Introduce yourself in one sentence." \
-  --out /tmp/trail.jsonl
-
-# In one shell: a long-lived responder.
-baton serve --inbox /tmp/mbox/inbox --outbox /tmp/mbox/outbox
+# In one shell: a long-lived responder backed by a real agent.
+baton serve --inbox /tmp/mbox/inbox --outbox /tmp/mbox/outbox \
+  --agent-cmd claude \
+  --agent-arg -p --agent-arg --dangerously-skip-permissions
 # In another: post a request and read the correlated reply.
 baton send --inbox /tmp/mbox/inbox --outbox /tmp/mbox/outbox \
   --await --body "Ping over the mailbox."
 ```
+
+The agent owns its own model, credentials, and MCP config; baton owns only the
+mailbox plumbing, which is identical either way. For the provider-backed chat
+verbs (`ask`, `session`, `exchange`), use
+[`SHUKE-LABS/leg`](https://github.com/SHUKE-LABS/leg) or build baton from
+source with `--features local` (legacy; scheduled for removal).

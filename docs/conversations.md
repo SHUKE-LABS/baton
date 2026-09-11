@@ -6,6 +6,15 @@ round-trip, and the two governed drivers. The envelope and trail schemas these
 verbs write are in [protocol.md](protocol.md); the mailbox they reach peers over
 is in [mailbox.md](mailbox.md).
 
+> **Build scope.** `ask`, `session`, `exchange`, and `converse` (any form —
+> side A is always an in-process provider participant) need the provider
+> client, which ships only in legacy `--features local` builds (scheduled for
+> removal) — the default, harness-only `baton` build refuses them; use
+> [`SHUKE-LABS/leg`](https://github.com/SHUKE-LABS/leg), which carries these
+> verbs standalone. `converse-ring` is harness-only: it drives external-agent
+> `baton serve` peers over the mailbox and needs no provider client — a
+> two-name roster is the harness-only `converse` equivalent.
+
 ## First reply
 
 `baton ask` sends a single prompt and prints the assistant's reply.

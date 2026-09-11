@@ -2404,13 +2404,19 @@ mod imp {
             fs::write(sessions_dir(&dir.path), b"not a directory").expect("block sessions dir");
 
             let spec_path = dir.path.join("session-request.json");
+            let mut session_spec = spec(
+                &dir.path.join("in").display().to_string(),
+                &dir.path.join("out").display().to_string(),
+            );
+            // This spawns the test binary itself, not a real `baton serve`,
+            // so the value is never actually consumed as a CLI flag — only
+            // its presence matters, to clear the harness-only build's
+            // `ensure_spawnable` gate ahead of the admission failure under
+            // test.
+            session_spec.agent_cmd = Some("true".to_string());
             fs::write(
                 &spec_path,
-                serde_json::to_string(&spec(
-                    &dir.path.join("in").display().to_string(),
-                    &dir.path.join("out").display().to_string(),
-                ))
-                .expect("serialize session spec"),
+                serde_json::to_string(&session_spec).expect("serialize session spec"),
             )
             .expect("write session spec");
 
@@ -2433,6 +2439,57 @@ mod imp {
                     .unwrap_or_default()
                     .is_empty(),
                 "a failed admission persists no session record"
+            );
+        }
+
+        /// A harness-only build (no `local` feature) rejects a start
+        /// request with no `--agent-cmd` before ever creating a log
+        /// directory or spawning a child — the in-process participant
+        /// fallback the request implicitly asks for does not exist in
+        /// this build.
+        #[cfg(not(feature = "local"))]
+        #[test]
+        fn start_request_without_agent_cmd_is_rejected_before_any_spawn() {
+            let _guard = serialize_forks_and_locks();
+            let dir = TempDir::new("session-no-agent-cmd");
+
+            let spec_path = dir.path.join("session-request.json");
+            let session_spec = spec(
+                &dir.path.join("in").display().to_string(),
+                &dir.path.join("out").display().to_string(),
+            );
+            assert!(session_spec.agent_cmd.is_none());
+            fs::write(
+                &spec_path,
+                serde_json::to_string(&session_spec).expect("serialize session spec"),
+            )
+            .expect("write session spec");
+
+            let outcome = handle_start_request(&dir.path, "session-no-agent-cmd", &spec_path)
+                .expect("a rejected request is a handled response, not a request-loop error");
+            assert!(outcome.is_none(), "a rejected request returns no session");
+
+            let response_path =
+                responses_dir(&dir.path).join(mailbox::file_name("session-no-agent-cmd"));
+            let response: StartResponse =
+                serde_json::from_str(&fs::read_to_string(response_path).expect("start response"))
+                    .expect("decode start response");
+            assert!(response.session_id.is_none());
+            let error = response.error.expect("the response carries an error");
+            assert!(
+                error.contains("agent_cmd") && error.contains("local"),
+                "the response names the missing agent_cmd / local feature: {error}"
+            );
+            assert!(
+                list_session_records(&dir.path)
+                    .unwrap_or_default()
+                    .is_empty(),
+                "a rejected request persists no session record"
+            );
+            assert!(
+                !sessions_dir(&dir.path).exists(),
+                "a rejected request never creates a session log directory, \
+                 which would only happen after a real spawn"
             );
         }
 

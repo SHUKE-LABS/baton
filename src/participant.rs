@@ -23,11 +23,18 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::error::{BatonError, Result};
-use crate::events::{ExchangeMeta, now_ms};
+#[cfg(feature = "local")]
+use crate::events::ExchangeMeta;
+use crate::events::now_ms;
+#[cfg(feature = "local")]
 use crate::log::{Exchange, Outcome, RequestRecord};
 use crate::mailbox;
-use crate::message::{MessageEnvelope, MessageKind, WrappedExchange};
+#[cfg(feature = "local")]
+use crate::message::WrappedExchange;
+use crate::message::{MessageEnvelope, MessageKind};
+#[cfg(feature = "local")]
 use crate::model::Prompt;
+#[cfg(feature = "local")]
 use crate::transport::Transport;
 
 /// Answers a `baton.message/v1` request envelope with a response envelope.
@@ -50,11 +57,13 @@ pub trait Participant {
 /// record for the call it ran so the call — and its token usage — is observable
 /// in-band. [`ExchangeMeta`] supplies the `model`/`base_url` stamped on that
 /// nested record.
+#[cfg(feature = "local")]
 pub struct LocalParticipant<T: Transport> {
     transport: T,
     meta: ExchangeMeta,
 }
 
+#[cfg(feature = "local")]
 impl<T: Transport> LocalParticipant<T> {
     /// Builds a participant over `transport`, stamping `meta` (`model` /
     /// `base_url`) onto the nested `baton.exchange/v1` record of each reply.
@@ -63,6 +72,7 @@ impl<T: Transport> LocalParticipant<T> {
     }
 }
 
+#[cfg(feature = "local")]
 impl<T: Transport> Participant for LocalParticipant<T> {
     fn respond(&self, request: &MessageEnvelope) -> MessageEnvelope {
         let request_ts = now_ms();
@@ -145,6 +155,7 @@ impl<T: Transport> Participant for LocalParticipant<T> {
 ///   *synthesized* delivered `kind: "error"` envelope with **no** nested record
 ///   — the parent observed no provider call it can vouch for (mirroring how
 ///   [`testing::ScriptedParticipant`] nests nothing when it ran no call).
+#[cfg(feature = "local")]
 pub struct SubprocessParticipant {
     program: PathBuf,
     args: Vec<String>,
@@ -152,6 +163,7 @@ pub struct SubprocessParticipant {
     read_timeout: Duration,
 }
 
+#[cfg(feature = "local")]
 impl SubprocessParticipant {
     /// Builds a participant that spawns `program` with `args`, layering `envs`
     /// over the inherited environment, and waits at most `read_timeout` for the
@@ -224,6 +236,7 @@ impl SubprocessParticipant {
     }
 }
 
+#[cfg(feature = "local")]
 impl Participant for SubprocessParticipant {
     fn respond(&self, request: &MessageEnvelope) -> MessageEnvelope {
         match self.try_respond(request) {
@@ -1120,20 +1133,26 @@ pub mod testing {
 mod tests {
     use super::testing::ScriptedParticipant;
     use super::*;
+    #[cfg(feature = "local")]
     use crate::config::{BatonConfig, Credential, DEFAULT_MAX_TOKENS};
-    use crate::error::Result;
+    use crate::log::{Exchange, Outcome, RequestRecord};
+    use crate::message::WrappedExchange;
+    #[cfg(feature = "local")]
     use crate::transport::claude::ClaudeClient;
+    #[cfg(feature = "local")]
     use crate::transport::http::{HttpClient, HttpResponse};
     use std::time::Duration;
 
     /// A fake [`HttpClient`] returning a canned status + body, so a
     /// [`ClaudeClient`] can be driven without a network — mirroring the fake in
     /// `transport::claude`'s own tests.
+    #[cfg(feature = "local")]
     struct FakeHttp {
         status: u16,
         body: String,
     }
 
+    #[cfg(feature = "local")]
     impl HttpClient for FakeHttp {
         fn post_json(
             &self,
@@ -1148,6 +1167,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "local")]
     fn test_meta() -> ExchangeMeta {
         ExchangeMeta {
             model: "claude-test-model".to_string(),
@@ -1155,6 +1175,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "local")]
     fn test_config() -> BatonConfig {
         BatonConfig {
             credential: Credential::ApiKey("secret-key".to_string()),
@@ -1181,6 +1202,7 @@ mod tests {
     /// A `ClaudeClient`-backed participant (as production uses) turns a request
     /// envelope into a `kind: "response"` reply correlated to the request, with
     /// the provider call nested in-band.
+    #[cfg(feature = "local")]
     #[test]
     fn local_participant_builds_response_envelope_correlated_to_request() {
         let body = r#"{"content": [{"type": "text", "text": "four"}]}"#;
@@ -1219,6 +1241,7 @@ mod tests {
     }
 
     /// Reported token usage rides along on the nested `baton.exchange/v1` record.
+    #[cfg(feature = "local")]
     #[test]
     fn local_participant_wraps_reported_token_usage() {
         let body = r#"{"content": [{"type": "text", "text": "hi"}], "usage": {"input_tokens": 7, "output_tokens": 11}}"#;
@@ -1248,6 +1271,7 @@ mod tests {
 
     /// The provider terminal reason remains available in the nested exchange
     /// so a conversation driver can warn even when this participant is remote.
+    #[cfg(feature = "local")]
     #[test]
     fn local_participant_wraps_stop_reason() {
         let body =
@@ -1273,6 +1297,7 @@ mod tests {
 
     /// A provider failure is a *delivered* `kind: "error"` envelope, never a
     /// propagated error — and the nested outcome carries the machine kind.
+    #[cfg(feature = "local")]
     #[test]
     fn local_participant_delivers_error_envelope_on_provider_failure() {
         let body = r#"{"type":"error","error":{"type":"authentication_error","message":"invalid x-api-key"}}"#;
@@ -1345,12 +1370,14 @@ mod tests {
 
     /// Builds a subprocess participant that runs `script` under `sh -c`, passing
     /// `STUB_OUT` through as an env override the script can echo.
+    #[cfg(feature = "local")]
     fn stub(script: &str, stub_out: &str, read_timeout: Duration) -> SubprocessParticipant {
         SubprocessParticipant::new("sh", ["-c", script], [("STUB_OUT", stub_out)], read_timeout)
     }
 
     /// A child that exits 0 emitting a well-formed envelope has that envelope
     /// returned unchanged.
+    #[cfg(feature = "local")]
     #[test]
     fn subprocess_returns_child_envelope_unchanged_on_success() {
         let mut child_reply = MessageEnvelope::new(
@@ -1379,6 +1406,7 @@ mod tests {
     /// A child that exits 0 with a `kind: "error"` envelope (a delivered
     /// provider failure) is passed through unchanged, nested record and all —
     /// it is a delivered response, not a machinery failure.
+    #[cfg(feature = "local")]
     #[test]
     fn subprocess_passes_through_delivered_error_envelope() {
         let mut child_error = MessageEnvelope::new(
@@ -1438,6 +1466,7 @@ mod tests {
     }
 
     /// A child that exits non-zero yields a synthesized delivered error.
+    #[cfg(feature = "local")]
     #[test]
     fn subprocess_synthesizes_error_on_nonzero_exit() {
         let participant = stub(
@@ -1455,6 +1484,7 @@ mod tests {
     }
 
     /// A child that exits 0 but emits non-JSON yields a synthesized error.
+    #[cfg(feature = "local")]
     #[test]
     fn subprocess_synthesizes_error_on_malformed_stdout() {
         let participant = stub(
@@ -1466,6 +1496,7 @@ mod tests {
     }
 
     /// A child that exits 0 with empty stdout yields a synthesized error.
+    #[cfg(feature = "local")]
     #[test]
     fn subprocess_synthesizes_error_on_absent_envelope() {
         let participant = stub("cat >/dev/null", "", Duration::from_secs(5));
@@ -1474,6 +1505,7 @@ mod tests {
 
     /// A child that holds stdout open past the read timeout is killed and
     /// yields a synthesized error, without hanging the parent.
+    #[cfg(feature = "local")]
     #[test]
     fn subprocess_synthesizes_error_on_read_timeout() {
         // `sleep 30` keeps stdout open; the 150ms parent deadline fires first.
@@ -1489,6 +1521,7 @@ mod tests {
 
     /// A program that cannot be spawned at all yields a synthesized error, not
     /// a panic.
+    #[cfg(feature = "local")]
     #[test]
     fn subprocess_synthesizes_error_when_program_missing() {
         let participant = SubprocessParticipant::new(
