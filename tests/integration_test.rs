@@ -6051,12 +6051,11 @@ fn service_stop_serializes_task_admission_and_reaps_owned_tasks() {
     // awaited command above, but full convergence — the daemon's own
     // supervisor tick reconciling any residue left by that bounded ladder —
     // is eventually consistent, not guaranteed by the time this loop starts.
-    // 100 * 50ms (5s) undersizes it relative to the documented worst case
-    // (STOP_GRACE_MS + 2×KILL_GRACE_MS for the session, then 2×KILL_GRACE_MS
-    // for the task) under CI scheduling load; widen to the 10s budget already
-    // used for other eventually-consistent daemon waits in this file.
+    // The documented worst case is STOP_GRACE_MS + 4×KILL_GRACE_MS (session
+    // ladder, then the task ladder) = 5_000 + 4*2_000 = 13s; budget 300 * 50ms
+    // (15s) to clear that worst case with explicit margin under CI load.
     let mut admitted_reaped = false;
-    for _ in 0..200 {
+    for _ in 0..300 {
         let status = Command::new(env!("CARGO_BIN_EXE_baton"))
             .args(["task", "status", "--control", control_str])
             .output()
