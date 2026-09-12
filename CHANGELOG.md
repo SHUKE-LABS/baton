@@ -10,6 +10,11 @@ versioning.
 
 _Generated from release tags with `bash scripts/release.sh generate-changelog`._
 
+## v0.9.2 (2026-09-12)
+
+### Fixes
+- fix(serve): make external-agent turn timeout explicitly unbounded (#355) (#356)
+
 ## v0.9.1 … v0.7.0 (2026-09-11)
 
 ### Features
