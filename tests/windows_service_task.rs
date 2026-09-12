@@ -1273,11 +1273,20 @@ fn windows_service_stop_reaps_a_no_deadline_in_flight_agent_tree() {
     // The agent drains its stdin request, records its own process id, then
     // sleeps far past any bounded default — the turn must survive until the
     // stop (never dying into a synthesized timeout error) and die with the
-    // session's Job Object.
-    let script = format!(
-        "$input | Out-Null; $PID | Set-Content -LiteralPath '{}'; Start-Sleep -Seconds 30",
-        agent_pid_file.display()
-    );
+    // session's Job Object. A script file (`-File`) plus `[Console]::In`
+    // keeps the fixture free of `-Command` quoting and piped-stdin
+    // interpretation: `ReadToEnd` blocks until baton closes the pipe.
+    let agent_script = guard.root.join("agent.ps1");
+    fs::write(
+        &agent_script,
+        format!(
+            "$null = [Console]::In.ReadToEnd()\n\
+             $PID | Set-Content -LiteralPath '{}'\n\
+             Start-Sleep -Seconds 30\n",
+            agent_pid_file.display()
+        ),
+    )
+    .expect("write agent script");
     let start = baton(&[
         "service",
         "start",
@@ -1294,9 +1303,13 @@ fn windows_service_stop_reaps_a_no_deadline_in_flight_agent_tree() {
         "--agent-arg",
         "-NoProfile",
         "--agent-arg",
-        "-Command",
+        "-ExecutionPolicy",
         "--agent-arg",
-        &script,
+        "Bypass",
+        "--agent-arg",
+        "-File",
+        "--agent-arg",
+        agent_script.to_str().unwrap(),
     ]);
     assert!(
         start.status.success(),
@@ -1317,8 +1330,10 @@ fn windows_service_stop_reaps_a_no_deadline_in_flight_agent_tree() {
     );
     baton::mailbox::deliver_to(&inbox, &request).expect("deliver the in-flight request");
 
+    // Generous budget: PowerShell cold start under parallel CI load can take
+    // seconds before the script runs at all.
     let mut in_flight = false;
-    for _ in 0..200 {
+    for _ in 0..800 {
         if agent_pid_file.is_file() {
             in_flight = true;
             break;
@@ -1328,6 +1343,18 @@ fn windows_service_stop_reaps_a_no_deadline_in_flight_agent_tree() {
     assert!(
         in_flight,
         "session did not enter its in-flight no-deadline agent turn"
+    );
+    // The turn is still in flight: no response may have been delivered yet —
+    // an early synthesized error here would mean the agent died before the
+    // stop, invalidating the reaping assertion below. `serve` writes replies
+    // keyed by request id straight into the outbox root.
+    let delivered: Vec<_> = fs::read_dir(&outbox)
+        .map(|entries| entries.filter_map(Result::ok).collect())
+        .unwrap_or_default();
+    assert!(
+        delivered.is_empty(),
+        "the no-deadline turn ended before the stop: {:?}",
+        delivered.iter().map(|e| e.path()).collect::<Vec<_>>()
     );
     let agent_pid: u32 = fs::read_to_string(&agent_pid_file)
         .expect("read agent pid file")
