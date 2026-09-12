@@ -1254,3 +1254,150 @@ fn windows_task_start_claim_ack_cleanup_survives_client_loss() {
         "restarted service exits cleanly"
     );
 }
+
+/// Issue #355 regression: a no-deadline external-agent session
+/// (`--agent-timeout-ms 0`) parked in an in-flight turn is terminated and
+/// reaped — the serve session *and* the agent child process — by the
+/// service-managed `service stop`, whose bounded grace escalates to
+/// `TerminateJobObject` over the whole session Job Object tree. Direct
+/// `baton serve --stop` stays sentinel-only between messages; this test
+/// exercises the actual service-owned agent path.
+#[test]
+fn windows_service_stop_reaps_a_no_deadline_in_flight_agent_tree() {
+    let guard = start_service();
+    let control = guard.control.to_string_lossy().into_owned();
+    let inbox = guard.root.join("session-inbox");
+    let outbox = guard.root.join("session-outbox");
+    let agent_pid_file = guard.root.join("agent-pid");
+
+    // The agent drains its stdin request, records its own process id, then
+    // sleeps far past any bounded default — the turn must survive until the
+    // stop (never dying into a synthesized timeout error) and die with the
+    // session's Job Object. A script file (`-File`) plus `[Console]::In`
+    // keeps the fixture free of `-Command` quoting and piped-stdin
+    // interpretation: `ReadToEnd` blocks until baton closes the pipe.
+    let agent_script = guard.root.join("agent.ps1");
+    fs::write(
+        &agent_script,
+        format!(
+            "$null = [Console]::In.ReadToEnd()\n\
+             $PID | Set-Content -LiteralPath '{}'\n\
+             Start-Sleep -Seconds 30\n",
+            agent_pid_file.display()
+        ),
+    )
+    .expect("write agent script");
+    let start = baton(&[
+        "service",
+        "start",
+        "--control",
+        &control,
+        "--inbox",
+        inbox.to_str().unwrap(),
+        "--outbox",
+        outbox.to_str().unwrap(),
+        "--agent-timeout-ms",
+        "0",
+        "--agent-cmd",
+        "powershell.exe",
+        "--agent-arg",
+        "-NoProfile",
+        "--agent-arg",
+        "-ExecutionPolicy",
+        "--agent-arg",
+        "Bypass",
+        "--agent-arg",
+        "-File",
+        "--agent-arg",
+        agent_script.to_str().unwrap(),
+    ]);
+    assert!(
+        start.status.success(),
+        "service start failed: {}",
+        String::from_utf8_lossy(&start.stderr)
+    );
+    let session = String::from_utf8_lossy(&start.stdout).trim().to_string();
+    assert!(!session.is_empty(), "service start returned a session id");
+
+    let request = baton::message::MessageEnvelope::new(
+        "svc-no-deadline-win-m1",
+        "conv-svc-no-deadline-win",
+        "agent-a",
+        "agent-b",
+        baton::message::MessageKind::Request,
+        "hold this turn",
+        1_700_000_000_000,
+    );
+    baton::mailbox::deliver_to(&inbox, &request).expect("deliver the in-flight request");
+
+    // Generous budget: PowerShell cold start under parallel CI load can take
+    // seconds before the script runs at all.
+    let mut in_flight = false;
+    for _ in 0..800 {
+        if agent_pid_file.is_file() {
+            in_flight = true;
+            break;
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    assert!(
+        in_flight,
+        "session did not enter its in-flight no-deadline agent turn"
+    );
+    // The turn is still in flight: no response may have been delivered yet —
+    // an early synthesized error here would mean the agent died before the
+    // stop, invalidating the reaping assertion below. `serve` writes replies
+    // keyed by request id straight into the outbox root.
+    let delivered: Vec<_> = fs::read_dir(&outbox)
+        .map(|entries| entries.filter_map(Result::ok).collect())
+        .unwrap_or_default();
+    assert!(
+        delivered.is_empty(),
+        "the no-deadline turn ended before the stop: {:?}",
+        delivered.iter().map(|e| e.path()).collect::<Vec<_>>()
+    );
+    let agent_pid: u32 = fs::read_to_string(&agent_pid_file)
+        .expect("read agent pid file")
+        .trim()
+        .parse()
+        .expect("agent pid is a number");
+
+    let status = baton(&[
+        "service",
+        "status",
+        "--control",
+        &control,
+        "--session",
+        &session,
+    ]);
+    assert!(status.status.success(), "service status failed");
+    let status_json: serde_json::Value = serde_json::from_slice(&status.stdout).expect("json");
+    let session_pid = status_json["sessions"][0]["pid"]
+        .as_u64()
+        .expect("session pid") as u32;
+
+    let stop = baton(&[
+        "service",
+        "stop",
+        "--control",
+        &control,
+        "--session",
+        &session,
+    ]);
+    assert!(
+        stop.status.success(),
+        "service stop failed: {}",
+        String::from_utf8_lossy(&stop.stderr)
+    );
+
+    wait_for_process_gone(session_pid);
+    wait_for_process_gone(agent_pid);
+
+    let status = baton(&["service", "status", "--control", &control]);
+    let status_json: serde_json::Value = serde_json::from_slice(&status.stdout).expect("json");
+    assert_eq!(
+        status_json["sessions"].as_array().expect("sessions").len(),
+        0,
+        "service stop removes the stopped session record"
+    );
+}

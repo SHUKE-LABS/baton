@@ -32,7 +32,14 @@ baton serve --stop --inbox <dir>
   [External-agent role](external-agent.md#external-agent-role---agent-cmd)).
   This is the only answering path a default, harness-only build has — `serve`
   refuses to start without it (an in-process provider fallback exists only in
-  legacy `--features local` builds).
+  legacy `--features local` builds). Its `--agent-timeout-ms` bound defaults to
+  `600000`; **`--agent-timeout-ms 0` is the explicit no-deadline mode** — the
+  turn runs until the agent finishes (no read deadline, no synthesized timeout
+  error) — while a positive value is a bounded read timeout. `serve --stop`
+  remains a between-messages cooperative request: it does not interrupt an
+  in-flight turn (bounded or not); `service stop` / `service teardown` are what
+  terminate an in-flight turn's whole process tree (see
+  [Service](service.md#lifecycle-contract)).
 - `--role <name>` — resolve the answering identity from the role's
   [home directory](configuration.md#role-homes-rolesname) (`roles/<name>/`), so a party is stood
   up by name instead of hand-assembled env vars. In-process mode (legacy
