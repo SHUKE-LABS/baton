@@ -3007,6 +3007,30 @@ mod imp {
             );
         }
 
+        /// Issue #355: `serve_argv` forwards `agent_timeout_ms: Some(0)`
+        /// verbatim, so a no-deadline `service start` spec reconstructs an
+        /// equivalent no-deadline `baton serve` daemon argv.
+        #[test]
+        fn serve_argv_forwards_zero_agent_timeout_verbatim() {
+            let mut spec = spec("/tmp/in", "/tmp/out");
+            spec.agent_cmd = Some("claude".to_string());
+            spec.agent_timeout_ms = Some(0);
+            assert_eq!(
+                serve_argv(&spec),
+                vec![
+                    "serve",
+                    "--inbox",
+                    "/tmp/in",
+                    "--outbox",
+                    "/tmp/out",
+                    "--agent-cmd",
+                    "claude",
+                    "--agent-timeout-ms",
+                    "0",
+                ]
+            );
+        }
+
         /// `execute_status` on a control root with no `Run` and no sessions
         /// reports `service_running: false` and an empty session list.
         #[test]

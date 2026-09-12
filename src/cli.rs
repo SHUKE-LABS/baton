@@ -89,6 +89,7 @@ pub const USAGE: &str = concat!(
     "baton serve --inbox <dir> --outbox <dir> [--poll-ms <n>] [--once] [--agent-cmd <program> [--agent-arg <arg>]... [--agent-cwd <dir>] [--agent-timeout-ms <n>] [--agent-output raw|json [--agent-result-key <key>]]] [--role <name>]\n",
     "baton serve --stop --inbox <dir>\n",
     "    Drain a mailbox with an external agent (`--agent-cmd`) or in-process provider; `--stop` requests a cooperative shutdown of a running daemon.\n",
+    "    `--agent-timeout-ms 0` waits indefinitely for the agent (no read deadline); a positive value is a bounded read timeout; omitting it keeps the 600000 ms default.\n",
     "\n",
     "baton send (--inbox <dir> | --registry <path>) (--body <text> [--to <role>] | --in <path>) [--from <id>] [--conversation <id>] [--await [--outbox <dir>] [--timeout-ms <n>]]\n",
     "    Deliver one message to a mailbox or registry-resolved role, optionally awaiting the reply.\n",
@@ -115,7 +116,7 @@ pub const USAGE: &str = concat!(
     "baton service run [--control <dir>] [--task-retention <duration>]\n",
     "    Run the service control-plane loop.\n",
     "baton service start [--control <dir>] --inbox <dir> --outbox <dir> [--poll-ms <n>] [--agent-cmd <program> [--agent-arg <arg>]... [--agent-cwd <dir>] [--agent-timeout-ms <n>] [--agent-output raw|json [--agent-result-key <key>]]] [--role <name>]\n",
-    "    Start a supervised service session.\n",
+    "    Start a supervised service session. `--agent-timeout-ms 0` waits indefinitely for the agent (no read deadline); a positive value is a bounded read timeout; omitting it keeps the 600000 ms default.\n",
     "baton service status [--control <dir>] [--session <id>]\n",
     "    Report a service session's status.\n",
     "baton service stop [--control <dir>] --session <id> [--force]\n",
@@ -143,7 +144,9 @@ const SERVE_READY_TOKEN: &str = "baton serve: ready";
 /// Default `baton serve --agent-cmd` read timeout for one headless agent run, in
 /// milliseconds, when `--agent-timeout-ms` is unset. Very generous: a full-tooled
 /// agent run is many tool calls (git, edits, MCP), not one provider turn, so a
-/// short deadline would kill a live-but-working agent mid-task.
+/// short deadline would kill a live-but-working agent mid-task. `--agent-timeout-ms
+/// 0` opts out of the deadline entirely (unbounded wait); only a positive value
+/// falls back to this default when the flag is omitted.
 const DEFAULT_AGENT_TIMEOUT_MS: u64 = 600_000;
 
 /// Default `baton send --await` timeout, in milliseconds, when `--timeout-ms` is
@@ -651,8 +654,13 @@ pub fn run() -> Result<()> {
                         .map_err(|err| {
                             BatonError::Io(format!("could not resolve the agent cwd: {err}"))
                         })?;
-                    let read_timeout =
-                        Duration::from_millis(agent_timeout_ms.unwrap_or(DEFAULT_AGENT_TIMEOUT_MS));
+                    // Omitted → the generous bounded default; `0` → the explicit
+                    // no-deadline mode (`None`); positive → that bound.
+                    let read_timeout = match agent_timeout_ms {
+                        Some(0) => None,
+                        Some(ms) => Some(Duration::from_millis(ms)),
+                        None => Some(Duration::from_millis(DEFAULT_AGENT_TIMEOUT_MS)),
+                    };
                     let output = build_output_adapter(agent_output.as_deref(), agent_result_key)?;
                     // The participant stays backend-neutral: agent_args passes
                     // straight through, unmodified — all agent-specific flag
@@ -2788,14 +2796,14 @@ impl SessionSpecFlags {
                 Ok(true)
             }
             "--agent-timeout-ms" => {
-                self.agent_timeout_ms = Some(parse_positive_ms(
+                self.agent_timeout_ms = Some(parse_agent_timeout_ms(
                     &take("--agent-timeout-ms")?,
                     "--agent-timeout-ms",
                 )?);
                 Ok(true)
             }
             other if other.starts_with("--agent-timeout-ms=") => {
-                self.agent_timeout_ms = Some(parse_positive_ms(
+                self.agent_timeout_ms = Some(parse_agent_timeout_ms(
                     &other["--agent-timeout-ms=".len()..],
                     "--agent-timeout-ms",
                 )?);
@@ -3689,6 +3697,18 @@ fn parse_positive_ms(raw: &str, flag: &str) -> Result<u64> {
         .ok()
         .filter(|&n| n > 0)
         .ok_or_else(|| usage(&format!("{flag} must be a positive integer, got {raw:?}")))
+}
+
+/// Parses `--agent-timeout-ms`: zero is the explicit no-deadline mode (the
+/// external-agent read wait has no deadline), a positive integer is a bounded
+/// read timeout in milliseconds. Unlike every other `--*-ms` flag, zero is
+/// meaningful here rather than rejected.
+fn parse_agent_timeout_ms(raw: &str, flag: &str) -> Result<u64> {
+    raw.trim().parse::<u64>().ok().ok_or_else(|| {
+        usage(&format!(
+            "{flag} must be a non-negative integer, got {raw:?}"
+        ))
+    })
 }
 
 /// Requires a non-blank directory value for `flag`.
@@ -6057,8 +6077,11 @@ mod tests {
     }
 
     #[test]
-    fn parse_serve_non_positive_agent_timeout_is_usage_error() {
-        assert!(matches!(
+    fn parse_serve_agent_timeout_zero_is_the_no_deadline_mode() {
+        // `0` is the explicit no-deadline mode (`#355`), preserved verbatim as
+        // `Some(0)` for the dispatch mapping and the service-start argv
+        // forwarding; non-numeric values are still usage errors.
+        assert_eq!(
             parse_args(&argv(&[
                 "serve",
                 "--inbox=/tmp/in",
@@ -6066,8 +6089,48 @@ mod tests {
                 "--agent-cmd=claude",
                 "--agent-timeout-ms=0",
             ]))
+            .expect("parses"),
+            Command::Serve {
+                inbox: "/tmp/in".to_string(),
+                outbox: "/tmp/out".to_string(),
+                poll_ms: DEFAULT_SERVE_POLL_MS,
+                once: false,
+                agent_cmd: Some("claude".to_string()),
+                agent_args: vec![],
+                agent_cwd: None,
+                agent_timeout_ms: Some(0),
+                agent_output: None,
+                agent_result_key: None,
+                role: None,
+            }
+        );
+        assert!(matches!(
+            parse_args(&argv(&[
+                "serve",
+                "--inbox=/tmp/in",
+                "--outbox=/tmp/out",
+                "--agent-cmd=claude",
+                "--agent-timeout-ms=-5",
+            ]))
             .unwrap_err(),
             BatonError::Usage(_)
+        ));
+    }
+
+    #[test]
+    fn parse_service_start_agent_timeout_zero_is_forwarded_in_the_spec() {
+        assert!(matches!(
+            parse_args(&argv(&[
+                "service",
+                "start",
+                "--inbox=/tmp/in",
+                "--outbox=/tmp/out",
+                "--agent-cmd=claude",
+                "--agent-timeout-ms=0",
+            ]))
+            .expect("parses"),
+            Command::Service(service::ServiceCommand::Start { spec, .. })
+                if spec.agent_timeout_ms == Some(0)
         ));
     }
 
@@ -7846,7 +7909,7 @@ mod tests {
             std::iter::empty::<(String, String)>(),
             &root,
             OutputAdapter::Raw,
-            Duration::from_secs(5),
+            Some(Duration::from_secs(5)),
         );
         let success_request = MessageEnvelope::new(
             "m-success-request",
@@ -7870,7 +7933,7 @@ mod tests {
             std::iter::empty::<(String, String)>(),
             &root,
             OutputAdapter::Raw,
-            Duration::from_secs(5),
+            Some(Duration::from_secs(5)),
         );
         let failure_request = MessageEnvelope::new(
             "m-failure-request",

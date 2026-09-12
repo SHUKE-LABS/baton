@@ -220,7 +220,7 @@ impl SubprocessParticipant {
             &self.envs,
             None,
             payload.as_bytes(),
-            self.read_timeout,
+            Some(self.read_timeout),
         )?;
 
         if stdout.trim().is_empty() {
@@ -409,8 +409,10 @@ pub struct ExternalAgentParticipant {
     output: OutputAdapter,
     /// Maximum time to await the agent's final output before synthesizing an
     /// error. Should be *generous*: a headless agent run is many tool calls, not
-    /// one provider turn.
-    read_timeout: Duration,
+    /// one provider turn. `None` is the explicit no-deadline mode: the wait has
+    /// no deadline and the turn ends only when the child closes stdout / exits
+    /// (stop/teardown still terminates the whole process tree).
+    read_timeout: Option<Duration>,
     /// When set, non-empty stderr from successful turns is persisted as
     /// `<stderr_dir>/<message-id>.stderr`. `None` is a strict no-op.
     stderr_dir: Option<PathBuf>,
@@ -474,15 +476,16 @@ impl OutputAdapter {
 impl ExternalAgentParticipant {
     /// Builds a participant that runs `program` with `args` (layering `envs` over
     /// the inherited environment) in `cwd`, feeding each request body on stdin,
-    /// awaiting the agent's final stdout for at most `read_timeout`, and isolating
-    /// the reply body from that stdout with `output`.
+    /// awaiting the agent's final stdout for at most `read_timeout` (`None` waits
+    /// indefinitely — the no-deadline mode), and isolating the reply body from
+    /// that stdout with `output`.
     pub fn new(
         program: impl Into<PathBuf>,
         args: impl IntoIterator<Item = impl Into<String>>,
         envs: impl IntoIterator<Item = (impl Into<String>, impl Into<String>)>,
         cwd: impl Into<PathBuf>,
         output: OutputAdapter,
-        read_timeout: Duration,
+        read_timeout: Option<Duration>,
     ) -> Self {
         Self {
             program: program.into(),
@@ -720,10 +723,12 @@ fn append_windows_msvc_arg(line: &mut String, token: &str) {
 /// full pipe. Stdout is capped at [`MAX_STDOUT_BYTES`] with tail retention;
 /// stderr is capped at [`MAX_STDERR_BYTES`].
 ///
-/// A child that holds stdout open past `read_timeout` is killed and reaped.
-/// Returns `Ok((stdout, stderr))` only when the child exits 0 (either string
-/// may be empty — the caller decides what empty means); a spawn failure, a
-/// non-zero exit (stderr folded into the message), a timeout, or an I/O error
+/// A child that holds stdout open past `read_timeout` is killed and reaped;
+/// `None` (`read_timeout`) waits for stdout EOF with no deadline — termination
+/// then comes only from the caller's own stop/teardown of the parent process
+/// tree. Returns `Ok((stdout, stderr))` only when the child exits 0 (either
+/// string may be empty — the caller decides what empty means); a spawn failure,
+/// a non-zero exit (stderr folded into the message), a timeout, or an I/O error
 /// is an `Err`.
 fn capture_child_output(
     program: &Path,
@@ -731,7 +736,7 @@ fn capture_child_output(
     envs: &[(String, String)],
     cwd: Option<&Path>,
     payload: &[u8],
-    read_timeout: Duration,
+    read_timeout: Option<Duration>,
 ) -> Result<(String, String)> {
     // `CreateProcessW` does not consult `PATHEXT`, so `Command::new` cannot
     // resolve an installed Windows CLI's `.cmd` shim by its command name.
@@ -905,8 +910,28 @@ fn capture_child_output(
         )));
     }
 
-    match stdout_rx.recv_timeout(read_timeout) {
-        Ok(read_result) => {
+    // Await the child's final stdout. `read_timeout` bounds the wait and a
+    // breach kills the child; `None` is the explicit no-deadline mode — the
+    // wait ends only when the child closes stdout, and termination comes from
+    // the caller's own stop/teardown of the parent process tree.
+    enum WaitOutcome {
+        Done(std::io::Result<Vec<u8>>),
+        TimedOut(Duration),
+        Disconnected,
+    }
+    let outcome = match read_timeout {
+        Some(timeout) => match stdout_rx.recv_timeout(timeout) {
+            Ok(result) => WaitOutcome::Done(result),
+            Err(mpsc::RecvTimeoutError::Timeout) => WaitOutcome::TimedOut(timeout),
+            Err(mpsc::RecvTimeoutError::Disconnected) => WaitOutcome::Disconnected,
+        },
+        None => match stdout_rx.recv() {
+            Ok(result) => WaitOutcome::Done(result),
+            Err(_) => WaitOutcome::Disconnected,
+        },
+    };
+    match outcome {
+        WaitOutcome::Done(read_result) => {
             let stdout = match read_result {
                 Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
                 Err(err) => {
@@ -930,16 +955,16 @@ fn capture_child_output(
             }
             Ok((stdout, collect_stderr()))
         }
-        Err(mpsc::RecvTimeoutError::Timeout) => {
+        WaitOutcome::TimedOut(timeout) => {
             let _ = child.kill();
             let _ = child.wait();
             let stderr = collect_stderr();
             Err(BatonError::Transport(format!(
-                "child process exceeded the {read_timeout:?} read timeout{}",
+                "child process exceeded the {timeout:?} read timeout{}",
                 stderr_detail(&stderr)
             )))
         }
-        Err(mpsc::RecvTimeoutError::Disconnected) => {
+        WaitOutcome::Disconnected => {
             let _ = child.kill();
             let _ = child.wait();
             let stderr = collect_stderr();
@@ -1554,6 +1579,19 @@ mod tests {
         external_agent_with_output(script, cwd, OutputAdapter::Raw, read_timeout)
     }
 
+    /// The no-deadline counterpart of [`external_agent`]: the same `sh -c`
+    /// stub shape, but the read wait has no deadline at all.
+    fn external_agent_unbounded(script: &str, cwd: &std::path::Path) -> ExternalAgentParticipant {
+        ExternalAgentParticipant::new(
+            "sh",
+            ["-c", script],
+            std::iter::empty::<(String, String)>(),
+            cwd,
+            OutputAdapter::Raw,
+            None,
+        )
+    }
+
     /// Builds an external-agent participant running `script` under `sh -c` in
     /// `cwd`, with the chosen `output` adapter — for exercising streaming-result
     /// extraction against a stub that emits chatter + a final result.
@@ -1569,7 +1607,7 @@ mod tests {
             std::iter::empty::<(String, String)>(),
             cwd,
             output,
-            read_timeout,
+            Some(read_timeout),
         )
     }
 
@@ -1663,7 +1701,7 @@ mod tests {
             [("PATH", path)],
             &dir.path,
             OutputAdapter::Raw,
-            Duration::from_secs(5),
+            Some(Duration::from_secs(5)),
         );
 
         let response = participant.respond(&request_with_body("m-req-1", "shim request"));
@@ -1710,7 +1748,7 @@ mod tests {
             ],
             &dir.path,
             OutputAdapter::Raw,
-            Duration::from_secs(5),
+            Some(Duration::from_secs(5)),
         );
 
         let response = participant.respond(&request_with_body("m-req-1", "metachar request"));
@@ -1741,7 +1779,7 @@ mod tests {
             std::iter::empty::<(String, String)>(),
             &dir.path,
             OutputAdapter::Raw,
-            Duration::from_secs(5),
+            Some(Duration::from_secs(5)),
         );
 
         let response = participant.respond(&request_with_body("m-req-1", "space request"));
@@ -1862,6 +1900,35 @@ mod tests {
         );
     }
 
+    /// Issue #355 regression: in the explicit no-deadline mode the read wait
+    /// has no deadline, so an agent that outlives the bounded kill point
+    /// (150 ms, as in the timeout test above) still completes and delivers its
+    /// reply instead of being killed into a synthesized timeout error. The
+    /// bounded counterpart of the same stub proves the sleep really does
+    /// outlast the short bound, so only the mode difference explains success.
+    #[test]
+    fn external_agent_no_deadline_completes_a_turn_past_the_bounded_kill_point() {
+        let script = "cat >/dev/null; sleep 1; printf 'late but done'";
+
+        let bounded = {
+            let dir = TempDir::new("ext-no-deadline-bounded");
+            external_agent(script, &dir.path, Duration::from_millis(150))
+                .respond(&request_with_body("m-req-1", "go"))
+        };
+        assert_synthesized_error(&bounded);
+        assert!(
+            bounded.body.contains("timeout"),
+            "bounded mode still kills the same stub: {}",
+            bounded.body
+        );
+
+        let dir = TempDir::new("ext-no-deadline");
+        let participant = external_agent_unbounded(script, &dir.path);
+        let response = participant.respond(&request_with_body("m-req-1", "go"));
+        assert_eq!(response.kind, MessageKind::Response);
+        assert_eq!(response.body, "late but done");
+    }
+
     /// A **streaming** backend that interleaves tool/step chatter on stdout and
     /// prints its final answer as a terminal JSON line yields a reply whose body
     /// is **only** that answer — the chatter is excluded by the `Json` adapter.
@@ -1939,7 +2006,7 @@ mod tests {
             &[],
             None,
             b"",
-            Duration::from_secs(5),
+            Some(Duration::from_secs(5)),
         )
         .expect("exits 0");
         assert_eq!(stdout.trim(), "OUT");
@@ -1958,7 +2025,7 @@ mod tests {
             &[],
             None,
             b"",
-            Duration::from_secs(5),
+            Some(Duration::from_secs(5)),
         )
         .unwrap_err();
         assert!(
@@ -1979,7 +2046,7 @@ mod tests {
             &[],
             None,
             b"",
-            Duration::from_millis(150),
+            Some(Duration::from_millis(150)),
         )
         .unwrap_err();
         assert!(
@@ -2004,7 +2071,7 @@ mod tests {
             &[],
             None,
             b"",
-            Duration::from_secs(10),
+            Some(Duration::from_secs(10)),
         )
         .expect("exits 0");
         assert!(
@@ -2033,7 +2100,7 @@ mod tests {
             &[],
             None,
             b"",
-            Duration::from_secs(10),
+            Some(Duration::from_secs(10)),
         )
         .expect("exits 0");
         assert!(
@@ -2091,7 +2158,7 @@ mod tests {
             std::iter::empty::<(String, String)>(),
             &dir.path,
             OutputAdapter::Raw,
-            Duration::from_secs(5),
+            Some(Duration::from_secs(5)),
         )
         .with_stderr_dir(&stderr_dir);
 

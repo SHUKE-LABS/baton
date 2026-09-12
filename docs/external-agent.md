@@ -36,6 +36,16 @@ baton serve --inbox <dir> --outbox <dir> \
   defaults to the `serve` process's own cwd.
 - `--agent-timeout-ms <n>` — read timeout for one agent run (default `600000`).
   Generous by design: an agent run is many tool calls, not one provider turn.
+  `0` is the explicit **no-deadline** mode (`#355`): the turn runs until the
+  agent finishes — no read deadline, no synthesized `transport error`, no child
+  kill. Stopping a session mid-turn still works: the service-managed
+  `service stop` / `service teardown` terminate the whole session process tree
+  (Job Object on Windows, process group on Unix), while direct `serve --stop`
+  stays a between-messages cooperative request and does not interrupt a turn.
+  Because an unbounded turn outlives the built-in `max_runtime_ms` fallback, a
+  team using this mode should raise its per-role `max_runtime_ms` in the
+  registry, since a claim older than that bound reads as `crashed-stale` to
+  `baton status`.
 
 ## Reply shape: the output adapter
 

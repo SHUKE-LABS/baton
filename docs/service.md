@@ -120,9 +120,13 @@ baton service teardown [--control <dir>] [--force]
   `--control` selects an explicit control directory; when omitted, the shared
   per-user default described above is used. The
   session-shaping flags become the session's `SessionSpec`, reconstructed into
-  an equivalent `baton serve` argv by `run`. Direct `baton serve` lifecycle
-  flags such as `--once` and `--stop` are not accepted; service-managed
-  lifecycle is handled by `service run`, `service stop`, and `service teardown`.
+  an equivalent `baton serve` argv by `run` — including
+  `--agent-timeout-ms 0`, the explicit no-deadline external-agent mode (the
+  turn runs until the agent finishes; `service stop` / `service teardown`
+  still terminate the in-flight turn's whole process tree). Direct
+  `baton serve` lifecycle flags such as `--once` and `--stop` are not accepted;
+  service-managed lifecycle is handled by `service run`, `service stop`, and
+  `service teardown`.
   It submits the spec and returns a session id as soon as `run` has spawned the
   child and persisted its record — it never waits on a served turn.
   Fails fast, with a clear error, if no `service run`

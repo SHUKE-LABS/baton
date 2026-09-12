@@ -2838,6 +2838,199 @@ fn service_liveness_keys_ignore_supervisor_and_client_environment() {
     assert_eq!(session_records, 0, "teardown removes every session record");
 }
 
+/// Issue #355 regression: a no-deadline external-agent session
+/// (`--agent-timeout-ms 0`) parked in an in-flight turn is terminated and
+/// reaped — session process *and* agent child — by `service stop`, whose
+/// bounded grace escalates to a process-group signal that reaches the whole
+/// session tree. Direct `baton serve --stop` stays sentinel-only between
+/// messages; the service-managed stop path is what owns forceful teardown.
+#[cfg(unix)]
+#[test]
+fn service_stop_reaps_a_no_deadline_in_flight_agent_tree() {
+    use baton::mailbox;
+    use baton::message::{MessageEnvelope, MessageKind};
+
+    let root = TempMailbox::new("service-no-deadline-stop");
+    let control = root.path.join("control");
+    let inbox = root.path.join("inbox");
+    let outbox = root.path.join("outbox");
+    let agent_pid_file = root.path.join("agent-pid");
+    let control_str = control.to_str().unwrap().to_string();
+
+    let mut run = Command::new(env!("CARGO_BIN_EXE_baton"));
+    run.args(["service", "run", "--control", control_str.as_str()]);
+    run.env_remove("BATON_EVENT_LOG");
+    run.stdout(Stdio::null());
+    run.stderr(Stdio::null());
+    let mut run_child = run.spawn().expect("spawn baton service run");
+
+    let mut live = false;
+    for _ in 0..100 {
+        if let Ok(out) = Command::new(env!("CARGO_BIN_EXE_baton"))
+            .args(["service", "status", "--control", control_str.as_str()])
+            .output()
+            && out.status.success()
+            && String::from_utf8_lossy(&out.stdout).contains("\"service_running\":true")
+        {
+            live = true;
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(live, "baton service run did not report live in time");
+
+    // `--agent-timeout-ms 0` is the no-deadline mode: the turn below sleeps
+    // far past any bounded default and must survive until the stop, never
+    // dying into a synthesized timeout error. The stub records its own pid so
+    // the agent child's reaping is observable.
+    let start = Command::new(env!("CARGO_BIN_EXE_baton"))
+        .args([
+            "service",
+            "start",
+            "--control",
+            control_str.as_str(),
+            "--inbox",
+            inbox.to_str().unwrap(),
+            "--outbox",
+            outbox.to_str().unwrap(),
+            "--poll-ms",
+            "20",
+            "--agent-timeout-ms",
+            "0",
+            "--agent-cmd",
+            "sh",
+            "--agent-arg",
+            "-c",
+            "--agent-arg",
+            "cat >/dev/null; echo $$ > \"$1\"; sleep 30",
+            "--agent-arg",
+            "no-deadline-agent",
+            "--agent-arg",
+            agent_pid_file.to_str().unwrap(),
+        ])
+        .output()
+        .expect("run baton service start");
+    assert!(
+        start.status.success(),
+        "service start should exit 0; stderr: {}",
+        String::from_utf8_lossy(&start.stderr)
+    );
+    let session_id = String::from_utf8_lossy(&start.stdout).trim().to_string();
+    assert!(!session_id.is_empty(), "service start prints a session id");
+
+    let request = MessageEnvelope::new(
+        "svc-no-deadline-m1",
+        "conv-svc-no-deadline",
+        "agent-a",
+        "agent-b",
+        MessageKind::Request,
+        "hold this turn",
+        1_700_000_000_000,
+    );
+    mailbox::deliver_to(&inbox, &request).expect("deliver the in-flight session request");
+    let mut in_flight = false;
+    for _ in 0..100 {
+        if agent_pid_file.is_file() {
+            in_flight = true;
+            break;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        in_flight,
+        "session did not enter its in-flight no-deadline agent turn"
+    );
+    let agent_pid: u32 = std::fs::read_to_string(&agent_pid_file)
+        .expect("read agent pid file")
+        .trim()
+        .parse()
+        .expect("agent pid is a number");
+    assert!(
+        process_is_live(agent_pid),
+        "the no-deadline agent child is running"
+    );
+
+    let status = Command::new(env!("CARGO_BIN_EXE_baton"))
+        .args([
+            "service",
+            "status",
+            "--control",
+            control_str.as_str(),
+            "--session",
+            &session_id,
+        ])
+        .output()
+        .expect("run baton service status");
+    let status_json: serde_json::Value =
+        serde_json::from_slice(&status.stdout).expect("status is JSON");
+    let session_pid = status_json["sessions"][0]["pid"]
+        .as_u64()
+        .expect("session pid") as u32;
+    assert!(process_is_live(session_pid), "the serve session is running");
+
+    let stop = Command::new(env!("CARGO_BIN_EXE_baton"))
+        .args([
+            "service",
+            "stop",
+            "--control",
+            control_str.as_str(),
+            "--session",
+            &session_id,
+        ])
+        .output()
+        .expect("run baton service stop");
+    assert!(
+        stop.status.success(),
+        "service stop should exit 0; stderr: {}",
+        String::from_utf8_lossy(&stop.stderr)
+    );
+
+    // The stop ladder is STOP_GRACE_MS + KILL_GRACE_MS (7s) worst case; poll
+    // past it with margin so the cooperative grace is observed to escalate.
+    let mut reaped = false;
+    for _ in 0..240 {
+        if !process_is_live(session_pid) && !process_is_live(agent_pid) {
+            reaped = true;
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        reaped,
+        "service stop must reap the session and the no-deadline agent child"
+    );
+
+    let status = Command::new(env!("CARGO_BIN_EXE_baton"))
+        .args(["service", "status", "--control", control_str.as_str()])
+        .output()
+        .expect("run baton service status after stop");
+    let status_json: serde_json::Value =
+        serde_json::from_slice(&status.stdout).expect("status is JSON");
+    assert_eq!(
+        status_json["sessions"].as_array().unwrap().len(),
+        0,
+        "service stop removes the stopped session record"
+    );
+
+    let _ = run_child.kill();
+    let _ = run_child.wait();
+    let teardown = Command::new(env!("CARGO_BIN_EXE_baton"))
+        .args([
+            "service",
+            "teardown",
+            "--control",
+            control_str.as_str(),
+            "--force",
+        ])
+        .output()
+        .expect("run baton service teardown");
+    assert!(
+        teardown.status.success(),
+        "teardown should exit 0; stderr: {}",
+        String::from_utf8_lossy(&teardown.stderr)
+    );
+}
+
 /// Issue #335 regression: a Unix `service run` launched from an absolute
 /// executable path keeps accepting `service start` after that path's file is
 /// atomically replaced in place (e.g. `cargo install` or a systemd-managed
