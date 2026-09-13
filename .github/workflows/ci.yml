@@ -1,3 +1,15 @@
+# Known CI flake class (#357)
+# ----------------------------
+# Process/liveness-sensitive integration tests — notably
+# `tests/windows_service_task.rs` and parts of `tests/integration_test.rs` —
+# can fail intermittently under parallel CI load on unrelated changes.
+#
+# Handling rule: an occurrence is answered by a link to #357 or a fix.
+# A green retry of unchanged code alone is NOT proof.
+#
+# New occurrences are logged on #357 with run id, job link, head SHA,
+# test name + panic line. See #357 for the running occurrence list.
+
 name: ci
 
 on:
