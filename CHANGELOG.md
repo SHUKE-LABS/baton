@@ -10,6 +10,11 @@ versioning.
 
 _Generated from release tags with `bash scripts/release.sh generate-changelog`._
 
+## v0.9.3 (2026-09-13)
+
+### Other Changes
+- ci: document known flake class in workflow header (#357) (#359)
+
 ## v0.9.2 (2026-09-12)
 
 ### Fixes
