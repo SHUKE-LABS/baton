@@ -56,10 +56,11 @@ use crate::message::MessageEnvelope;
 const LOCK_FILE: &str = "serve.lock";
 
 /// How many times [`lock_single_instance`] retries a contended lock, and how
-/// long it waits between attempts (≈100 ms total). A lock *probe* — `status`,
-/// `--stop` — holds the lockfile only for an instant, so a starting `serve`
-/// out-waits that instant instead of refusing itself as a duplicate, and
-/// `--stop` does not drop a sentinel for a probe's phantom hold.
+/// long it waits between attempts (four 20 ms pauses, ≈80 ms of waiting). A
+/// lock *probe* — `status`, `--stop` — holds the lockfile only for an instant,
+/// so a starting `serve` out-waits that instant instead of refusing itself as
+/// a duplicate, and `--stop` does not drop a sentinel for a probe's phantom
+/// hold.
 const LOCK_RETRY_ATTEMPTS: usize = 5;
 const LOCK_RETRY_PAUSE: Duration = Duration::from_millis(20);
 
@@ -147,7 +148,8 @@ pub struct MailboxStatus {
     pub claim_age_ms: Option<u64>,
     /// Whether the oldest claim has run past `max_runtime` — an advisory alert
     /// on a suspiciously long (but possibly live) turn; it does not affect
-    /// `state`.
+    /// `state`. Decided at the reported millisecond precision, so it always
+    /// agrees with `claim_age_ms > max_runtime_ms`.
     pub overdue: bool,
     /// Whether a live daemon holds the single-instance lock.
     pub daemon: MailboxDaemon,
@@ -458,8 +460,8 @@ pub fn deliver_to(root: impl AsRef<Path>, envelope: &MessageEnvelope) -> Result<
 /// claim ⇒ [`MailboxState::IdleDone`]; a claim while a daemon holds the lock ⇒
 /// [`MailboxState::Busy`]; a claim while the lock is free ⇒
 /// [`MailboxState::CrashedStale`] — independent of claim age. `max_runtime` only
-/// calibrates the advisory `overdue` flag (`claim_age_ms > max_runtime`), an
-/// alert on a suspiciously long live turn.
+/// calibrates the advisory `overdue` flag (`claim_age_ms > max_runtime_ms`),
+/// an alert on a suspiciously long live turn.
 ///
 /// Concurrency-safe against a live daemon: the probe opens the lockfile,
 /// `try_lock`s it once, and releases immediately if acquired (acquiring it
@@ -482,11 +484,16 @@ pub fn status(root: impl AsRef<Path>, max_runtime: Duration) -> Result<MailboxSt
         Some(_) if daemon == MailboxDaemon::Live => MailboxState::Busy,
         Some(_) => MailboxState::CrashedStale,
     };
+    // `overdue` is decided at the *reported* precision: comparing the unrounded
+    // duration would let an age in `(max_runtime, max_runtime + 1ms)` report
+    // `claim_age_ms == max_runtime_ms` together with `overdue: true`,
+    // contradicting the documented contract.
+    let claim_age_ms = oldest.map(|age| age.as_millis() as u64);
     Ok(MailboxStatus {
         state,
         queue_depth,
-        claim_age_ms: oldest.map(|age| age.as_millis() as u64),
-        overdue: oldest.is_some_and(|age| age > max_runtime),
+        claim_age_ms,
+        overdue: claim_age_ms.is_some_and(|ms| ms > max_runtime.as_millis() as u64),
         daemon,
     })
 }
@@ -1382,7 +1389,13 @@ mod tests {
     /// Backdates a file's modification time by `secs` seconds, simulating a claim
     /// that was taken long ago.
     fn backdate(path: &Path, secs: u64) {
-        let when = SystemTime::now() - Duration::from_secs(secs);
+        backdate_by(path, Duration::from_secs(secs));
+    }
+
+    /// Backdates a file's modification time by an exact [`Duration`], for
+    /// boundary tests that need millisecond control.
+    fn backdate_by(path: &Path, age: Duration) {
+        let when = SystemTime::now() - age;
         let file = OpenOptions::new().write(true).open(path).expect("open");
         file.set_modified(when).expect("set mtime");
     }
@@ -1445,6 +1458,57 @@ mod tests {
         assert!(s.overdue, "a claim past the threshold reads overdue");
         assert!(s.claim_age_ms.unwrap() >= 3_600_000);
         assert_eq!(s.daemon, MailboxDaemon::Live);
+    }
+
+    /// The `overdue` contract holds at the *reported* precision:
+    /// `overdue` ⇔ `claim_age_ms > max_runtime_ms`. Exactly at the threshold
+    /// the unrounded age has always run a few µs past the backdated mtime (the
+    /// test's own elapsed time), so a duration comparison would wrongly read
+    /// overdue while the reported `claim_age_ms` equals the threshold;
+    /// truncation must happen before the comparison. One millisecond past the
+    /// threshold reads overdue at that same reported precision.
+    #[test]
+    fn status_overdue_boundary_is_millisecond_precise() {
+        let dir = TempDir::new("status-overdue-boundary");
+        let mailbox = Mailbox::open(&dir.path).expect("open");
+        mailbox.deliver(&request("m-1")).expect("deliver");
+        let _claimed = mailbox.claim_next().expect("claim").expect("some");
+        let claimed = dir.path.join("claimed").join("m-1.json");
+        let threshold = Duration::from_millis(60_000);
+
+        // Exactly at the threshold (60_000 ms backdate, 60_000 ms threshold):
+        // `overdue` must agree with the reported `claim_age_ms`, never with
+        // the unrounded duration. Under normal timing the µs of elapsed test
+        // time truncate away, so the reported age equals the threshold and
+        // reads not-overdue.
+        backdate_by(&claimed, threshold);
+        let s = status(&dir.path, threshold).expect("status");
+        assert_eq!(s.state, MailboxState::Busy, "the held lock keeps it busy");
+        assert_eq!(
+            s.overdue,
+            s.claim_age_ms.unwrap() > 60_000,
+            "overdue must agree with the reported claim_age_ms"
+        );
+
+        // Deterministic equality case: a future-dated mtime clamps to age
+        // zero, so `claim_age_ms == max_runtime_ms == 0` must read
+        // `overdue: false` — no elapsed-time race can move either side.
+        let file = OpenOptions::new().write(true).open(&claimed).expect("open");
+        file.set_modified(SystemTime::now() + Duration::from_secs(60))
+            .expect("set mtime");
+        let s = status(&dir.path, Duration::ZERO).expect("status");
+        assert_eq!(
+            s.claim_age_ms,
+            Some(0),
+            "a future-dated claim clamps to zero"
+        );
+        assert!(!s.overdue, "claim_age_ms == max_runtime_ms is not overdue");
+
+        // The first millisecond past the threshold reads overdue.
+        backdate_by(&claimed, Duration::from_millis(60_001));
+        let s = status(&dir.path, threshold).expect("status");
+        assert!(s.overdue, "the first ms past the threshold reads overdue");
+        assert!(s.claim_age_ms.unwrap() >= 60_001);
     }
 
     /// A claim while the lock is free ⇒ `crashed-stale`, however fresh the
@@ -1548,7 +1612,7 @@ mod tests {
             let lock = open_lock_file(&root).expect("open lockfile");
             lock.try_lock().expect("hold the lockfile");
             tx.send(()).expect("signal: lockfile held");
-            // Hold it well inside the ≈100 ms retry window, then release.
+            // Hold it well inside the ≈80 ms retry window, then release.
             std::thread::sleep(Duration::from_millis(40));
             drop(lock);
         });
