@@ -39,7 +39,7 @@ use crate::events::{
     EventSink, ExchangeEvent, ExchangeMeta, IdentityField, NoopSink, WriterSink, now_ms,
 };
 use crate::log::{self, Exchange};
-use crate::mailbox::{self, Mailbox, MailboxState, MailboxStatus};
+use crate::mailbox::{self, Mailbox, MailboxDaemon, MailboxState, MailboxStatus};
 use crate::message::{MessageEnvelope, MessageKind};
 use crate::model::TokenUsage;
 #[cfg(feature = "local")]
@@ -164,11 +164,12 @@ const DEFAULT_CONVERSE_AWAIT_MS: u64 = 60_000;
 /// interval keeps a local round-trip responsive without a flag for it.
 const SEND_POLL_INTERVAL_MS: u64 = 50;
 
-/// Default `baton status` max-runtime threshold, in milliseconds, when neither
+/// Default `baton status` overdue threshold, in milliseconds, when neither
 /// `--max-runtime-ms` nor a per-role registry `max_runtime_ms` is set. A claim
-/// older than this reads as `crashed-stale`. Sized above [`DEFAULT_AGENT_TIMEOUT_MS`]
-/// (the serve-side agent cap) so a slow-but-alive worker is never misjudged
-/// crashed; a team with longer legitimate runs raises it per role.
+/// older than this reports `overdue: true` — an advisory alert on a
+/// suspiciously long (but live) turn; `state` is decided by the `serve.lock`
+/// probe and never by age. Sized above [`DEFAULT_AGENT_TIMEOUT_MS`] (the
+/// serve-side agent cap) so a normal bounded run does not flag overdue.
 const DEFAULT_MAX_RUNTIME_MS: u64 = 900_000;
 
 /// The in-session command that ends the REPL cleanly (alongside EOF).
@@ -1390,23 +1391,30 @@ fn execute_send(
 /// Writes a mailbox `status` snapshot as one JSON line to `out`.
 ///
 /// The stable machine-readable contract a gate-check parses: `state` is
-/// `idle-done` / `busy` / `crashed-stale`, `queue_depth` the pending count,
-/// `claim_age_ms` the oldest claim's age in ms (null when idle), and
-/// `max_runtime_ms` the threshold the state was decided against. Parameterised
-/// over [`Write`] so it is unit-testable with an in-memory buffer.
+/// `idle-done` / `busy` / `crashed-stale` (decided by the `serve.lock` probe,
+/// not claim age), `queue_depth` the pending count, `claim_age_ms` the oldest
+/// claim's age in ms (null when idle), `max_runtime_ms` the threshold reported
+/// and used for `overdue`, `daemon` whether a live serve holds the lock, and
+/// `overdue` whether the oldest claim has run past `max_runtime_ms`.
+/// Parameterised over [`Write`] so it is unit-testable with an in-memory buffer.
 fn execute_status(status: &MailboxStatus, max_runtime_ms: u64, mut out: impl Write) -> Result<()> {
     let state = match status.state {
         MailboxState::IdleDone => "idle-done",
         MailboxState::Busy => "busy",
         MailboxState::CrashedStale => "crashed-stale",
     };
+    let daemon = match status.daemon {
+        MailboxDaemon::Live => "live",
+        MailboxDaemon::Absent => "absent",
+    };
     let claim_age = match status.claim_age_ms {
         Some(ms) => ms.to_string(),
         None => "null".to_string(),
     };
+    let overdue = if status.overdue { "true" } else { "false" };
     writeln!(
         out,
-        "{{\"state\":\"{state}\",\"queue_depth\":{},\"claim_age_ms\":{claim_age},\"max_runtime_ms\":{max_runtime_ms}}}",
+        "{{\"state\":\"{state}\",\"queue_depth\":{},\"claim_age_ms\":{claim_age},\"max_runtime_ms\":{max_runtime_ms},\"daemon\":\"{daemon}\",\"overdue\":{overdue}}}",
         status.queue_depth
     )
     .map_err(io_err)
@@ -3541,7 +3549,7 @@ fn parse_send<'a>(mut iter: impl Iterator<Item = &'a String>) -> Result<Command>
 /// Accepts either `--mailbox <root>` or a `--registry <path> --role <role>`
 /// lookup — the two forms are mutually exclusive, and neither being present is a
 /// usage error. `--max-runtime-ms` is an optional positive-integer override of
-/// the crashed-stale threshold. Every valued flag also accepts the `--flag=value`
+/// the overdue threshold. Every valued flag also accepts the `--flag=value`
 /// form; any other token is a usage error. The `--mailbox`/`--registry`/`--role`
 /// combination is validated in [`run`] where the registry is loaded.
 fn parse_status<'a>(mut iter: impl Iterator<Item = &'a String>) -> Result<Command> {
@@ -3684,7 +3692,8 @@ fn parse_duration_ms(flag: &str, raw: &str) -> Result<u64> {
 }
 
 /// Parses `--max-runtime-ms`: a positive integer of milliseconds (zero is
-/// rejected — a zero threshold would flag every live claim as crashed).
+/// rejected — every nonzero-age claim would read `overdue: true`, making the
+/// alert meaningless).
 fn parse_max_runtime_ms(raw: &str) -> Result<u64> {
     parse_positive_ms(raw, "--max-runtime-ms")
 }
@@ -7496,36 +7505,58 @@ mod tests {
             state: MailboxState::Busy,
             queue_depth: 3,
             claim_age_ms: Some(4200),
+            overdue: false,
+            daemon: MailboxDaemon::Live,
         };
         let mut out = Vec::new();
         execute_status(&busy, 900_000, &mut out).expect("render");
         assert_eq!(
             String::from_utf8(out).unwrap(),
-            "{\"state\":\"busy\",\"queue_depth\":3,\"claim_age_ms\":4200,\"max_runtime_ms\":900000}\n"
+            "{\"state\":\"busy\",\"queue_depth\":3,\"claim_age_ms\":4200,\"max_runtime_ms\":900000,\"daemon\":\"live\",\"overdue\":false}\n"
         );
 
         let idle = MailboxStatus {
             state: MailboxState::IdleDone,
             queue_depth: 0,
             claim_age_ms: None,
+            overdue: false,
+            daemon: MailboxDaemon::Absent,
         };
         let mut out = Vec::new();
         execute_status(&idle, 900_000, &mut out).expect("render");
         assert_eq!(
             String::from_utf8(out).unwrap(),
-            "{\"state\":\"idle-done\",\"queue_depth\":0,\"claim_age_ms\":null,\"max_runtime_ms\":900000}\n"
+            "{\"state\":\"idle-done\",\"queue_depth\":0,\"claim_age_ms\":null,\"max_runtime_ms\":900000,\"daemon\":\"absent\",\"overdue\":false}\n"
         );
 
         let stale = MailboxStatus {
             state: MailboxState::CrashedStale,
             queue_depth: 1,
             claim_age_ms: Some(999_999),
+            overdue: true,
+            daemon: MailboxDaemon::Absent,
         };
         let mut out = Vec::new();
         execute_status(&stale, 60_000, &mut out).expect("render");
         assert_eq!(
             String::from_utf8(out).unwrap(),
-            "{\"state\":\"crashed-stale\",\"queue_depth\":1,\"claim_age_ms\":999999,\"max_runtime_ms\":60000}\n"
+            "{\"state\":\"crashed-stale\",\"queue_depth\":1,\"claim_age_ms\":999999,\"max_runtime_ms\":60000,\"daemon\":\"absent\",\"overdue\":true}\n"
+        );
+
+        // `overdue` and `daemon` are independent of `state`: a live worker past
+        // the threshold is still `busy`, flagged overdue.
+        let overdue_live = MailboxStatus {
+            state: MailboxState::Busy,
+            queue_depth: 0,
+            claim_age_ms: Some(900_001),
+            overdue: true,
+            daemon: MailboxDaemon::Live,
+        };
+        let mut out = Vec::new();
+        execute_status(&overdue_live, 900_000, &mut out).expect("render");
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "{\"state\":\"busy\",\"queue_depth\":0,\"claim_age_ms\":900001,\"max_runtime_ms\":900000,\"daemon\":\"live\",\"overdue\":true}\n"
         );
     }
 

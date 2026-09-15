@@ -46,9 +46,11 @@ pub struct MailboxRef {
     pub inbox: PathBuf,
     /// Directory the correlated reply is awaited from (the peer's outbox).
     pub outbox: PathBuf,
-    /// Per-role max-runtime threshold, in milliseconds, above which a claim is
-    /// read as `crashed-stale` by `baton status`. Optional and back-compatible:
-    /// an omitted value leaves the threshold to the `status` caller (its
+    /// Per-role overdue threshold, in milliseconds, reported by `baton status`
+    /// as `max_runtime_ms` and used to compute `overdue` — a claim older than
+    /// it flags a suspiciously long (but live) turn. It never decides `state`;
+    /// that is the `serve.lock` probe's job. Optional and back-compatible: an
+    /// omitted value leaves the threshold to the `status` caller (its
     /// `--max-runtime-ms` override or the documented default).
     #[serde(default)]
     pub max_runtime_ms: Option<u64>,

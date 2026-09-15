@@ -229,8 +229,11 @@ Both the send and the consumed reply are recorded to `BATON_EVENT_LOG` (as
 crashed — the signal a team's gate-check reads before starting a cycle. The naive
 test `idle = pending empty AND claimed empty` cannot tell a legitimately long run
 from a crash: both leave a `claimed/` entry (this is why
-[reclaim](#at-least-once-semantics) exists). `status` splits that ambiguity by
-**claim age** against a max-runtime threshold — there is **no heartbeat protocol**.
+[reclaim](#at-least-once-semantics) exists). `status` splits that ambiguity with
+the **single-instance lock**: `serve` holds `serve.lock` for its whole lifetime
+(the same lock `serve --stop` probes), so `status` probes it — `daemon: "live"`
+or `"absent"` — and derives `state` from claim presence plus that verdict.
+Claim age never decides `state`; there is no heartbeat protocol.
 
 ```
 baton status (--mailbox <root> | --registry <path> --role <role>) [--max-runtime-ms <n>]
@@ -239,40 +242,59 @@ baton status (--mailbox <root> | --registry <path> --role <role>) [--max-runtime
 - `--mailbox <root>` — probe this mailbox root directly.
 - `--registry <path> --role <role>` — resolve the mailbox by role name (same
   registry as `send`/`converse-ring`); an unknown role fails fast.
-- `--max-runtime-ms <n>` — the crashed-stale threshold, in milliseconds. Precedence:
+- `--max-runtime-ms <n>` — the **overdue** threshold, in milliseconds. Precedence:
   this flag > the role's `max_runtime_ms` in the registry (see below) > a built-in
-  default. It **must sit above the worst-case legitimate agent run**, or a
-  slow-but-alive worker is misread as crashed.
+  default. It never decides `state`.
 
 It prints one JSON line and exits 0:
 
 ```json
-{"state":"busy","queue_depth":2,"claim_age_ms":4200,"max_runtime_ms":900000}
+{"state":"busy","queue_depth":2,"claim_age_ms":4200,"max_runtime_ms":900000,"daemon":"live","overdue":false}
 ```
 
-- `state` — `idle-done` (no claim), `busy` (a claim younger than the threshold),
-  or `crashed-stale` (a claim older than the threshold).
+- `state` — `idle-done` (no claim), `busy` (a claim while the lock is held — a
+  live worker is on it), or `crashed-stale` (a claim while the lock is free —
+  the claiming daemon died mid-run).
 - `queue_depth` — the number of requests waiting in `pending/`.
 - `claim_age_ms` — the oldest claim's age in milliseconds, or `null` when idle.
+  Informational: it feeds `overdue`, never `state`.
+- `max_runtime_ms` — the overdue threshold the probe reported against.
+- `daemon` — `"live"` when a daemon holds `serve.lock`, `"absent"` when the
+  lock is free.
+- `overdue` — `true` when `claim_age_ms > max_runtime_ms`: a suspiciously long
+  (but possibly live) turn worth alerting on. Advisory only.
 
-The probe is **lock-free**: it reads `pending/` and `claimed/` without taking the
-single-instance lock, so it safely inspects a mailbox a live `serve` owns. A
-claim's age is measured from **when it was claimed** — `claim_next` stamps the
-claim time onto the file — so a request that waited in `pending/` is not misread as
-instantly stale.
+The probe is **non-blocking**: it opens `serve.lock`, `try_lock`s it once, and
+releases it immediately if acquired — acquiring it proves no daemon is live. It
+never waits on a daemon's lock, so it safely inspects a mailbox a live `serve`
+owns; conversely, `serve` itself retries a contended lock for a bounded window
+so a probe's instant hold cannot make a starting daemon refuse itself as a
+duplicate. The read is also concurrency-safe against a mutating mailbox: a
+directory that does not exist yet is read as empty, and a claim file that a
+concurrent `complete`/`reclaim` moves between the listing and the stat is
+skipped (its `ENOENT` is not an error). A claim's age is measured from **when
+it was claimed** — `claim_next` stamps the claim time onto the file — so a
+request that waited in `pending/` does not inflate `claim_age_ms`.
+
+The lock — and with it `daemon` — is advisory and **per-host**: reliable on a
+local filesystem, but on an NFS/network filesystem another host's daemon is
+invisible, so `status` there reports `daemon: "absent"` (hence
+`crashed-stale`) for a mailbox whose daemon runs elsewhere.
 
 **Reclaim hazard (documented boundary).** A `crashed-stale` claim is recovered by
 `serve`'s [at-least-once reclaim](#at-least-once-semantics) on the next start,
 which re-runs the abandoned message — possibly re-running a side-effecting agent (a
-double commit / PR). Two mitigations are required: (a) the threshold above sits
-above the worst-case legitimate run, so a live worker is never falsely reclaimed;
-and (b) correctness on re-run relies on the agent's **idempotency via durable
-artifacts** — on re-run it observes its own prior branch/commit and adapts.
+double commit / PR). Two mitigations are required: (a) `state` says
+`crashed-stale` only when the lock is genuinely free, so a live worker — however
+slow — is never falsely reclaimed; and (b) correctness on re-run relies on the
+agent's **idempotency via durable artifacts** — on re-run it observes its own
+prior branch/commit and adapts.
 
-### Per-role threshold in the registry
+### Per-role overdue threshold in the registry
 
 A registry entry may carry an optional `max_runtime_ms`, used by `status
---registry --role` when no `--max-runtime-ms` override is given:
+--registry --role` when no `--max-runtime-ms` override is given. It calibrates
+the `overdue` alert only — `state` never depends on it:
 
 ```json
 {

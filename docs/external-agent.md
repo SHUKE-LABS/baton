@@ -42,10 +42,11 @@ baton serve --inbox <dir> --outbox <dir> \
   `service stop` / `service teardown` terminate the whole session process tree
   (Job Object on Windows, process group on Unix), while direct `serve --stop`
   stays a between-messages cooperative request and does not interrupt a turn.
-  Because an unbounded turn outlives the built-in `max_runtime_ms` fallback, a
-  team using this mode should raise its per-role `max_runtime_ms` in the
-  registry, since a claim older than that bound reads as `crashed-stale` to
-  `baton status`.
+  Liveness is lock-based, not timeout-based: `baton status` decides `busy` vs
+  `crashed-stale` from the `serve.lock` probe, so an unbounded turn never reads
+  as `crashed-stale` however long it runs. The per-role `max_runtime_ms` only
+  calibrates the `overdue` alert on a suspiciously long (but live) turn; a team
+  whose legitimate runs are long raises it to quiet that alert.
 
 ## Reply shape: the output adapter
 
