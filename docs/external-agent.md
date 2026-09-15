@@ -67,6 +67,30 @@ the reply. `--agent-output` isolates the final result:
     key's value is not a string, the run becomes a synthesized delivered
     `kind: "error"` (never a stringified-JSON body).
 
+## Envelope metadata: `BATON_*` environment
+
+The request body on stdin is unchanged, but every agent spawn also carries the
+claimed envelope's addressing and correlation fields — plus this daemon's
+mailbox addressing — as environment variables, overriding any inherited value
+of the same name:
+
+| Variable | Value |
+| --- | --- |
+| `BATON_MESSAGE_ID` | `message_id` |
+| `BATON_CONVERSATION_ID` | `conversation_id` |
+| `BATON_FROM` | `from` |
+| `BATON_TO` | `to` |
+| `BATON_KIND` | `kind` wire value (`request`, `response`, `done`, `error`, `notify`) |
+| `BATON_IN_REPLY_TO` | `in_reply_to`, empty string when null |
+| `BATON_TS_MS` | `ts_ms` |
+| `BATON_INBOX` | the serving mailbox root (`--inbox`) |
+| `BATON_OUTBOX` | `--outbox` |
+| `BATON_ROLE` | `--role` name — absent (and stripped from any inherited value) without `--role` |
+
+A headless agent can use these to know who is talking to it, whether the turn
+is a `request`/`response`/`error`/`notify`, and correlate it with an earlier
+turn — without the wrapper re-encoding any of that into the body.
+
 ## System prompt and MCP: the caller's job
 
 Baton has no first-class flag for system prompt or MCP config in agent mode —

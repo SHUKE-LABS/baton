@@ -218,6 +218,7 @@ impl SubprocessParticipant {
             &self.program,
             &self.args,
             &self.envs,
+            &[],
             None,
             payload.as_bytes(),
             Some(self.read_timeout),
@@ -416,6 +417,17 @@ pub struct ExternalAgentParticipant {
     /// When set, non-empty stderr from successful turns is persisted as
     /// `<stderr_dir>/<message-id>.stderr`. `None` is a strict no-op.
     stderr_dir: Option<PathBuf>,
+    /// The serving mailbox root (`--inbox`), stamped as `BATON_INBOX` on every
+    /// turn. `None` omits the variable.
+    inbox: Option<PathBuf>,
+    /// The serving mailbox's outbox (`--outbox`), stamped as `BATON_OUTBOX` on
+    /// every turn. `None` omits the variable.
+    outbox: Option<PathBuf>,
+    /// The `--role` name, stamped as `BATON_ROLE` on every turn. `None` both
+    /// omits the variable *and* strips any same-named value the child would
+    /// otherwise inherit from this process's environment, so a role-less serve
+    /// never leaks a stale `BATON_ROLE` (#361).
+    role: Option<String>,
 }
 
 /// Isolates the agent's final *result* from its raw stdout.
@@ -498,6 +510,9 @@ impl ExternalAgentParticipant {
             output,
             read_timeout,
             stderr_dir: None,
+            inbox: None,
+            outbox: None,
+            role: None,
         }
     }
 
@@ -509,6 +524,27 @@ impl ExternalAgentParticipant {
         self
     }
 
+    /// Sets the serving mailbox root stamped as `BATON_INBOX` on every turn.
+    pub fn with_inbox(mut self, inbox: impl Into<PathBuf>) -> Self {
+        self.inbox = Some(inbox.into());
+        self
+    }
+
+    /// Sets the serving mailbox's outbox stamped as `BATON_OUTBOX` on every
+    /// turn.
+    pub fn with_outbox(mut self, outbox: impl Into<PathBuf>) -> Self {
+        self.outbox = Some(outbox.into());
+        self
+    }
+
+    /// Sets the `--role` name stamped as `BATON_ROLE` on every turn. Without
+    /// this, `BATON_ROLE` is both omitted and actively stripped from any
+    /// inherited value (#361).
+    pub fn with_role(mut self, role: impl Into<String>) -> Self {
+        self.role = Some(role.into());
+        self
+    }
+
     /// Runs one headless agent turn, returning the reply body (the agent's final
     /// result, isolated from raw stdout by the [`OutputAdapter`]) or an `Err`
     /// describing the machinery failure (spawn failure, non-zero exit, empty
@@ -516,10 +552,22 @@ impl ExternalAgentParticipant {
     /// [`Participant::respond`] reconciles that `Err` into a delivered error
     /// envelope.
     fn try_respond(&self, request: &MessageEnvelope) -> Result<String> {
+        let mut envs = self.envs.clone();
+        envs.extend(self.turn_envs(request));
+        // `BATON_ROLE` must be *absent* without `--role` (#361), even if the
+        // serving process itself inherited one — so a role-less turn strips
+        // it explicitly rather than merely not setting it.
+        let env_removals: &[&str] = if self.role.is_none() {
+            &["BATON_ROLE"]
+        } else {
+            &[]
+        };
+
         let (stdout, stderr) = capture_child_output(
             &self.program,
             &self.args,
-            &self.envs,
+            &envs,
+            env_removals,
             Some(&self.cwd),
             request.body.as_bytes(),
             self.read_timeout,
@@ -563,6 +611,47 @@ impl ExternalAgentParticipant {
             .collect();
         let path = dir.join(format!("{safe_id}.stderr"));
         let _ = std::fs::write(&path, stderr.as_bytes());
+    }
+
+    /// Builds the `BATON_*` environment layer for one turn, from `request`'s
+    /// addressing/correlation fields plus this participant's mailbox/role
+    /// configuration (#361). Applied *after* `self.envs`, so a turn value
+    /// always overrides a same-named fixed or inherited one.
+    fn turn_envs(&self, request: &MessageEnvelope) -> Vec<(String, String)> {
+        let mut envs = vec![
+            ("BATON_MESSAGE_ID".to_string(), request.message_id.clone()),
+            (
+                "BATON_CONVERSATION_ID".to_string(),
+                request.conversation_id.clone(),
+            ),
+            ("BATON_FROM".to_string(), request.from.clone()),
+            ("BATON_TO".to_string(), request.to.clone()),
+            (
+                "BATON_KIND".to_string(),
+                request.kind.as_wire_str().to_string(),
+            ),
+            (
+                "BATON_IN_REPLY_TO".to_string(),
+                request.in_reply_to.clone().unwrap_or_default(),
+            ),
+            ("BATON_TS_MS".to_string(), request.ts_ms.to_string()),
+        ];
+        if let Some(inbox) = &self.inbox {
+            envs.push((
+                "BATON_INBOX".to_string(),
+                inbox.to_string_lossy().into_owned(),
+            ));
+        }
+        if let Some(outbox) = &self.outbox {
+            envs.push((
+                "BATON_OUTBOX".to_string(),
+                outbox.to_string_lossy().into_owned(),
+            ));
+        }
+        if let Some(role) = &self.role {
+            envs.push(("BATON_ROLE".to_string(), role.clone()));
+        }
+        envs
     }
 }
 
@@ -717,6 +806,12 @@ fn append_windows_msvc_arg(line: &mut String, token: &str) {
 /// process machinery behind [`SubprocessParticipant`] and
 /// [`ExternalAgentParticipant`].
 ///
+/// `env_removals` removes each named variable from the child's environment
+/// entirely, applied *after* `envs`, so the removal wins over both the
+/// inherited environment and any same-named entry in `envs` — a caller can
+/// thus guarantee a variable's absence (e.g. a role-less `BATON_ROLE`, #361),
+/// which `envs` alone cannot express (it only sets/overrides).
+///
 /// Both stdout and stderr are drained on their own threads, started *before*
 /// the stdin write, so a child that emits before consuming all its input — or
 /// that writes more than a pipe buffer to stderr — cannot deadlock against a
@@ -734,6 +829,7 @@ fn capture_child_output(
     program: &Path,
     args: &[String],
     envs: &[(String, String)],
+    env_removals: &[&str],
     cwd: Option<&Path>,
     payload: &[u8],
     read_timeout: Option<Duration>,
@@ -777,6 +873,12 @@ fn capture_child_output(
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    // Removals apply *after* `envs` so the key cannot be resurrected — by a
+    // same-named entry in the fixed layer either — and the caller's absence
+    // guarantee wins over every earlier layer (#361).
+    for key in env_removals {
+        command.env_remove(key);
+    }
     if let Some(cwd) = cwd {
         command.current_dir(cwd);
     }
@@ -1853,6 +1955,127 @@ mod tests {
         assert!(resp2.body.contains("ROUND-TWO-PAYLOAD"));
     }
 
+    // -- BATON_* turn environment (#361) ------------------------------------
+
+    /// Serializes tests that temporarily mutate the *process* environment
+    /// (`std::env::set_var`/`remove_var`), so parallel `cargo test` threads
+    /// never observe another test's transient value.
+    static ENV_MUTATION_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// A stub agent script that echoes every `BATON_*` turn variable on stdout,
+    /// one `KEY=[value]` line each, brackets making an empty value visible.
+    /// `ROLE_SET` carries the `${BATON_ROLE+x}` expansion — `x` when the
+    /// variable is present (even set-but-empty), empty when genuinely absent —
+    /// so the role-less case can assert removal, not just an empty value.
+    const ECHO_BATON_ENV_SCRIPT: &str = "cat >/dev/null; \
+        printf 'MESSAGE_ID=[%s]\\n' \"$BATON_MESSAGE_ID\"; \
+        printf 'CONVERSATION_ID=[%s]\\n' \"$BATON_CONVERSATION_ID\"; \
+        printf 'FROM=[%s]\\n' \"$BATON_FROM\"; \
+        printf 'TO=[%s]\\n' \"$BATON_TO\"; \
+        printf 'KIND=[%s]\\n' \"$BATON_KIND\"; \
+        printf 'IN_REPLY_TO=[%s]\\n' \"$BATON_IN_REPLY_TO\"; \
+        printf 'TS_MS=[%s]\\n' \"$BATON_TS_MS\"; \
+        printf 'INBOX=[%s]\\n' \"$BATON_INBOX\"; \
+        printf 'OUTBOX=[%s]\\n' \"$BATON_OUTBOX\"; \
+        printf 'ROLE=[%s]\\n' \"$BATON_ROLE\"; \
+        printf 'ROLE_SET=[%s]\\n' \"${BATON_ROLE+x}\"";
+
+    /// A `request` envelope (via [`external_agent`] + `--role`) receives every
+    /// `BATON_*` variable from the claimed envelope plus the configured mailbox
+    /// addressing and role.
+    #[test]
+    fn external_agent_stamps_baton_env_for_request_with_role() {
+        let dir = TempDir::new("ext-baton-env-request");
+        let participant = external_agent(ECHO_BATON_ENV_SCRIPT, &dir.path, Duration::from_secs(5))
+            .with_inbox("/mailbox/in")
+            .with_outbox("/mailbox/out")
+            .with_role("scribe");
+
+        let response = participant.respond(&request_with_body("m-req-1", "go"));
+
+        assert_eq!(
+            response.body,
+            "MESSAGE_ID=[m-req-1]\n\
+             CONVERSATION_ID=[conv-42]\n\
+             FROM=[agent-a]\n\
+             TO=[agent-b]\n\
+             KIND=[request]\n\
+             IN_REPLY_TO=[]\n\
+             TS_MS=[1700000000000]\n\
+             INBOX=[/mailbox/in]\n\
+             OUTBOX=[/mailbox/out]\n\
+             ROLE=[scribe]\n\
+             ROLE_SET=[x]\n"
+        );
+    }
+
+    /// A `notify` envelope with a non-null `in_reply_to`, no `--role`, and
+    /// `BATON_ROLE` poisoned on *both* layers a child could inherit it from —
+    /// the participant's fixed env layer and the serving process's own
+    /// environment: the turn's values still win (the stale inherited
+    /// `BATON_FROM` is overridden) and `BATON_ROLE` ends up genuinely absent
+    /// (stripped from both layers), not merely unset by omission.
+    #[test]
+    fn external_agent_notify_overrides_inherited_from_and_strips_role_without_role() {
+        let _guard = ENV_MUTATION_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prior_from = std::env::var("BATON_FROM").ok();
+        let prior_role = std::env::var("BATON_ROLE").ok();
+        // Safety: serialized by `ENV_MUTATION_LOCK` above, restored below on
+        // every exit path (including the panic from a failed assertion).
+        unsafe {
+            std::env::set_var("BATON_FROM", "stale-inherited-agent");
+            std::env::set_var("BATON_ROLE", "leaked-inherited-role");
+        }
+
+        let dir = TempDir::new("ext-baton-env-notify");
+        let participant = ExternalAgentParticipant::new(
+            "sh",
+            ["-c", ECHO_BATON_ENV_SCRIPT],
+            [("BATON_ROLE", "fixed-layer-role")],
+            &dir.path,
+            OutputAdapter::Raw,
+            Some(Duration::from_secs(5)),
+        )
+        .with_inbox("/mailbox/in")
+        .with_outbox("/mailbox/out");
+        let mut request = request_with_body("m-req-2", "milestone reached");
+        request.kind = MessageKind::Notify;
+        request.in_reply_to = Some("m-req-1".to_string());
+
+        let response = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            participant.respond(&request)
+        }));
+
+        // Safety: restores exactly what was observed before this test mutated
+        // the process environment, regardless of the assertion outcome below.
+        unsafe {
+            match prior_from {
+                Some(v) => std::env::set_var("BATON_FROM", v),
+                None => std::env::remove_var("BATON_FROM"),
+            }
+            match prior_role {
+                Some(v) => std::env::set_var("BATON_ROLE", v),
+                None => std::env::remove_var("BATON_ROLE"),
+            }
+        }
+        let response = response.unwrap_or_else(|payload| std::panic::resume_unwind(payload));
+
+        assert_eq!(
+            response.body,
+            "MESSAGE_ID=[m-req-2]\n\
+             CONVERSATION_ID=[conv-42]\n\
+             FROM=[agent-a]\n\
+             TO=[agent-b]\n\
+             KIND=[notify]\n\
+             IN_REPLY_TO=[m-req-1]\n\
+             TS_MS=[1700000000000]\n\
+             INBOX=[/mailbox/in]\n\
+             OUTBOX=[/mailbox/out]\n\
+             ROLE=[]\n\
+             ROLE_SET=[]\n"
+        );
+    }
+
     /// An agent that exits non-zero yields a synthesized delivered error naming
     /// the failure.
     #[test]
@@ -2004,6 +2227,7 @@ mod tests {
                 "cat >/dev/null; echo OUT; echo ERR >&2".to_string(),
             ],
             &[],
+            &[],
             None,
             b"",
             Some(Duration::from_secs(5)),
@@ -2022,6 +2246,7 @@ mod tests {
                 "-c".to_string(),
                 "cat >/dev/null; echo BOOM >&2; exit 1".to_string(),
             ],
+            &[],
             &[],
             None,
             b"",
@@ -2043,6 +2268,7 @@ mod tests {
                 "-c".to_string(),
                 "cat >/dev/null; echo TIMEOUT-DIAG >&2; sleep 1 2>/dev/null &".to_string(),
             ],
+            &[],
             &[],
             None,
             b"",
@@ -2068,6 +2294,7 @@ mod tests {
         let (_, stderr) = capture_child_output(
             Path::new("sh"),
             &["-c".to_string(), script],
+            &[],
             &[],
             None,
             b"",
@@ -2097,6 +2324,7 @@ mod tests {
         let (stdout, _) = capture_child_output(
             Path::new("sh"),
             &["-c".to_string(), script],
+            &[],
             &[],
             None,
             b"",
