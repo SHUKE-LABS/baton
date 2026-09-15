@@ -225,9 +225,32 @@ impl Mailbox {
     /// id already in `done/` is dropped (dedup). A claimed file that will not
     /// parse is moved to `done/` and skipped with a warning, so one malformed
     /// message cannot wedge the daemon.
+    ///
+    /// Entries are visited in delivery order — ascending `(mtime, file name)` —
+    /// not `read_dir`'s filesystem-defined order, so a handoff followed by a
+    /// correction is never answered in reverse. `rename(2)` preserves the
+    /// delivery mtime `baton send` sets on write, and `stamp_claim_time` only
+    /// touches files already moved into `claimed/`, so neither disturbs this
+    /// ordering. A path whose metadata can't be read by the time it's sorted
+    /// (raced away by another claimant) is dropped from the scan rather than
+    /// failing the whole call.
     pub fn claim_next(&self) -> Result<Option<Claimed>> {
+        let mut candidates: Vec<(SystemTime, PathBuf)> = Vec::new();
         for entry in read_dir(&self.pending)? {
             let path = dir_entry(entry, &self.pending)?.path();
+            let Ok(metadata) = fs::metadata(&path) else {
+                continue;
+            };
+            let Ok(mtime) = metadata.modified() else {
+                continue;
+            };
+            candidates.push((mtime, path));
+        }
+        candidates.sort_by(|(a_mtime, a_path), (b_mtime, b_path)| {
+            a_mtime.cmp(b_mtime).then_with(|| a_path.cmp(b_path))
+        });
+
+        for (_, path) in candidates {
             let Some(key) = json_key(&path) else { continue };
 
             // Dedup: already answered ⇒ drop the redelivered duplicate.
@@ -841,6 +864,33 @@ mod tests {
         let dir = TempDir::new("empty");
         let mailbox = Mailbox::open(&dir.path).expect("open");
         assert!(mailbox.claim_next().expect("claim").is_none());
+    }
+
+    /// `claim_next` orders by mtime, not by write (and so not by `read_dir`'s
+    /// filesystem-defined) order: three envelopes are delivered `m-a, m-b,
+    /// m-c`, then backdated to non-monotonic ages so the oldest-mtime entry
+    /// (`m-c`) is the *last* one written. Three successive claims must still
+    /// return oldest-mtime-first: `m-c`, `m-a`, `m-b`.
+    #[test]
+    fn claim_next_orders_by_mtime_not_write_order() {
+        let dir = TempDir::new("fifo");
+        let mailbox = Mailbox::open(&dir.path).expect("open");
+        mailbox.deliver(&request("m-a")).expect("deliver a");
+        mailbox.deliver(&request("m-b")).expect("deliver b");
+        mailbox.deliver(&request("m-c")).expect("deliver c");
+
+        let pending = dir.path.join("pending");
+        backdate(&pending.join(file_name("m-a")), 50);
+        backdate(&pending.join(file_name("m-b")), 10);
+        backdate(&pending.join(file_name("m-c")), 100);
+
+        let first = mailbox.claim_next().expect("claim").expect("some");
+        let second = mailbox.claim_next().expect("claim").expect("some");
+        let third = mailbox.claim_next().expect("claim").expect("some");
+
+        assert_eq!(first.key, "m-c");
+        assert_eq!(second.key, "m-a");
+        assert_eq!(third.key, "m-b");
     }
 
     /// Completes a message, then backdates its ledger entry by `age_secs` —
