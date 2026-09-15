@@ -86,9 +86,10 @@ pub const USAGE: &str = concat!(
     "baton converse-ring --registry <path> --roster <a,b,c> (--seed <text> | --seed-file <path>) [--await-ms <n>] [--out <path>]\n",
     "    Drive an N-party round-robin conversation across registry-resolved mailbox peers.\n",
     "\n",
-    "baton serve --inbox <dir> --outbox <dir> [--poll-ms <n>] [--once] [--agent-cmd <program> [--agent-arg <arg>]... [--agent-cwd <dir>] [--agent-timeout-ms <n>] [--agent-output raw|json [--agent-result-key <key>]]] [--role <name>]\n",
+    "baton serve --inbox <dir> --outbox <dir> [--poll-ms <n>] [--retention <duration>] [--once] [--agent-cmd <program> [--agent-arg <arg>]... [--agent-cwd <dir>] [--agent-timeout-ms <n>] [--agent-output raw|json [--agent-result-key <key>]]] [--role <name>]\n",
     "baton serve --stop --inbox <dir>\n",
     "    Drain a mailbox with an external agent (`--agent-cmd`) or in-process provider; `--stop` requests a cooperative shutdown of a running daemon.\n",
+    "    `--retention <duration>` prunes aged `done/` entries and unconsumed outbox replies between polls (at most once per 60s); `0` is rejected; omitting it keeps pruning manual.\n",
     "    `--agent-timeout-ms 0` waits indefinitely for the agent (no read deadline); a positive value is a bounded read timeout; omitting it keeps the 600000 ms default.\n",
     "\n",
     "baton send (--inbox <dir> | --registry <path>) (--body <text> [--to <role>] | --in <path>) [--from <id>] [--conversation <id>] [--await [--outbox <dir>] [--timeout-ms <n>]]\n",
@@ -97,8 +98,8 @@ pub const USAGE: &str = concat!(
     "baton status (--mailbox <root> | --registry <path> --role <role>) [--max-runtime-ms <n>]\n",
     "    Report a mailbox's claim and health status.\n",
     "\n",
-    "baton mailbox prune --mailbox <root> --older-than <duration>\n",
-    "    Delete done mailbox entries older than a duration.\n",
+    "baton mailbox prune --mailbox <root> --older-than <duration> [--outbox <dir>]\n",
+    "    Delete done mailbox entries older than a duration; with `--outbox`, also delete unconsumed outbox replies past the same window.\n",
     "\n",
     "baton log show [--file <path>]\n",
     "    Print the recorded exchanges from a log.\n",
@@ -273,6 +274,10 @@ enum Command {
         /// system prompt, credential, cwd). Explicit flags override the role's
         /// values; `None` ⇒ pure env, the prior behaviour.
         role: Option<String>,
+        /// `--retention` window (ms). When set, the daemon prunes its own
+        /// `done/` ledger and this outbox between polls, at most once per 60 s;
+        /// `None` ⇒ no automatic prune, the prior behaviour.
+        retention_ms: Option<u64>,
     },
     /// Cooperatively stop a running `baton serve` on `inbox` (Option C graceful
     /// shutdown): drop a stop sentinel the daemon observes between messages, so
@@ -315,8 +320,14 @@ enum Command {
     /// Prune the `done/` dedup ledger of the mailbox at `mailbox`, removing
     /// every entry at least `older_than_ms` old. Operator-invoked and never
     /// automatic: it bounds the ledger at the cost of shortening the
-    /// redelivery-dedup window.
-    MailboxPrune { mailbox: String, older_than_ms: u64 },
+    /// redelivery-dedup window. `outbox` extends the same window to the
+    /// outbox's unconsumed reply files; `None` leaves the outbox untouched and
+    /// keeps the output line byte-identical to the two-field form.
+    MailboxPrune {
+        mailbox: String,
+        outbox: Option<String>,
+        older_than_ms: u64,
+    },
     /// Pretty-print the recorded exchange trail.
     LogShow { file: Option<String> },
     /// Re-run a recorded exchange. `index` is 1-based; `None` ⇒ the last one.
@@ -614,6 +625,7 @@ pub fn run() -> Result<()> {
             agent_output,
             agent_result_key,
             role,
+            retention_ms,
         } => {
             #[cfg(windows)]
             service::adopt_windows_service_job()?;
@@ -739,6 +751,8 @@ pub fn run() -> Result<()> {
             let outbox = Path::new(&outbox);
 
             let poll = Duration::from_millis(poll_ms);
+            let retention_window = retention_ms.map(Duration::from_millis);
+            let mut last_retention_pass: Option<Instant> = None;
             loop {
                 match drain_mailbox(
                     &mailbox,
@@ -751,6 +765,17 @@ pub fn run() -> Result<()> {
                     // Cooperative stop observed between messages ⇒ exit 0.
                     Drain::Stopped => break,
                     Drain::Drained(processed) => {
+                        // The retention prune is the daemon applying its own
+                        // `--retention` window between polls (first pass on
+                        // the first drained pass, so `--once` prunes too).
+                        if let Some(window) = retention_window {
+                            retention_pass(
+                                Path::new(&inbox),
+                                outbox,
+                                window,
+                                &mut last_retention_pass,
+                            );
+                        }
                         if once {
                             break;
                         }
@@ -849,11 +874,23 @@ pub fn run() -> Result<()> {
         }
         Command::MailboxPrune {
             mailbox,
+            outbox,
             older_than_ms,
         } => {
-            let removed = mailbox::prune_done(&mailbox, Duration::from_millis(older_than_ms))?;
+            let window = Duration::from_millis(older_than_ms);
+            let removed = mailbox::prune_done(&mailbox, window)?;
+            let outbox_removed = match &outbox {
+                Some(dir) => mailbox::prune_outbox(dir, window)?,
+                None => 0,
+            };
             let stdout = std::io::stdout();
-            execute_mailbox_prune(removed, older_than_ms, stdout.lock())
+            execute_mailbox_prune(
+                removed,
+                outbox_removed,
+                older_than_ms,
+                outbox.is_some(),
+                stdout.lock(),
+            )
         }
         Command::LogShow { file } => {
             let exchanges = read_log(file.as_deref())?;
@@ -1280,6 +1317,32 @@ enum Drain {
     Stopped,
 }
 
+/// The minimum wall-clock gap between two retention prune passes.
+const RETENTION_PRUNE_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Runs one retention prune pass over the daemon's `done/` ledger and outbox,
+/// gated by `last` to at most one pass per [`RETENTION_PRUNE_INTERVAL`] — the
+/// first call always prunes, so a `--once` daemon runs its pass too. One stderr
+/// line reports a pass that removed anything; a failed pass warns instead of
+/// killing the daemon, and the stamp advances either way so a broken scan
+/// retries at the interval cadence rather than per poll.
+fn retention_pass(inbox: &Path, outbox: &Path, window: Duration, last: &mut Option<Instant>) {
+    if last.is_some_and(|at| at.elapsed() < RETENTION_PRUNE_INTERVAL) {
+        return;
+    }
+    *last = Some(Instant::now());
+    let pass = mailbox::prune_done(inbox, window)
+        .and_then(|done| mailbox::prune_outbox(outbox, window).map(|replies| (done, replies)));
+    match pass {
+        Ok((0, 0)) => {}
+        Ok((done, replies)) => eprintln!(
+            "retention prune: removed {done} done entries, {replies} outbox replies (window {}ms)",
+            window.as_millis()
+        ),
+        Err(err) => eprintln!("warning: retention prune failed: {err}"),
+    }
+}
+
 /// Drains every currently-claimable request from `mailbox` through one
 /// participant, writing each reply to `outbox` keyed by the request id, and
 /// returns how many were processed — unless a cooperative stop is observed.
@@ -1422,13 +1485,30 @@ fn execute_status(status: &MailboxStatus, max_runtime_ms: u64, mut out: impl Wri
 
 /// Renders one `baton mailbox prune` result as a single JSON line: how many
 /// ledger entries were removed, and the window they were measured against
-/// (normalized to milliseconds, whatever unit the operator typed).
-fn execute_mailbox_prune(removed: usize, older_than_ms: u64, mut out: impl Write) -> Result<()> {
-    writeln!(
-        out,
-        "{{\"removed\":{removed},\"older_than_ms\":{older_than_ms}}}"
-    )
-    .map_err(io_err)
+/// (normalized to milliseconds, whatever unit the operator typed). With
+/// `--outbox`, the line additionally reports how many outbox replies the same
+/// window removed; without it the two-field line is byte-identical to the
+/// pre-`--outbox` contract.
+fn execute_mailbox_prune(
+    removed: usize,
+    outbox_removed: usize,
+    older_than_ms: u64,
+    with_outbox: bool,
+    mut out: impl Write,
+) -> Result<()> {
+    if with_outbox {
+        writeln!(
+            out,
+            "{{\"removed\":{removed},\"outbox_removed\":{outbox_removed},\"older_than_ms\":{older_than_ms}}}"
+        )
+        .map_err(io_err)
+    } else {
+        writeln!(
+            out,
+            "{{\"removed\":{removed},\"older_than_ms\":{older_than_ms}}}"
+        )
+        .map_err(io_err)
+    }
 }
 
 /// Polls `outbox` for the reply keyed by `key`, claiming it atomically, until it
@@ -2739,6 +2819,8 @@ struct SessionSpecFlags {
     inbox: Option<String>,
     outbox: Option<String>,
     poll_ms: Option<u64>,
+    /// `--retention` window in ms; `None` ⇒ no automatic prune.
+    retention_ms: Option<u64>,
     agent_cmd: Option<String>,
     agent_args: Vec<String>,
     agent_cwd: Option<String>,
@@ -2784,6 +2866,17 @@ impl SessionSpecFlags {
             }
             other if other.starts_with("--poll-ms=") => {
                 self.poll_ms = Some(parse_poll_ms(&other["--poll-ms=".len()..])?);
+                Ok(true)
+            }
+            "--retention" => {
+                self.retention_ms = Some(parse_duration_ms("--retention", &take("--retention")?)?);
+                Ok(true)
+            }
+            other if other.starts_with("--retention=") => {
+                self.retention_ms = Some(parse_duration_ms(
+                    "--retention",
+                    &other["--retention=".len()..],
+                )?);
                 Ok(true)
             }
             "--agent-cmd" => {
@@ -2927,12 +3020,13 @@ fn parse_serve<'a>(mut iter: impl Iterator<Item = &'a String>) -> Result<Command
         if flags.outbox.is_some()
             || flags.poll_ms.is_some()
             || once
+            || flags.retention_ms.is_some()
             || flags.agent_cmd.is_some()
             || flags.has_agent_run_flags()
             || flags.role.is_some()
         {
             return Err(usage(
-                "--stop takes only --inbox (not --outbox/--poll-ms/--once/--agent-*/--role)",
+                "--stop takes only --inbox (not --outbox/--poll-ms/--retention/--once/--agent-*/--role)",
             ));
         }
         let inbox = require_dir(flags.inbox, "--inbox")?;
@@ -2944,6 +3038,7 @@ fn parse_serve<'a>(mut iter: impl Iterator<Item = &'a String>) -> Result<Command
         inbox,
         outbox,
         poll_ms,
+        retention_ms,
         agent_cmd,
         agent_args,
         agent_cwd,
@@ -2967,6 +3062,7 @@ fn parse_serve<'a>(mut iter: impl Iterator<Item = &'a String>) -> Result<Command
         agent_output,
         agent_result_key,
         role,
+        retention_ms,
     })
 }
 
@@ -3064,6 +3160,7 @@ fn parse_service_start<'a>(mut iter: impl Iterator<Item = &'a String>) -> Result
         inbox,
         outbox,
         poll_ms,
+        retention_ms,
         agent_cmd,
         agent_args,
         agent_cwd,
@@ -3087,6 +3184,7 @@ fn parse_service_start<'a>(mut iter: impl Iterator<Item = &'a String>) -> Result
         inbox,
         outbox,
         poll_ms,
+        retention_ms,
         agent_cmd,
         agent_args,
         agent_cwd,
@@ -3611,10 +3709,13 @@ fn parse_status<'a>(mut iter: impl Iterator<Item = &'a String>) -> Result<Comman
     })
 }
 
-/// Parses `baton mailbox prune --mailbox <root> --older-than <duration>`.
+/// Parses `baton mailbox prune --mailbox <root> --older-than <duration>
+/// [--outbox <dir>]`.
 ///
-/// `prune` is the only subcommand; both flags are required. The full ledger scan
-/// happens in `run`, so this stays I/O-free.
+/// `prune` is the only subcommand; `--mailbox` and `--older-than` are required,
+/// `--outbox` extends the same window to an outbox's unconsumed replies and is
+/// optional (its absence keeps the two-field output contract). The full ledger
+/// scan happens in `run`, so this stays I/O-free.
 fn parse_mailbox<'a>(mut iter: impl Iterator<Item = &'a String>) -> Result<Command> {
     let sub = iter
         .next()
@@ -3624,6 +3725,7 @@ fn parse_mailbox<'a>(mut iter: impl Iterator<Item = &'a String>) -> Result<Comma
     }
 
     let mut mailbox: Option<String> = None;
+    let mut outbox: Option<String> = None;
     let mut older_than_ms: Option<u64> = None;
     while let Some(arg) = iter.next() {
         let mut take = |flag: &str| -> Result<String> {
@@ -3635,6 +3737,10 @@ fn parse_mailbox<'a>(mut iter: impl Iterator<Item = &'a String>) -> Result<Comma
             "--mailbox" => mailbox = Some(take("--mailbox")?),
             other if other.starts_with("--mailbox=") => {
                 mailbox = Some(other["--mailbox=".len()..].to_string());
+            }
+            "--outbox" => outbox = Some(take("--outbox")?),
+            other if other.starts_with("--outbox=") => {
+                outbox = Some(other["--outbox=".len()..].to_string());
             }
             "--older-than" => {
                 older_than_ms = Some(parse_duration_ms("--older-than", &take("--older-than")?)?)
@@ -3651,6 +3757,9 @@ fn parse_mailbox<'a>(mut iter: impl Iterator<Item = &'a String>) -> Result<Comma
 
     Ok(Command::MailboxPrune {
         mailbox: require_dir(mailbox, "--mailbox")?,
+        outbox: outbox
+            .map(|dir| require_dir(Some(dir), "--outbox"))
+            .transpose()?,
         older_than_ms: older_than_ms
             .ok_or_else(|| usage("mailbox prune requires --older-than <duration>"))?,
     })
@@ -5876,6 +5985,7 @@ mod tests {
                 agent_output: None,
                 agent_result_key: None,
                 role: None,
+                retention_ms: None,
             }
         );
     }
@@ -5963,6 +6073,7 @@ mod tests {
                 agent_output: None,
                 agent_result_key: None,
                 role: None,
+                retention_ms: None,
             }
         );
     }
@@ -5990,6 +6101,7 @@ mod tests {
                 agent_output: None,
                 agent_result_key: None,
                 role: None,
+                retention_ms: None,
             }
         );
     }
@@ -6119,6 +6231,7 @@ mod tests {
                 agent_output: None,
                 agent_result_key: None,
                 role: None,
+                retention_ms: None,
             }
         );
         assert!(matches!(
@@ -6187,8 +6300,95 @@ mod tests {
                 agent_output: None,
                 agent_result_key: None,
                 role: None,
+                retention_ms: None,
             }
         );
+    }
+
+    #[test]
+    fn parse_serve_accepts_retention() {
+        let command = parse_args(&argv(&[
+            "serve",
+            "--inbox=/tmp/in",
+            "--outbox=/tmp/out",
+            "--agent-cmd=/bin/true",
+            "--retention",
+            "7d",
+        ]))
+        .expect("parses");
+        assert!(
+            matches!(
+                command,
+                Command::Serve {
+                    retention_ms: Some(604_800_000),
+                    ..
+                }
+            ),
+            "expected retention parsed to milliseconds, got {command:?}"
+        );
+        let inline = parse_args(&argv(&[
+            "serve",
+            "--inbox=/tmp/in",
+            "--outbox=/tmp/out",
+            "--agent-cmd=/bin/true",
+            "--retention=900ms",
+        ]))
+        .expect("parses");
+        assert!(matches!(
+            inline,
+            Command::Serve {
+                retention_ms: Some(900),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn serve_retention_rules_are_usage_errors() {
+        let cases: &[&[&str]] = &[
+            &[
+                "serve",
+                "--inbox=/tmp/in",
+                "--outbox=/tmp/out",
+                "--agent-cmd=/bin/true",
+                "--retention",
+                "0",
+            ], // zero window
+            &[
+                "serve",
+                "--inbox=/tmp/in",
+                "--outbox=/tmp/out",
+                "--agent-cmd=/bin/true",
+                "--retention",
+                "0d",
+            ], // zero, suffixed
+            &["serve", "--stop", "--inbox=/tmp/in", "--retention=7d"], // stop takes no retention
+        ];
+        for case in cases {
+            assert!(
+                matches!(parse_args(&argv(case)).unwrap_err(), BatonError::Usage(_)),
+                "expected usage error for {case:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_service_start_forwards_retention_into_the_spec() {
+        let cmd = parse_args(&argv(&[
+            "service",
+            "start",
+            "--inbox=/tmp/in",
+            "--outbox=/tmp/out",
+            "--agent-cmd=/bin/true",
+            "--retention=48h",
+        ]))
+        .expect("parses");
+        match cmd {
+            Command::Service(service::ServiceCommand::Start { spec, .. }) => {
+                assert_eq!(spec.retention_ms, Some(172_800_000));
+            }
+            other => panic!("expected Service(Start), got {other:?}"),
+        }
     }
 
     #[test]
@@ -7401,6 +7601,7 @@ mod tests {
                 .expect("parses"),
                 Command::MailboxPrune {
                     mailbox: "/mb".to_string(),
+                    outbox: None,
                     older_than_ms: *expected,
                 },
                 "for {raw:?}"
@@ -7420,9 +7621,42 @@ mod tests {
             .expect("parses"),
             Command::MailboxPrune {
                 mailbox: "/mb".to_string(),
+                outbox: None,
                 older_than_ms: 604_800_000,
             }
         );
+    }
+
+    #[test]
+    fn mailbox_prune_accepts_optional_outbox() {
+        let spaced = parse_args(&argv(&[
+            "mailbox",
+            "prune",
+            "--mailbox",
+            "/mb",
+            "--older-than",
+            "7d",
+            "--outbox",
+            "/out",
+        ]))
+        .expect("parses");
+        assert_eq!(
+            spaced,
+            Command::MailboxPrune {
+                mailbox: "/mb".to_string(),
+                outbox: Some("/out".to_string()),
+                older_than_ms: 604_800_000,
+            }
+        );
+        let inline = parse_args(&argv(&[
+            "mailbox",
+            "prune",
+            "--mailbox=/mb",
+            "--older-than=7d",
+            "--outbox=/out",
+        ]))
+        .expect("parses");
+        assert_eq!(inline, spaced);
     }
 
     #[test]
@@ -7453,6 +7687,26 @@ mod tests {
                 "soon",
             ], // not a number
             &["mailbox", "prune", "--mailbox", "/mb", "--older-than"],       // dangling flag
+            &[
+                "mailbox",
+                "prune",
+                "--mailbox",
+                "/mb",
+                "--older-than",
+                "7d",
+                "--outbox",
+                "  ",
+            ], // blank outbox
+            &[
+                "mailbox",
+                "prune",
+                "--mailbox",
+                "/mb",
+                "--older-than",
+                "7d",
+                "--outbox=/out",
+                "--force",
+            ], // unknown flag past --outbox
             // Syntactically valid but unrepresentable: the suffix multiplication
             // must fail as a usage error, never wrap or panic.
             &[
@@ -7484,7 +7738,7 @@ mod tests {
     #[test]
     fn execute_mailbox_prune_renders_one_json_line() {
         let mut out = Vec::new();
-        execute_mailbox_prune(12, 604_800_000, &mut out).expect("render");
+        execute_mailbox_prune(12, 0, 604_800_000, false, &mut out).expect("render");
         assert_eq!(
             String::from_utf8(out).unwrap(),
             "{\"removed\":12,\"older_than_ms\":604800000}\n"
@@ -7492,10 +7746,19 @@ mod tests {
 
         // Nothing pruned still reports the window it was measured against.
         let mut out = Vec::new();
-        execute_mailbox_prune(0, 900_000, &mut out).expect("render");
+        execute_mailbox_prune(0, 0, 900_000, false, &mut out).expect("render");
         assert_eq!(
             String::from_utf8(out).unwrap(),
             "{\"removed\":0,\"older_than_ms\":900000}\n"
+        );
+
+        // With an outbox, the same window additionally reports the replies it
+        // removed — the three-field contract.
+        let mut out = Vec::new();
+        execute_mailbox_prune(2, 7, 604_800_000, true, &mut out).expect("render");
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "{\"removed\":2,\"outbox_removed\":7,\"older_than_ms\":604800000}\n"
         );
     }
 

@@ -18,8 +18,9 @@
 //!   claimant racing for the same file loses with `ENOENT` and moves on.
 //! - **complete** — `rename(claimed → done)`; `done/` doubles as the dedup
 //!   ledger, so a redelivered id already in `done/` is dropped, not reprocessed.
-//!   Nothing prunes it on its own: the ledger is bounded only by an operator's
-//!   [`prune_done`] (`baton mailbox prune`), which trades ledger size for the
+//!   Nothing prunes it on its own: the ledger is bounded only by an explicit
+//!   prune — an operator's [`prune_done`] (`baton mailbox prune`) or the
+//!   daemon's own `serve --retention` — which trades ledger size for the
 //!   length of the redelivery-dedup window.
 //! - **reclaim** — on startup the sole live instance moves any `claimed/` entry
 //!   a prior crash abandoned back to `pending/`, so no in-flight message is lost.
@@ -535,9 +536,11 @@ fn daemon_live(root: &Path) -> Result<bool> {
 ///
 /// The operator-invoked bound on the dedup ledger: `done/` grows by one file per
 /// completed message and nothing else ever removes them, so a long-lived daemon
-/// accumulates one permanent file per message. Pruning is **never automatic** —
-/// it shortens the redelivery-dedup window, and only an operator can decide that
-/// a duplicate arriving after the cutoff may be reprocessed.
+/// accumulates one permanent file per message. Pruning happens **only on an
+/// explicit flag** — `baton mailbox prune`, or `serve --retention` — and never
+/// on its own: it shortens the redelivery-dedup window, and only whoever sets
+/// that window can decide that a duplicate arriving after the cutoff may be
+/// reprocessed.
 ///
 /// Scoped to `done/`: `pending/` and `claimed/` are never touched, so a prune can
 /// neither drop an unanswered request nor abandon an in-flight one. Like
@@ -553,15 +556,38 @@ fn daemon_live(root: &Path) -> Result<bool> {
 /// wipe the ledger. Clearing it outright stays an explicit `rm` an operator
 /// types.
 pub fn prune_done(root: impl AsRef<Path>, older_than: Duration) -> Result<usize> {
+    prune_json_entries(&root.as_ref().join("done"), older_than)
+}
+
+/// Deletes unconsumed reply files in `outbox` whose mtime is at least
+/// `older_than` old, returning how many were removed.
+///
+/// The second half of the same prune: a fire-and-forget sender (or any `send`
+/// without `--await`) never claims its reply, so outbox files otherwise live
+/// forever alongside the `done/` ledger. The same window applies to both — a
+/// reply older than the window is as unconsumable as its ledger entry is
+/// dedup-expired.
+///
+/// Scoped like [`prune_done`]: only `<key>.json` entries are considered, so the
+/// `.`-prefixed non-`.json` files an in-flight `send --await` claim renames to
+/// (and atomic-write temp files) are never touched — a claim racing this prune
+/// keeps its file. Lock-free for the same reason, and `older_than` carries the
+/// same strictly-positive rule.
+pub fn prune_outbox(outbox: impl AsRef<Path>, older_than: Duration) -> Result<usize> {
+    prune_json_entries(outbox.as_ref(), older_than)
+}
+
+/// The shared prune scan behind [`prune_done`] and [`prune_outbox`]: delete the
+/// `<key>.json` entries in `dir` whose mtime is at least `older_than` old.
+fn prune_json_entries(dir: &Path, older_than: Duration) -> Result<usize> {
     if older_than.is_zero() {
         return Err(BatonError::Io(
             "mailbox prune window must be greater than zero".to_string(),
         ));
     }
-    let dir = root.as_ref().join("done");
-    let rd = match fs::read_dir(&dir) {
+    let rd = match fs::read_dir(dir) {
         Ok(rd) => rd,
-        // No `done/` ⇒ nothing was ever completed here; nothing to prune.
+        // No directory ⇒ nothing was ever written here; nothing to prune.
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(0),
         Err(err) => {
             return Err(BatonError::Io(format!(
@@ -572,7 +598,7 @@ pub fn prune_done(root: impl AsRef<Path>, older_than: Duration) -> Result<usize>
     let now = SystemTime::now();
     let mut removed = 0;
     for entry in rd {
-        let path = dir_entry(entry, &dir)?.path();
+        let path = dir_entry(entry, dir)?.path();
         if json_key(&path).is_none() {
             continue;
         }
@@ -1126,6 +1152,85 @@ mod tests {
         let dir = TempDir::new("prune-absent");
         assert_eq!(
             prune_done(&dir.path, Duration::from_secs(60)).expect("prune"),
+            0
+        );
+    }
+
+    /// An outbox reply older than the window is pruned, a fresh one survives,
+    /// and the count reports the removals.
+    #[test]
+    fn prune_outbox_removes_replies_past_the_window() {
+        let dir = TempDir::new("prune-outbox");
+        let outbox = dir.path.join("outbox");
+        fs::create_dir_all(&outbox).expect("outbox");
+        for id in ["m-old", "m-fresh"] {
+            fs::write(outbox.join(file_name(id)), "{}").expect("write reply");
+        }
+        backdate(&outbox.join(file_name("m-old")), 3_600);
+
+        let removed = prune_outbox(&outbox, Duration::from_secs(60)).expect("prune");
+        assert_eq!(removed, 1);
+        assert_eq!(count_files(&outbox), 1);
+        assert!(outbox.join(file_name("m-fresh")).exists());
+    }
+
+    /// The `.`-prefixed non-`.json` file an in-flight `send --await` claim
+    /// renames to is never touched — the prune cannot steal a claim a consumer
+    /// is mid-read on.
+    #[test]
+    fn prune_outbox_never_touches_claim_files() {
+        let dir = TempDir::new("prune-outbox-claim");
+        let outbox = dir.path.join("outbox");
+        fs::create_dir_all(&outbox).expect("outbox");
+        let claim = outbox.join(".m-1.4242.0.claimed");
+        fs::write(&claim, "{}").expect("write claim file");
+        backdate(&claim, 3_600);
+
+        let removed = prune_outbox(&outbox, Duration::from_secs(60)).expect("prune");
+        assert_eq!(removed, 0);
+        assert!(claim.exists(), "in-flight claim file must survive");
+    }
+
+    /// With `--outbox`, `pending/` and `claimed/` stay out of reach for both
+    /// halves of the prune — the counts pin the scope.
+    #[test]
+    fn prune_with_outbox_never_touches_pending_or_claimed() {
+        let dir = TempDir::new("prune-outbox-scope");
+        let mailbox = Mailbox::open(&dir.path).expect("open");
+        mailbox.deliver(&request("m-claimed")).expect("deliver");
+        let _held = mailbox.claim_next().expect("claim").expect("some");
+        mailbox.deliver(&request("m-pending")).expect("deliver");
+        let outbox = dir.path.join("outbox");
+        fs::create_dir_all(&outbox).expect("outbox");
+
+        assert_eq!(
+            prune_done(&dir.path, Duration::from_secs(60)).expect("prune done"),
+            0
+        );
+        assert_eq!(
+            prune_outbox(&outbox, Duration::from_secs(60)).expect("prune outbox"),
+            0
+        );
+        assert_eq!(count_files(&dir.path.join("pending")), 1);
+        assert_eq!(count_files(&dir.path.join("claimed")), 1);
+    }
+
+    /// The outbox prune carries the same strictly-positive window rule as the
+    /// ledger prune.
+    #[test]
+    fn prune_outbox_rejects_a_zero_window() {
+        let dir = TempDir::new("prune-outbox-zero");
+        let outbox = dir.path.join("outbox");
+        fs::create_dir_all(&outbox).expect("outbox");
+        assert!(prune_outbox(&outbox, Duration::ZERO).is_err());
+    }
+
+    /// No outbox directory ⇒ nothing was ever replied; a no-op, not an error.
+    #[test]
+    fn prune_outbox_absent_directory_is_a_no_op() {
+        let dir = TempDir::new("prune-outbox-absent");
+        assert_eq!(
+            prune_outbox(dir.path.join("outbox"), Duration::from_secs(60)).expect("prune"),
             0
         );
     }

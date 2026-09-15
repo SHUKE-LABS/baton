@@ -15,7 +15,7 @@ reply to an outbox. Everything is a file — the reach is the filesystem, not a
 socket.
 
 ```
-baton serve --inbox <dir> --outbox <dir> [--poll-ms <n>] [--once]
+baton serve --inbox <dir> --outbox <dir> [--poll-ms <n>] [--retention <duration>] [--once]
             [--agent-cmd <program> [--agent-arg <arg>]... [--agent-cwd <dir>] [--agent-timeout-ms <n>]
              [--agent-output raw|json [--agent-result-key <key>]]]
             [--role <name>]
@@ -26,6 +26,9 @@ baton serve --stop --inbox <dir>
   `done/` subdirectories under it.
 - `--outbox <dir>` — where response envelopes are written.
 - `--poll-ms <n>` — inbox poll interval in milliseconds (default `500`).
+- `--retention <duration>` — prune the `done/` ledger and this outbox between
+  polls (at most once per 60 s); omitted, nothing is ever pruned automatically
+  (see [Retention pruning](#retention-pruning-from-the-daemon-baton-serve---retention)).
 - `--once` — drain everything currently pending, then exit (cron-friendly);
   omitted, `serve` polls the inbox until terminated.
 - `--agent-cmd <program>` — host the role with an **external agent** (see
@@ -317,7 +320,7 @@ per processed message. `baton mailbox prune` is the operator's bound on that
 growth.
 
 ```
-baton mailbox prune --mailbox <root> --older-than <duration>
+baton mailbox prune --mailbox <root> --older-than <duration> [--outbox <dir>]
 ```
 
 - `--mailbox <root>` — the mailbox root to prune, the same root `serve --inbox`
@@ -326,11 +329,21 @@ baton mailbox prune --mailbox <root> --older-than <duration>
   mtime is at least this old is deleted. An integer with an optional unit
   suffix — `ms`, `s`, `m`, `h`, `d` — and a bare integer is milliseconds, as
   everywhere else in the CLI: `7d`, `48h`, `900000`.
+- `--outbox <dir>` — optionally extend the same window to an outbox's
+  unconsumed replies. Every `*.json` reply whose mtime is at least this old is
+  deleted too; the `.`-prefixed files an in-flight `send --await` claim renames
+  to are never touched. Without the flag the outbox is not scanned.
 
-It prints one JSON line and exits 0:
+It prints one JSON line and exits 0 — without `--outbox`, the two-field line:
 
 ```json
 {"removed":12,"older_than_ms":604800000}
+```
+
+and with `--outbox`, the same window's outbox removals are reported too:
+
+```json
+{"removed":12,"outbox_removed":3,"older_than_ms":604800000}
 ```
 
 **The trade-off: pruning shortens the dedup window.** A duplicate is suppressed
@@ -340,23 +353,46 @@ call, and for an `--agent-cmd` worker a repeat agent run. Size the window above
 the longest delay after which a sender could plausibly redeliver, not merely above
 the time the reply took.
 
-This is why pruning is **never automatic**: only an operator can decide that a
-duplicate arriving after the cutoff may be reprocessed. Two consequences of the
-same rule:
+This is why pruning happens **only on an explicit flag**: whoever sets the
+window decides that a duplicate arriving after the cutoff may be reprocessed —
+an operator typing `baton mailbox prune`, or a daemon started with
+[`--retention`](#retention-pruning-from-the-daemon-baton-serve---retention).
+Two consequences of the same rule:
 
-- **The window must be strictly positive.** `--older-than 0` is a usage error, not
-  a shorthand for "prune everything" — the cutoff is `age >= window`, so a zero
-  window matches every entry and one typo would wipe the ledger. Clearing it
-  outright stays an explicit `rm` you type yourself, with dedup disabled for every
-  id you removed.
+- **The window must be strictly positive.** `--older-than 0` and
+  `--retention 0` are usage errors, not a shorthand for "prune everything" —
+  the cutoff is `age >= window`, so a zero window matches every entry and one
+  typo would wipe the ledger. Clearing it outright stays an explicit `rm` you
+  type yourself, with dedup disabled for every id you removed.
 - **A future-dated entry always survives.** A clock skew that stamps an entry in
   the future clamps its age to zero, and zero never reaches a positive window.
 
-Pruning is scoped to `done/`: `pending/` and `claimed/` are never touched, so it
-can neither drop an unanswered request nor abandon an in-flight one. Like
+Pruning is scoped to `done/` (and, with `--outbox`, the outbox): `pending/` and
+`claimed/` are never touched, so it can neither drop an unanswered request nor
+abandon an in-flight one. Like
 [`status`](#mailbox-liveness-baton-status) it is **lock-free**, so it can prune a
 mailbox a live `serve` daemon owns — an entry the daemon writes while the scan
 runs is simply seen by the next prune.
+
+### Retention pruning from the daemon (`baton serve --retention`)
+
+The same window can be applied by the daemon itself, so a fire-and-forget
+deployment needs no cron entry to bound its mailbox:
+
+```
+baton serve --inbox <dir> --outbox <dir> [--retention <duration>] ...
+baton service start --inbox <dir> --outbox <dir> [--retention <duration>] ...
+```
+
+`--retention <duration>` uses the same duration grammar and strictly-positive
+rule as `--older-than`. When set, the daemon prunes its own `done/` ledger and
+its `--outbox` between polls, at most once per 60 s; a pass that removed
+anything logs one stderr line (`retention prune: removed N done entries, M
+outbox replies (window ...)`). The first pass runs on the first drained pass,
+so even a `serve --once` invocation prunes before exiting. A failing pass is
+warned about, not fatal — the daemon keeps answering messages and retries at
+the same 60 s cadence. Omitted, nothing is ever pruned automatically: the
+behaviour is exactly as without the flag.
 
 ## Routing registry (name → mailbox)
 

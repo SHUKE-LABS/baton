@@ -1625,6 +1625,97 @@ fn roleless_external_agent_serve_does_not_require_home() {
     }
 }
 
+/// A `serve --once` daemon with `--retention` prunes its own aged `done/`
+/// ledger entries and aged unconsumed outbox replies on its first (and only)
+/// pass, keeps fresh ones, and never touches `pending/`/`claimed/` — the
+/// automatic-retention half of the mailbox prune contract.
+#[test]
+fn serve_once_retention_prunes_aged_done_and_outbox_keeps_fresh() {
+    let root = TempMailbox::new("retention");
+    let inbox = root.path.join("inbox");
+    let outbox = root.path.join("outbox");
+
+    let age = |path: &std::path::Path, secs: u64| {
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .expect("open for backdate");
+        file.set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(secs))
+            .expect("backdate");
+    };
+
+    // Aged entries the retention window must remove; fresh ones it must keep.
+    std::fs::create_dir_all(inbox.join("done")).expect("seed done");
+    std::fs::create_dir_all(&outbox).expect("seed outbox");
+    for name in ["m-aged.json", "m-fresh.json"] {
+        std::fs::write(inbox.join("done").join(name), "{}").expect("seed done entry");
+        std::fs::write(outbox.join(name), "{}").expect("seed outbox reply");
+    }
+    age(&inbox.join("done").join("m-aged.json"), 3_600);
+    age(&outbox.join("m-aged.json"), 3_600);
+    // An in-flight claim file (renamed by a concurrent `send --await`) must
+    // survive even aged — the prune only ever considers `<key>.json`.
+    let claim = outbox.join(".m-inflight.4242.0.claimed");
+    std::fs::write(&claim, "{}").expect("seed claim file");
+    age(&claim, 3_600);
+    // `pending/` and `claimed/` are never prune targets; serve creates them on
+    // startup and, with an empty mailbox, both must end the run still empty
+    // (the non-empty count pinning lives in the mailbox unit tests).
+
+    let mut serve = Command::new(env!("CARGO_BIN_EXE_baton"));
+    serve.args([
+        "serve",
+        "--inbox",
+        inbox.to_str().unwrap(),
+        "--outbox",
+        outbox.to_str().unwrap(),
+        "--once",
+        "--retention",
+        "10m",
+        "--agent-cmd",
+        "baton-test-agent-stub",
+    ]);
+    serve
+        .env_clear()
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+
+    let out = serve.output().expect("run serve --once --retention");
+    assert!(
+        out.status.success(),
+        "serve --retention should succeed; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("retention prune"),
+        "a pass that removed anything logs one stderr line; got: {stderr}"
+    );
+
+    assert!(
+        !inbox.join("done").join("m-aged.json").exists(),
+        "aged done entry must be pruned"
+    );
+    assert!(
+        !outbox.join("m-aged.json").exists(),
+        "aged outbox reply must be pruned"
+    );
+    assert!(inbox.join("done").join("m-fresh.json").exists());
+    assert!(outbox.join("m-fresh.json").exists());
+    assert!(claim.exists(), "in-flight claim file must survive");
+    assert_eq!(count_dir(&inbox.join("pending")), 0, "pending untouched");
+    assert_eq!(count_dir(&inbox.join("claimed")), 0, "claimed untouched");
+    assert_eq!(count_dir(&inbox.join("done")), 1, "fresh done kept");
+    assert_eq!(count_dir(&outbox), 2, "fresh reply + claim file kept");
+}
+
+fn count_dir(dir: &std::path::Path) -> usize {
+    std::fs::read_dir(dir)
+        .expect("read dir")
+        .filter_map(|entry| entry.ok())
+        .count()
+}
+
 #[cfg(unix)]
 #[test]
 fn external_agent_serve_forwards_raw_args_and_mailbox_body() {

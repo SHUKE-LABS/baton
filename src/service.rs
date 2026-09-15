@@ -93,6 +93,9 @@ pub struct SessionSpec {
     pub outbox: String,
     /// `baton serve --poll-ms`; `None` ⇒ the child's own default.
     pub poll_ms: Option<u64>,
+    /// `baton serve --retention`; `None` ⇒ the child never prunes on its own.
+    #[serde(default)]
+    pub retention_ms: Option<u64>,
     /// `baton serve --agent-cmd`; `None` ⇒ the in-process participant.
     pub agent_cmd: Option<String>,
     /// `baton serve --agent-arg` (repeatable).
@@ -1828,6 +1831,7 @@ mod imp {
                 inbox: inbox.to_string(),
                 outbox: outbox.to_string(),
                 poll_ms: None,
+                retention_ms: None,
                 agent_cmd: None,
                 agent_args: Vec::new(),
                 agent_cwd: None,

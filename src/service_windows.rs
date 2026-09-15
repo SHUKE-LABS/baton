@@ -996,6 +996,7 @@ mod tests {
             inbox: "test-inbox".to_string(),
             outbox: "test-outbox".to_string(),
             poll_ms: None,
+            retention_ms: None,
             agent_cmd: None,
             agent_args: Vec::new(),
             agent_cwd: None,
