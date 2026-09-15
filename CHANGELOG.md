@@ -10,10 +10,11 @@ versioning.
 
 _Generated from release tags with `bash scripts/release.sh generate-changelog`._
 
-## v0.10.0 … v0.9.4 (2026-09-15)
+## v0.11.0 … v0.9.4 (2026-09-15)
 
 ### Features
 - feat(serve): hand --agent-cmd child the envelope metadata via BATON_* env (#367)
+- feat(status): derive daemon liveness from serve.lock, drop claim-age crash heuristic (#368)
 
 ### Fixes
 - fix(mailbox): claim_next in delivery order, not read_dir order (#366)
