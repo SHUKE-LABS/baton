@@ -10,6 +10,11 @@ versioning.
 
 _Generated from release tags with `bash scripts/release.sh generate-changelog`._
 
+## v0.9.4 (2026-09-15)
+
+### Fixes
+- fix(mailbox): claim_next in delivery order, not read_dir order (#366)
+
 ## v0.9.3 (2026-09-13)
 
 ### Other Changes
