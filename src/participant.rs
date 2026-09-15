@@ -806,10 +806,11 @@ fn append_windows_msvc_arg(line: &mut String, token: &str) {
 /// process machinery behind [`SubprocessParticipant`] and
 /// [`ExternalAgentParticipant`].
 ///
-/// `env_removals` strips each named variable from the *inherited* environment
-/// before `envs` is applied, so a caller can guarantee a variable's absence
-/// (e.g. a role-less `BATON_ROLE`, #361) regardless of what this process itself
-/// inherited — `envs` alone can only set/override a key, never remove one.
+/// `env_removals` removes each named variable from the child's environment
+/// entirely, applied *after* `envs`, so the removal wins over both the
+/// inherited environment and any same-named entry in `envs` — a caller can
+/// thus guarantee a variable's absence (e.g. a role-less `BATON_ROLE`, #361),
+/// which `envs` alone cannot express (it only sets/overrides).
 ///
 /// Both stdout and stderr are drained on their own threads, started *before*
 /// the stdin write, so a child that emits before consuming all its input — or
@@ -867,14 +868,17 @@ fn capture_child_output(
     let mut command = Command::new(program);
     #[cfg(not(windows))]
     command.args(args);
-    for key in env_removals {
-        command.env_remove(key);
-    }
     command
         .envs(envs.iter().map(|(k, v)| (k, v)))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    // Removals apply *after* `envs` so the key cannot be resurrected — by a
+    // same-named entry in the fixed layer either — and the caller's absence
+    // guarantee wins over every earlier layer (#361).
+    for key in env_removals {
+        command.env_remove(key);
+    }
     if let Some(cwd) = cwd {
         command.current_dir(cwd);
     }
@@ -1960,6 +1964,9 @@ mod tests {
 
     /// A stub agent script that echoes every `BATON_*` turn variable on stdout,
     /// one `KEY=[value]` line each, brackets making an empty value visible.
+    /// `ROLE_SET` carries the `${BATON_ROLE+x}` expansion — `x` when the
+    /// variable is present (even set-but-empty), empty when genuinely absent —
+    /// so the role-less case can assert removal, not just an empty value.
     const ECHO_BATON_ENV_SCRIPT: &str = "cat >/dev/null; \
         printf 'MESSAGE_ID=[%s]\\n' \"$BATON_MESSAGE_ID\"; \
         printf 'CONVERSATION_ID=[%s]\\n' \"$BATON_CONVERSATION_ID\"; \
@@ -1970,7 +1977,8 @@ mod tests {
         printf 'TS_MS=[%s]\\n' \"$BATON_TS_MS\"; \
         printf 'INBOX=[%s]\\n' \"$BATON_INBOX\"; \
         printf 'OUTBOX=[%s]\\n' \"$BATON_OUTBOX\"; \
-        printf 'ROLE=[%s]\\n' \"$BATON_ROLE\"";
+        printf 'ROLE=[%s]\\n' \"$BATON_ROLE\"; \
+        printf 'ROLE_SET=[%s]\\n' \"${BATON_ROLE+x}\"";
 
     /// A `request` envelope (via [`external_agent`] + `--role`) receives every
     /// `BATON_*` variable from the claimed envelope plus the configured mailbox
@@ -1996,15 +2004,17 @@ mod tests {
              TS_MS=[1700000000000]\n\
              INBOX=[/mailbox/in]\n\
              OUTBOX=[/mailbox/out]\n\
-             ROLE=[scribe]\n"
+             ROLE=[scribe]\n\
+             ROLE_SET=[x]\n"
         );
     }
 
-    /// A `notify` envelope with a non-null `in_reply_to`, no `--role`, and a
-    /// *pre-set inherited* `BATON_FROM`/`BATON_ROLE` (mimicking what the
-    /// spawning process itself carries): the turn's values still win — the
-    /// stale `BATON_FROM` is overridden, and `BATON_ROLE` ends up genuinely
-    /// absent (stripped), not merely unset by omission.
+    /// A `notify` envelope with a non-null `in_reply_to`, no `--role`, and
+    /// `BATON_ROLE` poisoned on *both* layers a child could inherit it from —
+    /// the participant's fixed env layer and the serving process's own
+    /// environment: the turn's values still win (the stale inherited
+    /// `BATON_FROM` is overridden) and `BATON_ROLE` ends up genuinely absent
+    /// (stripped from both layers), not merely unset by omission.
     #[test]
     fn external_agent_notify_overrides_inherited_from_and_strips_role_without_role() {
         let _guard = ENV_MUTATION_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -2018,9 +2028,16 @@ mod tests {
         }
 
         let dir = TempDir::new("ext-baton-env-notify");
-        let participant = external_agent(ECHO_BATON_ENV_SCRIPT, &dir.path, Duration::from_secs(5))
-            .with_inbox("/mailbox/in")
-            .with_outbox("/mailbox/out");
+        let participant = ExternalAgentParticipant::new(
+            "sh",
+            ["-c", ECHO_BATON_ENV_SCRIPT],
+            [("BATON_ROLE", "fixed-layer-role")],
+            &dir.path,
+            OutputAdapter::Raw,
+            Some(Duration::from_secs(5)),
+        )
+        .with_inbox("/mailbox/in")
+        .with_outbox("/mailbox/out");
         let mut request = request_with_body("m-req-2", "milestone reached");
         request.kind = MessageKind::Notify;
         request.in_reply_to = Some("m-req-1".to_string());
@@ -2054,7 +2071,8 @@ mod tests {
              TS_MS=[1700000000000]\n\
              INBOX=[/mailbox/in]\n\
              OUTBOX=[/mailbox/out]\n\
-             ROLE=[]\n"
+             ROLE=[]\n\
+             ROLE_SET=[]\n"
         );
     }
 
