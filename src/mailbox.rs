@@ -55,6 +55,14 @@ use crate::message::MessageEnvelope;
 /// Name of the lockfile at the mailbox root guarding single-instance access.
 const LOCK_FILE: &str = "serve.lock";
 
+/// How many times [`lock_single_instance`] retries a contended lock, and how
+/// long it waits between attempts (≈100 ms total). A lock *probe* — `status`,
+/// `--stop` — holds the lockfile only for an instant, so a starting `serve`
+/// out-waits that instant instead of refusing itself as a duplicate, and
+/// `--stop` does not drop a sentinel for a probe's phantom hold.
+const LOCK_RETRY_ATTEMPTS: usize = 5;
+const LOCK_RETRY_PAUSE: Duration = Duration::from_millis(20);
+
 /// Name of the cooperative-stop sentinel at the mailbox root. A `baton serve
 /// --stop` drops this file; the live daemon consumes it between messages and
 /// exits 0 (Option C graceful shutdown). It sits at the root — never inside
@@ -91,34 +99,58 @@ pub struct Claimed {
     pub request: MessageEnvelope,
 }
 
-/// Liveness of a mailbox's worker, derived from its `claimed/` entries.
+/// Liveness of a mailbox's worker, derived from claim presence and the
+/// single-instance lock.
 ///
 /// The naive `idle = pending empty AND claimed empty` test cannot tell a
 /// legitimately long run from a crash: both leave a `claimed/` entry. This
-/// three-state signal splits that ambiguity by **claim age** against a per-role
-/// max-runtime threshold — the same crash a [`reclaim_stale`](Mailbox::reclaim_stale)
-/// on the next start would recover.
+/// three-state signal splits that ambiguity by the **lock**: `serve` holds
+/// `serve.lock` for its whole lifetime, so a claim under a held lock is a
+/// live worker mid-turn, and a claim under a free lock is a crash the
+/// [`reclaim_stale`](Mailbox::reclaim_stale) on the next start would recover —
+/// independent of how long the claim has sat.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MailboxState {
     /// No message is claimed — the worker is not mid-run.
     IdleDone,
-    /// A claim younger than the threshold — a worker is actively processing it.
+    /// A claim exists while a daemon holds the lock — a worker is actively
+    /// processing it.
     Busy,
-    /// A claim older than the threshold — the worker that took it almost
-    /// certainly crashed mid-run, and the message awaits reclaim.
+    /// A claim exists while the lock is free — the daemon that took it died
+    /// mid-run, and the message awaits reclaim.
     CrashedStale,
 }
 
+/// Whether a live `baton serve` holds the mailbox's single-instance lock —
+/// the probe [`status`] reports and [`MailboxState`] is decided against.
+/// Advisory and per-host: reliable on a local filesystem, not across NFS.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MailboxDaemon {
+    /// A daemon holds `serve.lock`.
+    Live,
+    /// The lock is free — no daemon is running (or it crashed).
+    Absent,
+}
+
 /// A point-in-time liveness snapshot of a mailbox: its worker [`MailboxState`],
-/// the depth of `pending/`, and the age of the oldest outstanding claim.
+/// the depth of `pending/`, the age of the oldest outstanding claim, and the
+/// `serve.lock` probe verdict.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MailboxStatus {
-    /// Worker liveness derived from the oldest claim's age.
+    /// Worker liveness from claim presence plus the daemon-lock probe — never
+    /// from claim age.
     pub state: MailboxState,
     /// Number of `baton.message/v1` envelopes waiting in `pending/`.
     pub queue_depth: usize,
     /// Age of the oldest `claimed/` entry, or `None` when nothing is claimed.
+    /// Informational: it feeds `overdue`, never `state`.
     pub claim_age_ms: Option<u64>,
+    /// Whether the oldest claim has run past `max_runtime` — an advisory alert
+    /// on a suspiciously long (but possibly live) turn; it does not affect
+    /// `state`.
+    pub overdue: bool,
+    /// Whether a live daemon holds the single-instance lock.
+    pub daemon: MailboxDaemon,
 }
 
 impl Mailbox {
@@ -126,7 +158,11 @@ impl Mailbox {
     /// exclusive single-instance lock.
     ///
     /// Fails if another live `baton serve` already holds the lock on `root`, so
-    /// the caller can exit non-zero rather than run a second daemon concurrently.
+    /// the caller can exit non-zero rather than run a second daemon
+    /// concurrently. The acquisition retries a contended lock for a bounded
+    /// window first: a `status`/`--stop` probe holds the lockfile only for an
+    /// instant, and that instant must never make a starting daemon refuse
+    /// itself as a duplicate.
     pub fn open(root: impl AsRef<Path>) -> Result<Self> {
         let root = root.as_ref();
         let pending = root.join("pending");
@@ -138,28 +174,16 @@ impl Mailbox {
             })?;
         }
 
-        let lock_path = root.join(LOCK_FILE);
-        let lock = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&lock_path)
-            .map_err(|err| {
-                BatonError::Io(format!("could not open mailbox lock {lock_path:?}: {err}"))
-            })?;
-        match lock.try_lock() {
-            Ok(()) => {}
-            Err(TryLockError::WouldBlock) => {
-                return Err(BatonError::Io(format!(
-                    "another baton serve already holds the mailbox at {root:?}"
-                )));
-            }
-            Err(TryLockError::Error(err)) => {
-                return Err(BatonError::Io(format!(
-                    "could not lock mailbox {root:?}: {err}"
-                )));
-            }
+        let lock = open_lock_file(root).map_err(|err| {
+            BatonError::Io(format!(
+                "could not open mailbox lock {}: {err}",
+                root.join(LOCK_FILE).display()
+            ))
+        })?;
+        if !lock_single_instance(&lock, root)? {
+            return Err(BatonError::Io(format!(
+                "another baton serve already holds the mailbox at {root:?}"
+            )));
         }
 
         Ok(Self {
@@ -263,12 +287,13 @@ impl Mailbox {
             match fs::rename(&path, &claimed_path) {
                 Ok(()) => match read_envelope(&claimed_path) {
                     Ok(request) => {
-                        // Stamp the claim time onto the file so `status` can age
-                        // the claim from *when it was claimed*, not when it was
-                        // delivered — `rename(2)` preserves the delivery mtime, so
-                        // a message that waited in `pending/` would otherwise read
-                        // as instantly stale. Best-effort: a failed stamp only
-                        // costs age precision, never the claim.
+                        // Stamp the claim time onto the file so `status`'s
+                        // informational fields (`claim_age_ms`/`overdue`) measure
+                        // from *when it was claimed*, not when it was delivered —
+                        // `rename(2)` preserves the delivery mtime, so a message
+                        // that waited in `pending/` would otherwise look older
+                        // than the run that claimed it. Best-effort: a failed
+                        // stamp only costs age precision, never the claim.
                         stamp_claim_time(&claimed_path);
                         return Ok(Some(Claimed { key, request }));
                     }
@@ -337,24 +362,19 @@ pub enum StopRequest {
 /// releases) it, which proves no daemon is running — so it drops **no** sentinel
 /// and returns [`StopRequest::NoDaemon`]. This is what keeps a fresh `serve`
 /// from being killed by a stale stop file: a stop is only ever written while a
-/// daemon holds the lock. If the lock is held ([`TryLockError::WouldBlock`]) a
-/// daemon is live, so the sentinel is written and [`StopRequest::Signalled`]
-/// returned. Either outcome is a success — cooperative stop is idempotent, so a
-/// supervisor's stop hook never fails just because the daemon already exited.
+/// daemon holds the lock. If the lock stays held through the bounded retry
+/// window, a daemon is live (a momentary probe hold is out-waited, not
+/// mistaken for one), so the sentinel is written and
+/// [`StopRequest::Signalled`] returned. Either outcome is a success —
+/// cooperative stop is idempotent, so a supervisor's stop hook never fails
+/// just because the daemon already exited.
 ///
 /// A root that does not exist yet (so the lockfile's parent is missing) likewise
 /// means no daemon has ever run there, and so resolves to [`StopRequest::NoDaemon`]
 /// rather than an error — `--stop` never creates the mailbox it is stopping.
 pub fn request_stop(root: impl AsRef<Path>) -> Result<StopRequest> {
     let root = root.as_ref();
-    let lock_path = root.join(LOCK_FILE);
-    let lock = match OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(&lock_path)
-    {
+    let lock = match open_lock_file(root) {
         Ok(lock) => lock,
         // No mailbox directory ⇒ nothing was ever served here.
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
@@ -362,23 +382,59 @@ pub fn request_stop(root: impl AsRef<Path>) -> Result<StopRequest> {
         }
         Err(err) => {
             return Err(BatonError::Io(format!(
-                "could not open mailbox lock {lock_path:?}: {err}"
+                "could not open mailbox lock {}: {err}",
+                root.join(LOCK_FILE).display()
             )));
         }
     };
-    match lock.try_lock() {
+    if lock_single_instance(&lock, root)? {
         // Lock acquired ⇒ no live daemon; nothing to stop. Dropping `lock`
         // releases it as this returns.
-        Ok(()) => Ok(StopRequest::NoDaemon),
-        // Lock held ⇒ a daemon is live; drop the sentinel for it.
-        Err(TryLockError::WouldBlock) => {
-            atomic_write(root, STOP_FILE, "")?;
-            Ok(StopRequest::Signalled)
-        }
-        Err(TryLockError::Error(err)) => Err(BatonError::Io(format!(
-            "could not probe mailbox lock {root:?}: {err}"
-        ))),
+        Ok(StopRequest::NoDaemon)
+    } else {
+        // Lock held through the retry window ⇒ a daemon is live; drop the
+        // sentinel for it.
+        atomic_write(root, STOP_FILE, "")?;
+        Ok(StopRequest::Signalled)
     }
+}
+
+/// Opens the single-instance lockfile at `root`, creating the file if absent
+/// (a missing root still surfaces as [`std::io::ErrorKind::NotFound`] — the
+/// `create` covers only the file, never the directory).
+fn open_lock_file(root: &Path) -> std::io::Result<File> {
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(root.join(LOCK_FILE))
+}
+
+/// Attempts to acquire the single-instance lock with a bounded retry, returning
+/// whether it was acquired.
+///
+/// A [`TryLockError::WouldBlock`] is retried [`LOCK_RETRY_ATTEMPTS`] times,
+/// [`LOCK_RETRY_PAUSE`] apart, before reporting "genuinely held": a `status`/
+/// `--stop` probe holds the lockfile only for an instant, and that instant must
+/// neither make a starting `serve` refuse itself as a duplicate nor make
+/// `--stop` drop a sentinel for a phantom daemon.
+fn lock_single_instance(lock: &File, root: &Path) -> Result<bool> {
+    for attempt in 0..LOCK_RETRY_ATTEMPTS {
+        match lock.try_lock() {
+            Ok(()) => return Ok(true),
+            Err(TryLockError::WouldBlock) => {}
+            Err(TryLockError::Error(err)) => {
+                return Err(BatonError::Io(format!(
+                    "could not lock mailbox {root:?}: {err}"
+                )));
+            }
+        }
+        if attempt + 1 < LOCK_RETRY_ATTEMPTS {
+            std::thread::sleep(LOCK_RETRY_PAUSE);
+        }
+    }
+    Ok(false)
 }
 
 /// Delivers `envelope` into `<root>/pending/` atomically, **without** taking the
@@ -394,33 +450,75 @@ pub fn deliver_to(root: impl AsRef<Path>, envelope: &MessageEnvelope) -> Result<
     deliver_into_pending(&root.as_ref().join("pending"), envelope)
 }
 
-/// Reports the mailbox at `root`'s liveness **without** taking the single-instance
-/// lock, so it can probe a mailbox a live `baton serve` owns.
+/// Reports the mailbox at `root`'s liveness **without taking a lasting hold** on
+/// the single-instance lock, so it can probe a mailbox a live `baton serve` owns.
 ///
-/// A pure read of `<root>/pending` and `<root>/claimed`: `queue_depth` counts the
-/// pending envelopes, and the worker [`MailboxState`] is decided by the oldest
-/// claim's age against `max_runtime` — `>= max_runtime` ⇒ [`MailboxState::CrashedStale`],
-/// a younger claim ⇒ [`MailboxState::Busy`], no claim ⇒ [`MailboxState::IdleDone`].
-/// The threshold **must sit above the worst-case legitimate agent run**, or a
-/// slow-but-alive worker is misread as crashed.
+/// `queue_depth` counts the pending envelopes. The worker [`MailboxState`] is
+/// decided by claim presence plus a one-shot `serve.lock` probe (`daemon`): no
+/// claim ⇒ [`MailboxState::IdleDone`]; a claim while a daemon holds the lock ⇒
+/// [`MailboxState::Busy`]; a claim while the lock is free ⇒
+/// [`MailboxState::CrashedStale`] — independent of claim age. `max_runtime` only
+/// calibrates the advisory `overdue` flag (`claim_age_ms > max_runtime`), an
+/// alert on a suspiciously long live turn.
 ///
-/// Concurrency-safe against a live daemon: a directory that does not exist yet is
-/// read as empty, and a claim file that a concurrent `complete`/`reclaim` moves
-/// between the listing and the stat is skipped (its `ENOENT` is not an error) —
-/// so a mailbox mutating under the probe never makes it flake.
+/// Concurrency-safe against a live daemon: the probe opens the lockfile,
+/// `try_lock`s it once, and releases immediately if acquired (acquiring it
+/// proves no daemon is live), so it never waits on a daemon's lock. A directory
+/// that does not exist yet is read as empty, and a claim file that a concurrent
+/// `complete`/`reclaim` moves between the listing and the stat is skipped (its
+/// `ENOENT` is not an error) — so a mailbox mutating under the probe never
+/// makes it flake.
 pub fn status(root: impl AsRef<Path>, max_runtime: Duration) -> Result<MailboxStatus> {
     let root = root.as_ref();
     let queue_depth = count_envelopes(&root.join("pending"))?;
     let oldest = oldest_claim_age(&root.join("claimed"))?;
+    let daemon = if daemon_live(root)? {
+        MailboxDaemon::Live
+    } else {
+        MailboxDaemon::Absent
+    };
     let state = match oldest {
         None => MailboxState::IdleDone,
-        Some(age) if age >= max_runtime => MailboxState::CrashedStale,
-        Some(_) => MailboxState::Busy,
+        Some(_) if daemon == MailboxDaemon::Live => MailboxState::Busy,
+        Some(_) => MailboxState::CrashedStale,
     };
     Ok(MailboxStatus {
         state,
         queue_depth,
         claim_age_ms: oldest.map(|age| age.as_millis() as u64),
+        overdue: oldest.is_some_and(|age| age > max_runtime),
+        daemon,
+    })
+}
+
+/// Whether a live `baton serve` holds the single-instance lock at `root`.
+///
+/// One shot, like `request_stop`'s probe: open the lockfile (a missing root or
+/// lockfile ⇒ no daemon), `try_lock`, and release at once if acquired —
+/// acquiring it *proves* no daemon is live. Never blocks: a genuinely held
+/// lock reads live on the first attempt, so `status` stays cheap to poll.
+/// Like the lock itself, the verdict is **per-host**: on an NFS/network
+/// filesystem another host's daemon is invisible.
+fn daemon_live(root: &Path) -> Result<bool> {
+    let lock = match open_lock_file(root) {
+        Ok(lock) => lock,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => {
+            return Err(BatonError::Io(format!(
+                "could not open mailbox lock {}: {err}",
+                root.join(LOCK_FILE).display()
+            )));
+        }
+    };
+    Ok(match lock.try_lock() {
+        // We held it, so nobody else does; dropping it below releases it.
+        Ok(()) => false,
+        Err(TryLockError::WouldBlock) => true,
+        Err(TryLockError::Error(err)) => {
+            return Err(BatonError::Io(format!(
+                "could not probe mailbox lock {root:?}: {err}"
+            )));
+        }
     })
 }
 
@@ -1289,10 +1387,12 @@ mod tests {
         file.set_modified(when).expect("set mtime");
     }
 
-    /// A generous threshold under which no real run is stale.
+    /// A test-only overdue threshold comfortably above any real claim age, so
+    /// the `overdue: false` assertions are stable. It never classifies state.
     const GENEROUS: Duration = Duration::from_secs(3600);
 
-    /// No claim ⇒ `idle-done`, and `queue_depth` counts pending envelopes.
+    /// No claim ⇒ `idle-done` (whatever the lock probe says), and `queue_depth`
+    /// counts pending envelopes.
     #[test]
     fn status_idle_done_reports_queue_depth() {
         let dir = TempDir::new("status-idle");
@@ -1304,10 +1404,16 @@ mod tests {
         assert_eq!(s.state, MailboxState::IdleDone);
         assert_eq!(s.queue_depth, 2);
         assert_eq!(s.claim_age_ms, None);
+        assert!(!s.overdue);
+        assert_eq!(
+            s.daemon,
+            MailboxDaemon::Live,
+            "the open Mailbox holds the lock"
+        );
     }
 
-    /// A fresh claim under the threshold ⇒ `busy`, and it is not counted in
-    /// `queue_depth` (it left `pending/`).
+    /// A claim while the lock is held ⇒ `busy` (a live worker is on it), and it
+    /// is not counted in `queue_depth` (it left `pending/`).
     #[test]
     fn status_busy_on_fresh_claim() {
         let dir = TempDir::new("status-busy");
@@ -1319,9 +1425,47 @@ mod tests {
         assert_eq!(s.state, MailboxState::Busy);
         assert_eq!(s.queue_depth, 0);
         assert!(s.claim_age_ms.is_some());
+        assert!(!s.overdue);
+        assert_eq!(s.daemon, MailboxDaemon::Live);
     }
 
-    /// A claim older than the threshold ⇒ `crashed-stale`, distinctly from idle.
+    /// A claim that has run past `max_runtime` while the lock is held is still
+    /// `busy` — the age only raises the advisory `overdue` alert, it never
+    /// classifies a live worker as crashed.
+    #[test]
+    fn status_held_lock_with_overdue_claim_is_busy() {
+        let dir = TempDir::new("status-overdue-busy");
+        let mailbox = Mailbox::open(&dir.path).expect("open");
+        mailbox.deliver(&request("m-1")).expect("deliver");
+        let _claimed = mailbox.claim_next().expect("claim").expect("some");
+        backdate(&dir.path.join("claimed").join("m-1.json"), 3600);
+
+        let s = status(&dir.path, Duration::from_secs(60)).expect("status");
+        assert_eq!(s.state, MailboxState::Busy);
+        assert!(s.overdue, "a claim past the threshold reads overdue");
+        assert!(s.claim_age_ms.unwrap() >= 3_600_000);
+        assert_eq!(s.daemon, MailboxDaemon::Live);
+    }
+
+    /// A claim while the lock is free ⇒ `crashed-stale`, however fresh the
+    /// claim: the daemon that took it is gone. Distinctly from idle.
+    #[test]
+    fn status_free_lock_with_fresh_claim_is_crashed_stale() {
+        let dir = TempDir::new("status-stale-fresh");
+        let mailbox = Mailbox::open(&dir.path).expect("open");
+        mailbox.deliver(&request("m-1")).expect("deliver");
+        let _claimed = mailbox.claim_next().expect("claim").expect("some");
+        drop(mailbox); // release the lock: no daemon is running
+
+        let s = status(&dir.path, GENEROUS).expect("status");
+        assert_eq!(s.state, MailboxState::CrashedStale);
+        assert!(!s.overdue, "the claim is younger than the threshold");
+        assert_eq!(s.daemon, MailboxDaemon::Absent);
+    }
+
+    /// A claim older than the threshold while the lock is free ⇒
+    /// `crashed-stale` (the free lock, not the age, is what makes it stale) and
+    /// `overdue: true` (the age is past the threshold).
     #[test]
     fn status_crashed_stale_on_aged_claim() {
         let dir = TempDir::new("status-stale");
@@ -1329,15 +1473,19 @@ mod tests {
         mailbox.deliver(&request("m-1")).expect("deliver");
         let _claimed = mailbox.claim_next().expect("claim").expect("some");
         backdate(&dir.path.join("claimed").join("m-1.json"), 3600);
+        drop(mailbox); // release the lock, as a crashed daemon would
 
         let s = status(&dir.path, Duration::from_secs(60)).expect("status");
         assert_eq!(s.state, MailboxState::CrashedStale);
+        assert!(s.overdue);
         assert!(s.claim_age_ms.unwrap() >= 3_600_000);
+        assert_eq!(s.daemon, MailboxDaemon::Absent);
     }
 
-    /// A message that sat in `pending/` before being claimed reads `busy`, not
-    /// `crashed-stale`: `claim_next` stamps the claim time, so the age is measured
-    /// from the claim, not the (old) delivery.
+    /// A message that sat in `pending/` before being claimed still reads `busy`
+    /// (the lock is held), and `claim_next`'s stamp keeps the informational age
+    /// honest: measured from the claim, not the (old) delivery, so `overdue`
+    /// reflects the run, not the queue wait.
     #[test]
     fn claim_stamps_time_so_late_claim_is_busy_not_stale() {
         let dir = TempDir::new("status-stamp");
@@ -1351,12 +1499,17 @@ mod tests {
         assert_eq!(
             s.state,
             MailboxState::Busy,
-            "claim-time stamping keeps a late-claimed message busy"
+            "the held lock, not the age, keeps a late-claimed message busy"
+        );
+        assert!(
+            !s.overdue,
+            "the claim-time stamp reset the informational age"
         );
     }
 
-    /// `status` reads a mailbox a live `serve` holds the lock on — it never opens
-    /// (and so never contends) the single-instance lock.
+    /// `status` probes a mailbox a live `serve` holds the lock on without ever
+    /// blocking on it: the probe is a single `try_lock` that reports the held
+    /// lock and moves on.
     #[test]
     fn status_is_lock_free_against_a_live_mailbox() {
         let dir = TempDir::new("status-lockfree");
@@ -1366,10 +1519,11 @@ mod tests {
         let s = status(&dir.path, GENEROUS).expect("status probes without the lock");
         assert_eq!(s.state, MailboxState::IdleDone);
         assert_eq!(s.queue_depth, 1);
+        assert_eq!(s.daemon, MailboxDaemon::Live);
     }
 
     /// `status` on a root whose `pending/`/`claimed/` do not exist yet is empty,
-    /// not an error.
+    /// not an error, and reports no daemon.
     #[test]
     fn status_on_absent_mailbox_is_idle_empty() {
         let dir = TempDir::new("status-absent");
@@ -1378,5 +1532,49 @@ mod tests {
         assert_eq!(s.state, MailboxState::IdleDone);
         assert_eq!(s.queue_depth, 0);
         assert_eq!(s.claim_age_ms, None);
+        assert_eq!(s.daemon, MailboxDaemon::Absent);
+    }
+
+    /// A starting `serve` out-waits a momentary lock probe: while an
+    /// independent handle holds `serve.lock` briefly (what a concurrent
+    /// `status` looks like), `Mailbox::open` retries through the hold and
+    /// acquires the lock instead of refusing itself as a duplicate.
+    #[test]
+    fn open_outwaits_a_brief_probe_hold() {
+        let dir = TempDir::new("open-retry");
+        let root = dir.path.to_path_buf();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            let lock = open_lock_file(&root).expect("open lockfile");
+            lock.try_lock().expect("hold the lockfile");
+            tx.send(()).expect("signal: lockfile held");
+            // Hold it well inside the ≈100 ms retry window, then release.
+            std::thread::sleep(Duration::from_millis(40));
+            drop(lock);
+        });
+        // Synchronized on the held lock, not on scheduler timing.
+        rx.recv().expect("holder signals once the lockfile is held");
+
+        let mailbox = Mailbox::open(&dir.path).expect("bounded retry out-waits a probe hold");
+        drop(mailbox);
+        holder.join().expect("holder thread finishes");
+    }
+
+    /// A genuinely held lock still refuses a second `serve` after the retry
+    /// window — the bounded retry must not weaken single-instance semantics.
+    #[test]
+    fn open_refuses_a_genuinely_held_lock() {
+        let dir = TempDir::new("open-refusal");
+        let _held = Mailbox::open(&dir.path).expect("first daemon holds the lock");
+
+        // `Mailbox` is not `Debug`, so assert the error by hand.
+        let err = match Mailbox::open(&dir.path) {
+            Ok(_) => panic!("duplicate open is refused"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().contains("another baton serve"),
+            "refusal names the live daemon: {err}"
+        );
     }
 }
