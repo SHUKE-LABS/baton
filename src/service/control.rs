@@ -981,6 +981,10 @@ pub(super) fn serve_argv(spec: &SessionSpec) -> Vec<String> {
         argv.push("--poll-ms".to_string());
         argv.push(poll_ms.to_string());
     }
+    if let Some(retention_ms) = spec.retention_ms {
+        argv.push("--retention".to_string());
+        argv.push(retention_ms.to_string());
+    }
     if let Some(agent_cmd) = &spec.agent_cmd {
         argv.push("--agent-cmd".to_string());
         argv.push(agent_cmd.clone());
