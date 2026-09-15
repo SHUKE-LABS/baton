@@ -56,6 +56,22 @@ pub enum MessageKind {
     Notify,
 }
 
+impl MessageKind {
+    /// The snake_case wire value this variant serializes to (`request` /
+    /// `response` / `done` / `error` / `notify`), for callers that need the
+    /// string outside of a full envelope serialization (e.g. stamping
+    /// `BATON_KIND` on a spawned agent's environment).
+    pub fn as_wire_str(&self) -> &'static str {
+        match self {
+            MessageKind::Request => "request",
+            MessageKind::Response => "response",
+            MessageKind::Done => "done",
+            MessageKind::Error => "error",
+            MessageKind::Notify => "notify",
+        }
+    }
+}
+
 /// The provider-call record a message wraps, self-describing via its schema.
 ///
 /// Pairs the `baton.exchange/v1` discriminator with the owned

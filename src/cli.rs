@@ -672,7 +672,7 @@ pub fn run() -> Result<()> {
                         base_url: "external-agent".to_string(),
                     };
                     let stderr_dir = PathBuf::from(&inbox).join("agent-stderr");
-                    let participant = ExternalAgentParticipant::new(
+                    let mut participant = ExternalAgentParticipant::new(
                         program,
                         args,
                         std::iter::empty::<(String, String)>(),
@@ -680,7 +680,15 @@ pub fn run() -> Result<()> {
                         output,
                         read_timeout,
                     )
-                    .with_stderr_dir(stderr_dir);
+                    .with_stderr_dir(stderr_dir)
+                    .with_inbox(PathBuf::from(&inbox))
+                    .with_outbox(PathBuf::from(&outbox));
+                    // BATON_ROLE is stamped only with `--role`; without it,
+                    // `ExternalAgentParticipant` actively strips any inherited
+                    // value rather than merely omitting it (#361).
+                    if let Some(name) = &role {
+                        participant = participant.with_role(name.clone());
+                    }
                     (Box::new(participant), meta)
                 }
                 #[cfg(feature = "local")]
