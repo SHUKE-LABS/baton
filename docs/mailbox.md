@@ -74,7 +74,9 @@ A sender delivers by writing a temp file and `rename(2)`-ing it into the inbox,
 so `serve` never observes a partial envelope. Each message then moves through one
 atomic rename per state: `pending → claimed → done`. A crash mid-answer leaves
 the message in `claimed/`; the next start **reclaims** it back to `pending/`, so
-no in-flight message is lost. The response is written to
+no in-flight message is lost. A single `serve` answers pending messages in
+delivery-time (FIFO) order — ascending mtime, ties broken by file name — not the
+filesystem's directory-listing order. The response is written to
 `<outbox>/<request message_id>.json` — keyed by the *request* id (the reply's
 `in_reply_to`), so a reprocessed message overwrites its own not-yet-consumed
 reply instead of leaving a second file.
