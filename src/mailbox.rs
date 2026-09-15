@@ -56,12 +56,13 @@ use crate::message::MessageEnvelope;
 const LOCK_FILE: &str = "serve.lock";
 
 /// How many times [`lock_single_instance`] retries a contended lock, and how
-/// long it waits between attempts (four 20 ms pauses, ≈80 ms of waiting). A
+/// long it waits between attempts (nine 20 ms pauses, ≈190 ms of waiting). A
 /// lock *probe* — `status`, `--stop` — holds the lockfile only for an instant,
 /// so a starting `serve` out-waits that instant instead of refusing itself as
 /// a duplicate, and `--stop` does not drop a sentinel for a probe's phantom
-/// hold.
-const LOCK_RETRY_ATTEMPTS: usize = 5;
+/// hold. The window is sized to absorb scheduler jitter on slow CI hosts while
+/// re-acquiring within one pause of the hold's release.
+const LOCK_RETRY_ATTEMPTS: usize = 10;
 const LOCK_RETRY_PAUSE: Duration = Duration::from_millis(20);
 
 /// Name of the cooperative-stop sentinel at the mailbox root. A `baton serve
@@ -1612,8 +1613,10 @@ mod tests {
             let lock = open_lock_file(&root).expect("open lockfile");
             lock.try_lock().expect("hold the lockfile");
             tx.send(()).expect("signal: lockfile held");
-            // Hold it well inside the ≈80 ms retry window, then release.
-            std::thread::sleep(Duration::from_millis(40));
+            // Hold it well inside the ≈190 ms retry window (several retries
+            // hit the hold; a CI scheduler's sleep jitter cannot plausibly
+            // stretch 25 ms past the whole budget), then release.
+            std::thread::sleep(Duration::from_millis(25));
             drop(lock);
         });
         // Synchronized on the held lock, not on scheduler timing.
