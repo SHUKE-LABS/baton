@@ -1123,8 +1123,20 @@ fn log_replay_out_of_range_index_is_error() {
 /// [`run_baton_ask`].
 #[cfg(feature = "local")]
 fn run_baton_exchange(base_url: &str, request: &str) -> std::process::Output {
+    run_baton_exchange_args(base_url, request, &[])
+}
+
+/// [`run_baton_exchange`] with extra CLI arguments, so a variant can pass
+/// global flags such as `--pretty`.
+#[cfg(feature = "local")]
+fn run_baton_exchange_args(
+    base_url: &str,
+    request: &str,
+    extra_args: &[&str],
+) -> std::process::Output {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_baton"));
     cmd.arg("exchange");
+    cmd.args(extra_args);
     cmd.env("ANTHROPIC_API_KEY", "test-key");
     cmd.env("ANTHROPIC_BASE_URL", base_url);
     cmd.env("BATON_MODEL", "claude-test-model");
@@ -8783,5 +8795,243 @@ fn serve_role_env_model_overrides_role_config_model() {
         !requests[0].contains("role-config-model"),
         "the role config's model was not used; request: {}",
         requests[0]
+    );
+}
+
+// ---------------------------------------------------------------------------
+// `--pretty` global flag (issue #370).
+//
+// Every user-facing JSON output renders multi-line 2-space-indented under
+// `--pretty` and stays byte-identical without it. Each command surface below
+// runs the real binary twice — once without the flag, once with — and the two
+// parsed outputs must be equal; where the response envelope is minted fresh
+// per run (exchange), the per-run volatile fields are normalized first.
+// ---------------------------------------------------------------------------
+
+/// Replaces the per-run volatile fields (fresh ids and timings the response
+/// construction mints per invocation, plus the mock server's ephemeral port
+/// echoed into the in-band request record) with a constant, so two separate
+/// runs of the same command compare equal regardless of wall-clock.
+#[cfg(feature = "local")]
+fn normalize_volatile_fields(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(map) => {
+            for (key, val) in map.iter_mut() {
+                if matches!(
+                    key.as_str(),
+                    "message_id" | "ts_ms" | "duration_ms" | "base_url"
+                ) {
+                    *val = serde_json::Value::String("<volatile>".to_string());
+                } else {
+                    normalize_volatile_fields(val);
+                }
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                normalize_volatile_fields(item);
+            }
+        }
+        _ => {}
+    }
+}
+
+#[test]
+fn service_status_pretty_round_trips_the_compact_form() {
+    let root = TempMailbox::new("service-status-pretty");
+    let control = root.path.join("control");
+    let control_str = control.to_str().unwrap().to_string();
+
+    let plain = Command::new(env!("CARGO_BIN_EXE_baton"))
+        .args(["service", "status", "--control", control_str.as_str()])
+        .env_clear()
+        .output()
+        .expect("service status runs");
+    let pretty = Command::new(env!("CARGO_BIN_EXE_baton"))
+        .args([
+            "service",
+            "status",
+            "--control",
+            control_str.as_str(),
+            "--pretty",
+        ])
+        .env_clear()
+        .output()
+        .expect("service status --pretty runs");
+    assert!(
+        plain.status.success() && pretty.status.success(),
+        "both status forms exit 0; plain stderr: {}; pretty stderr: {}",
+        String::from_utf8_lossy(&plain.stderr),
+        String::from_utf8_lossy(&pretty.stderr)
+    );
+
+    let plain_text = String::from_utf8_lossy(&plain.stdout);
+    let pretty_text = String::from_utf8_lossy(&pretty.stdout);
+    assert!(
+        pretty_text.trim().contains('\n'),
+        "pretty output is multi-line: {pretty_text}"
+    );
+    let plain_json: serde_json::Value =
+        serde_json::from_str(plain_text.trim()).expect("plain output is JSON");
+    let pretty_json: serde_json::Value =
+        serde_json::from_str(pretty_text.trim()).expect("pretty output is JSON");
+    assert_eq!(plain_json, pretty_json, "same status, either formatting");
+}
+
+#[test]
+fn task_status_pretty_round_trips_the_compact_form() {
+    let root = TempMailbox::new("task-status-pretty");
+    let control = root.path.join("control");
+    let control_str = control.to_str().unwrap().to_string();
+
+    let plain = Command::new(env!("CARGO_BIN_EXE_baton"))
+        .args(["task", "status", "--control", control_str.as_str()])
+        .env_clear()
+        .output()
+        .expect("task status runs");
+    let pretty = Command::new(env!("CARGO_BIN_EXE_baton"))
+        .args([
+            "task",
+            "status",
+            "--control",
+            control_str.as_str(),
+            "--pretty",
+        ])
+        .env_clear()
+        .output()
+        .expect("task status --pretty runs");
+    assert!(
+        plain.status.success() && pretty.status.success(),
+        "both status forms exit 0; plain stderr: {}; pretty stderr: {}",
+        String::from_utf8_lossy(&plain.stderr),
+        String::from_utf8_lossy(&pretty.stderr)
+    );
+
+    let plain_text = String::from_utf8_lossy(&plain.stdout);
+    let pretty_text = String::from_utf8_lossy(&pretty.stdout);
+    assert!(
+        pretty_text.trim().contains('\n'),
+        "pretty output is multi-line: {pretty_text}"
+    );
+    let plain_json: serde_json::Value =
+        serde_json::from_str(plain_text.trim()).expect("plain output is JSON");
+    let pretty_json: serde_json::Value =
+        serde_json::from_str(pretty_text.trim()).expect("pretty output is JSON");
+    assert_eq!(plain_json, pretty_json, "same status, either formatting");
+}
+
+/// A fixed reply correlated with [`REQUEST_ENVELOPE`]'s `m-1`, seeded into the
+/// outbox so `send --await` claims it deterministically — no daemon, no fresh
+/// ids, so the pretty and plain runs compare literally.
+#[cfg(feature = "local")]
+const PRETTY_AWAIT_REPLY: &str = r#"{
+    "schema": "baton.message/v1",
+    "message_id": "m-1-reply",
+    "conversation_id": "conv-1",
+    "from": "agent-b",
+    "to": "agent-a",
+    "in_reply_to": "m-1",
+    "kind": "response",
+    "body": "pong",
+    "ts_ms": 1700000000001,
+    "exchange": null
+}"#;
+
+#[cfg(feature = "local")]
+#[test]
+fn send_pretty_await_round_trips_a_seeded_reply() {
+    let plain_root = TempMailbox::new("send-pretty-plain");
+    let pretty_root = TempMailbox::new("send-pretty-indented");
+    let mut stdout_by_form = Vec::new();
+
+    for (root, pretty) in [(&plain_root, false), (&pretty_root, true)] {
+        let inbox = root.path.join("inbox");
+        let outbox = root.path.join("outbox");
+        std::fs::create_dir_all(&outbox).expect("create outbox");
+        std::fs::write(outbox.join("m-1.json"), PRETTY_AWAIT_REPLY).expect("seed reply");
+        let request_path = root.path.join("request.json");
+        std::fs::write(&request_path, REQUEST_ENVELOPE).expect("write request envelope");
+
+        let mut args = vec![
+            "send",
+            "--in",
+            request_path.to_str().unwrap(),
+            "--inbox",
+            inbox.to_str().unwrap(),
+            "--await",
+            "--outbox",
+            outbox.to_str().unwrap(),
+            "--timeout-ms",
+            "5000",
+        ];
+        if pretty {
+            args.push("--pretty");
+        }
+        let out = Command::new(env!("CARGO_BIN_EXE_baton"))
+            .args(&args)
+            .env_clear()
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .expect("send runs");
+        assert!(
+            out.status.success(),
+            "send --await exits 0 (pretty: {pretty}); stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        stdout_by_form.push(String::from_utf8_lossy(&out.stdout).to_string());
+    }
+
+    let (plain_text, pretty_text) = (&stdout_by_form[0], &stdout_by_form[1]);
+    assert!(
+        pretty_text.trim().contains('\n'),
+        "pretty reply is multi-line: {pretty_text}"
+    );
+    let plain_json: serde_json::Value =
+        serde_json::from_str(plain_text.trim()).expect("plain reply is JSON");
+    let pretty_json: serde_json::Value =
+        serde_json::from_str(pretty_text.trim()).expect("pretty reply is JSON");
+    assert_eq!(plain_json, pretty_json, "same reply, either formatting");
+    assert_eq!(pretty_json["in_reply_to"], "m-1");
+}
+
+#[cfg(feature = "local")]
+#[test]
+fn exchange_pretty_round_trips_the_compact_form_normalized() {
+    let plain_server = MockServer::spawn(200, SUCCESS_BODY);
+    let plain = run_baton_exchange(plain_server.base_url(), REQUEST_ENVELOPE);
+    assert!(
+        plain.status.success(),
+        "plain exchange exits 0; stderr: {}",
+        String::from_utf8_lossy(&plain.stderr)
+    );
+
+    let pretty_server = MockServer::spawn(200, SUCCESS_BODY);
+    let pretty = run_baton_exchange_args(pretty_server.base_url(), REQUEST_ENVELOPE, &["--pretty"]);
+    assert!(
+        pretty.status.success(),
+        "pretty exchange exits 0; stderr: {}",
+        String::from_utf8_lossy(&pretty.stderr)
+    );
+
+    let plain_text = String::from_utf8_lossy(&plain.stdout);
+    let pretty_text = String::from_utf8_lossy(&pretty.stdout);
+    assert!(
+        pretty_text.trim().contains('\n'),
+        "pretty response is multi-line: {pretty_text}"
+    );
+    // The response envelope is minted fresh per run (message_id, ts_ms,
+    // outcome duration), so compare after normalizing the volatile fields.
+    let mut plain_json: serde_json::Value =
+        serde_json::from_str(plain_text.trim()).expect("plain output is JSON");
+    let mut pretty_json: serde_json::Value =
+        serde_json::from_str(pretty_text.trim()).expect("pretty output is JSON");
+    normalize_volatile_fields(&mut plain_json);
+    normalize_volatile_fields(&mut pretty_json);
+    assert_eq!(plain_json, pretty_json, "same response, either formatting");
+    assert_eq!(pretty_json["kind"], "response");
+    assert_eq!(
+        pretty_json["exchange"]["schema"], "baton.exchange/v1",
+        "the in-band exchange wrapper survives pretty-printing"
     );
 }

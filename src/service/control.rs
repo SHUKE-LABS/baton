@@ -1660,6 +1660,7 @@ fn read_daemon_info(control: &Path) -> Option<DaemonInfo> {
 pub(super) fn execute_status(
     control: &Path,
     session: Option<&str>,
+    pretty: bool,
     mut out: impl Write,
 ) -> Result<()> {
     let service_running = probe_control(control)? == ControlLiveness::Live;
@@ -1689,8 +1690,7 @@ pub(super) fn execute_status(
         daemon,
         sessions,
     };
-    let json = serde_json::to_string(&view)
-        .map_err(|err| BatonError::Io(format!("could not serialize service status: {err}")))?;
+    let json = crate::cli::to_user_json(&view, pretty, "service status")?;
     writeln!(out, "{json}").map_err(io_err)
 }
 
@@ -1759,6 +1759,7 @@ struct TaskStatusReport<'a> {
 pub(super) fn execute_task_status<P: ServicePlatform>(
     control: &Path,
     task: Option<&str>,
+    pretty: bool,
     mut out: impl Write,
 ) -> Result<()> {
     let records: Vec<TaskRecord> = match task {
@@ -1792,8 +1793,7 @@ pub(super) fn execute_task_status<P: ServicePlatform>(
         control: control.display().to_string(),
         tasks,
     };
-    let json = serde_json::to_string(&report)
-        .map_err(|err| BatonError::Io(format!("could not serialize task status: {err}")))?;
+    let json = crate::cli::to_user_json(&report, pretty, "task status")?;
     writeln!(out, "{json}").map_err(io_err)
 }
 

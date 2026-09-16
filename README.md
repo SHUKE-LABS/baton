@@ -68,7 +68,12 @@ page for what you are doing.
 
 Run `baton --help` (or `baton -h`) for the current command synopsis. Run
 `baton --version` (or `baton -V`) to print the installed crate version. These
-global flags need no Baton configuration or provider credentials.
+global flags need no Baton configuration or provider credentials. A third
+global flag, `baton <cmd> --pretty` (accepted before or after the subcommand),
+renders the JSON-facing inspection commands (`status`, `mailbox prune`,
+`service status`, `task status`, and the `send`/`exchange` reply envelopes) as
+multi-line indented JSON for humans; without it the output stays one minified
+line for `jq` pipelines.
 
 ## Install
 
