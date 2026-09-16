@@ -86,14 +86,16 @@ pub const USAGE: &str = concat!(
     "baton converse-ring --registry <path> --roster <a,b,c> (--seed <text> | --seed-file <path>) [--await-ms <n>] [--out <path>]\n",
     "    Drive an N-party round-robin conversation across registry-resolved mailbox peers.\n",
     "\n",
-    "baton serve --inbox <dir> --outbox <dir> [--poll-ms <n>] [--retention <duration>] [--once] [--agent-cmd <program> [--agent-arg <arg>]... [--agent-cwd <dir>] [--agent-timeout-ms <n>] [--agent-output raw|json [--agent-result-key <key>]]] [--role <name>]\n",
+    "baton serve --inbox <dir> --outbox <dir> [--poll-ms <n>] [--retention <duration>] [--once] [--agent-cmd <program> [--agent-arg <arg>]... [--agent-cwd <dir>] [--agent-timeout-ms <n>] [--agent-output raw|json [--agent-result-key <key>]]] [--role <name>] [--registry <path>]\n",
     "baton serve --stop --inbox <dir>\n",
     "    Drain a mailbox with an external agent (`--agent-cmd`) or in-process provider; `--stop` requests a cooperative shutdown of a running daemon.\n",
     "    `--retention <duration>` prunes aged `done/` entries and unconsumed outbox replies between polls (at most once per 60s); `0` is rejected; omitting it keeps pruning manual.\n",
     "    `--agent-timeout-ms 0` waits indefinitely for the agent (no read deadline); a positive value is a bounded read timeout; omitting it keeps the 600000 ms default.\n",
+    "    `--registry <path>` (requires `--role`) routes a claimed request's `reply_to` name into that peer's inbox instead of `--outbox`.\n",
     "\n",
-    "baton send (--inbox <dir> | --registry <path>) (--body <text> [--to <role>] | --in <path>) [--from <id>] [--conversation <id>] [--await [--outbox <dir>] [--timeout-ms <n>]]\n",
+    "baton send (--inbox <dir> | --registry <path>) (--body <text> [--to <role>] [--reply-to <name>] | --in <path>) [--from <id>] [--conversation <id>] [--await [--outbox <dir>] [--timeout-ms <n>]]\n",
     "    Deliver one message to a mailbox or registry-resolved role, optionally awaiting the reply.\n",
+    "    `--reply-to <name>` stamps a routing hint a `serve --registry --role` daemon on the receiving end resolves to push its reply into that peer's inbox.\n",
     "\n",
     "baton status (--mailbox <root> | --registry <path> --role <role>) [--max-runtime-ms <n>]\n",
     "    Report a mailbox's claim and health status.\n",
@@ -116,8 +118,9 @@ pub const USAGE: &str = concat!(
     "\n",
     "baton service run [--control <dir>] [--task-retention <duration>]\n",
     "    Run the service control-plane loop.\n",
-    "baton service start [--control <dir>] --inbox <dir> --outbox <dir> [--poll-ms <n>] [--agent-cmd <program> [--agent-arg <arg>]... [--agent-cwd <dir>] [--agent-timeout-ms <n>] [--agent-output raw|json [--agent-result-key <key>]]] [--role <name>]\n",
+    "baton service start [--control <dir>] --inbox <dir> --outbox <dir> [--poll-ms <n>] [--agent-cmd <program> [--agent-arg <arg>]... [--agent-cwd <dir>] [--agent-timeout-ms <n>] [--agent-output raw|json [--agent-result-key <key>]]] [--role <name>] [--registry <path>]\n",
     "    Start a supervised service session. `--agent-timeout-ms 0` waits indefinitely for the agent (no read deadline); a positive value is a bounded read timeout; omitting it keeps the 600000 ms default.\n",
+    "    `--registry <path>` (requires `--role`) is forwarded to the underlying `baton serve`, same as direct-serve reply routing.\n",
     "baton service status [--control <dir>] [--session <id>]\n",
     "    Report a service session's status.\n",
     "baton service stop [--control <dir>] --session <id> [--force]\n",
@@ -278,6 +281,11 @@ enum Command {
         /// `done/` ledger and this outbox between polls, at most once per 60 s;
         /// `None` ⇒ no automatic prune, the prior behaviour.
         retention_ms: Option<u64>,
+        /// `--registry` routing table path; requires `role`. When a claimed
+        /// request carries `reply_to`, this resolves the name and the reply is
+        /// pushed into the resolved peer's inbox instead of `outbox`. `None` ⇒
+        /// every reply goes to `outbox`, the prior behaviour.
+        registry: Option<String>,
     },
     /// Cooperatively stop a running `baton serve` on `inbox` (Option C graceful
     /// shutdown): drop a stop sentinel the daemon observes between messages, so
@@ -299,6 +307,10 @@ enum Command {
         to: Option<String>,
         from: Option<String>,
         conversation: Option<String>,
+        /// `--reply-to <name>`: stamps `reply_to` on a `--body`-built envelope
+        /// so a `serve --registry --role` daemon on the receiving end routes
+        /// the reply into this name's inbox instead of its own outbox.
+        reply_to: Option<String>,
         await_reply: bool,
         outbox: Option<String>,
         timeout_ms: u64,
@@ -627,10 +639,19 @@ pub fn run() -> Result<()> {
             agent_result_key,
             role,
             retention_ms,
+            registry,
         } => {
             #[cfg(windows)]
             service::adopt_windows_service_job()?;
             let mut sink = open_event_sink()?;
+
+            // Loaded once at startup, fail-fast (mirroring `send`'s own
+            // `--registry` load) — a routed reply resolves a `reply_to` name
+            // through this table; without `--registry` every reply keeps going
+            // to `outbox`, unchanged.
+            let registry = registry
+                .map(|path| Registry::from_path(Path::new(&path)))
+                .transpose()?;
 
             // A `--role` resolves the role's home once; its values fill any
             // identity the operator did not pass explicitly (flag over role), and
@@ -754,6 +775,7 @@ pub fn run() -> Result<()> {
             let poll = Duration::from_millis(poll_ms);
             let retention_window = retention_ms.map(Duration::from_millis);
             let mut last_retention_pass: Option<Instant> = None;
+            let own_inbox = Path::new(&inbox);
             loop {
                 match drain_mailbox(
                     &mailbox,
@@ -762,6 +784,9 @@ pub fn run() -> Result<()> {
                     sink.as_mut(),
                     &meta,
                     recorder.as_ref(),
+                    registry.as_ref(),
+                    own_inbox,
+                    role.as_deref(),
                 )? {
                     // Cooperative stop observed between messages ⇒ exit 0.
                     Drain::Stopped => break,
@@ -807,6 +832,7 @@ pub fn run() -> Result<()> {
             to,
             from,
             conversation,
+            reply_to,
             await_reply,
             outbox,
             timeout_ms,
@@ -814,7 +840,7 @@ pub fn run() -> Result<()> {
             // A producer runs no provider call, so `send` needs no credential —
             // it does not load `BatonConfig`. Only the event sink is wired.
             let mut sink = open_event_sink()?;
-            let envelope = build_send_envelope(&source, to, from, conversation)?;
+            let envelope = build_send_envelope(&source, to, from, conversation, reply_to)?;
             // Resolve the delivery inbox and await outbox: either explicit paths,
             // or the addressee role (the envelope's `to`) looked up in the
             // registry. An unknown role fails fast via `Registry::resolve`.
@@ -1352,8 +1378,10 @@ fn retention_pass(inbox: &Path, outbox: &Path, window: Duration, last: &mut Opti
 }
 
 /// Drains every currently-claimable request from `mailbox` through one
-/// participant, writing each reply to `outbox` keyed by the request id, and
-/// returns how many were processed — unless a cooperative stop is observed.
+/// participant, writing each reply to `outbox` keyed by the request id (or, for
+/// a `reply_to`-routed request, pushing it into the named peer's inbox
+/// instead — see [`try_route_reply`]), and returns how many were processed —
+/// unless a cooperative stop is observed.
 ///
 /// The stop sentinel is checked **between messages** (at the top of each claim
 /// iteration), so an in-flight `respond()` is never interrupted mid-call: a stop
@@ -1362,9 +1390,14 @@ fn retention_pass(inbox: &Path, outbox: &Path, window: Duration, last: &mut Opti
 ///
 /// Each message runs the same [`execute_exchange`] path as `baton exchange` — so
 /// the response envelope and the `BATON_EVENT_LOG` trail are produced identically
-/// — then advances `claimed → done`. Parameterised over [`Participant`] /
+/// — then advances `claimed → done`. A claimed request whose own `kind` is
+/// `response` or `error` is never answered at all (#362 AC6): the exchange still
+/// runs and the seat session still records, but nothing is written to `outbox`
+/// and nothing is pushed — closing the unread-reply-file problem instead of
+/// relocating it one hop further. Parameterised over [`Participant`] /
 /// [`EventSink`] so it is unit-testable with fakes and a tempdir mailbox, no
 /// network. A single pass: the caller decides whether to loop.
+#[allow(clippy::too_many_arguments)]
 fn drain_mailbox(
     mailbox: &Mailbox,
     outbox: &Path,
@@ -1372,6 +1405,9 @@ fn drain_mailbox(
     sink: &mut dyn EventSink,
     meta: &ExchangeMeta,
     recorder: Option<&RoleSessionRecorder>,
+    registry: Option<&Registry>,
+    own_inbox: &Path,
+    role: Option<&str>,
 ) -> Result<Drain> {
     let mut processed = 0;
     loop {
@@ -1381,7 +1417,7 @@ fn drain_mailbox(
         let Some(claimed) = mailbox.claim_next()? else {
             return Ok(Drain::Drained(processed));
         };
-        let response = execute_exchange(participant, sink, meta, &claimed.request);
+        let mut response = execute_exchange(participant, sink, meta, &claimed.request);
         // Record the per-role seat session (#82) when serving with a `--role`. A
         // recording failure is observability, not the reply — downgrade it to a
         // warning rather than abort the drain, matching [`emit`].
@@ -1390,9 +1426,93 @@ fn drain_mailbox(
         {
             eprintln!("warning: failed to record role session: {err}");
         }
-        mailbox.deliver_response(outbox, &claimed.key, &response)?;
+        // A `response`/`error` claimed request has nobody expecting an answer:
+        // running the exchange on it would only produce a second unread file,
+        // one hop later. Drop the output, complete, and move on.
+        if matches!(
+            claimed.request.kind,
+            MessageKind::Response | MessageKind::Error
+        ) {
+            eprintln!(
+                "serve: dropping reply for claimed {} envelope {}; nothing answers a {} directly",
+                claimed.request.kind.as_wire_str(),
+                claimed.key,
+                claimed.request.kind.as_wire_str()
+            );
+            mailbox.complete(claimed)?;
+            processed += 1;
+            continue;
+        }
+        if !try_route_reply(
+            &claimed.request,
+            &mut response,
+            &claimed.key,
+            registry,
+            own_inbox,
+            role,
+            sink,
+        ) {
+            mailbox.deliver_response(outbox, &claimed.key, &response)?;
+        }
         mailbox.complete(claimed)?;
         processed += 1;
+    }
+}
+
+/// Resolves `request.reply_to` through `registry` and, when every routing
+/// precondition holds, pushes `response` into the named peer's `pending/`
+/// instead of the caller's outbox — returning `true` so [`drain_mailbox`]
+/// skips the outbox write entirely (#362 AC4/AC5/AC7/AC8).
+///
+/// Every other case returns `false` and changes nothing, so the caller falls
+/// through to today's unchanged `deliver_response` write: no `reply_to` on the
+/// request; no `--registry` on this daemon; the name does not resolve; the
+/// resolved inbox is this daemon's own (a would-be self-loop — an unresolvable
+/// target, e.g. a peer inbox not yet created, is *not* treated as a self-route,
+/// since `deliver_to` creates `pending/` on demand); or the derived id
+/// (`reply-<role>-<request-id>`, discriminating same-`message_id` replies from
+/// distinct daemons) fails [`mailbox::is_safe_key`]. A `deliver_to` I/O failure
+/// also falls through, after a warning — never aborts the drain.
+fn try_route_reply(
+    request: &MessageEnvelope,
+    response: &mut MessageEnvelope,
+    request_key: &str,
+    registry: Option<&Registry>,
+    own_inbox: &Path,
+    role: Option<&str>,
+    sink: &mut dyn EventSink,
+) -> bool {
+    let (Some(registry), Some(name), Some(role)) = (registry, request.reply_to.as_deref(), role)
+    else {
+        return false;
+    };
+    let Ok(target) = registry.resolve(name) else {
+        return false;
+    };
+    let is_self_route = match (
+        std::fs::canonicalize(&target.inbox),
+        std::fs::canonicalize(own_inbox),
+    ) {
+        (Ok(resolved), Ok(own)) => resolved == own,
+        _ => false,
+    };
+    if is_self_route {
+        return false;
+    }
+    let routed_id = format!("reply-{role}-{request_key}");
+    if !mailbox::is_safe_key(&routed_id) {
+        return false;
+    }
+    response.message_id = routed_id;
+    match mailbox::deliver_to(&target.inbox, response) {
+        Ok(_) => {
+            emit(sink, &ExchangeEvent::message_sent(now_ms(), response));
+            true
+        }
+        Err(err) => {
+            eprintln!("warning: failed to route reply to {name:?}, falling back to outbox: {err}");
+            false
+        }
     }
 }
 
@@ -1593,8 +1713,8 @@ fn await_response(
 }
 
 /// Resolves the `send` message to deliver: builds a request envelope from
-/// `--body` (with optional addressing overrides), or reads a complete envelope
-/// from `--in`.
+/// `--body` (with optional addressing overrides and `--reply-to`), or reads a
+/// complete envelope from `--in`.
 ///
 /// The `--body` ids are derived from the emission time plus the process id so a
 /// send needs no external id source and two rapid invocations never collide on a
@@ -1605,13 +1725,14 @@ fn build_send_envelope(
     to: Option<String>,
     from: Option<String>,
     conversation: Option<String>,
+    reply_to: Option<String>,
 ) -> Result<MessageEnvelope> {
     match source {
         SendSource::Body(body) => {
             let ts_ms = now_ms();
             let conversation_id = conversation.unwrap_or_else(|| format!("conv-{ts_ms}"));
             let message_id = format!("{conversation_id}-{ts_ms}-{}", std::process::id());
-            Ok(MessageEnvelope::new(
+            let mut envelope = MessageEnvelope::new(
                 message_id,
                 conversation_id,
                 from.unwrap_or_else(|| "agent-a".to_string()),
@@ -1619,7 +1740,9 @@ fn build_send_envelope(
                 MessageKind::Request,
                 body.clone(),
                 ts_ms,
-            ))
+            );
+            envelope.reply_to = reply_to;
+            Ok(envelope)
         }
         SendSource::Envelope(path) => read_request_envelope(open_input(Some(path))?),
     }
@@ -2918,6 +3041,9 @@ struct SessionSpecFlags {
     agent_output: Option<String>,
     agent_result_key: Option<String>,
     role: Option<String>,
+    /// `--registry` routing table path; requires `role` to be set (a routed
+    /// reply's derived id names the role).
+    registry: Option<String>,
 }
 
 impl SessionSpecFlags {
@@ -3032,6 +3158,14 @@ impl SessionSpecFlags {
                 self.role = Some(other["--role=".len()..].to_string());
                 Ok(true)
             }
+            "--registry" => {
+                self.registry = Some(take("--registry")?);
+                Ok(true)
+            }
+            other if other.starts_with("--registry=") => {
+                self.registry = Some(other["--registry=".len()..].to_string());
+                Ok(true)
+            }
             _ => Ok(false),
         }
     }
@@ -3074,6 +3208,12 @@ impl SessionSpecFlags {
         if self.agent_result_key.is_some() && self.agent_output.as_deref() != Some("json") {
             return Err(usage("--agent-result-key requires --agent-output json"));
         }
+
+        // A routed reply's derived id (`reply-<role>-<request-id>`) names the
+        // role, so `--registry` with no `--role` has nothing to name it with.
+        if self.registry.is_some() && self.role.is_none() {
+            return Err(usage("--registry requires --role"));
+        }
         Ok(())
     }
 }
@@ -3082,9 +3222,11 @@ impl SessionSpecFlags {
 ///
 /// The daemon form requires `--inbox <dir>` and `--outbox <dir>` (both
 /// non-blank) and accepts an optional `--poll-ms <n>` (positive integer, default
-/// [`DEFAULT_SERVE_POLL_MS`]) and the `--once` flag. The cooperative-stop form
-/// (`--stop`) requires only `--inbox` and rejects the daemon-only flags
-/// (`--outbox`, `--poll-ms`, `--once`). Every valued flag also accepts the
+/// [`DEFAULT_SERVE_POLL_MS`]) and the `--once` flag. `--registry <path>`
+/// resolves `reply_to`-routed replies and requires `--role <name>` (the
+/// derived reply id names the role). The cooperative-stop form (`--stop`)
+/// requires only `--inbox` and rejects the daemon-only flags (`--outbox`,
+/// `--poll-ms`, `--once`, `--registry`). Every valued flag also accepts the
 /// `--flag=value` form. A flag without a value, a blank/missing required dir, a
 /// non-positive `--poll-ms`, or any other token is a usage error.
 fn parse_serve<'a>(mut iter: impl Iterator<Item = &'a String>) -> Result<Command> {
@@ -3114,9 +3256,10 @@ fn parse_serve<'a>(mut iter: impl Iterator<Item = &'a String>) -> Result<Command
             || flags.agent_cmd.is_some()
             || flags.has_agent_run_flags()
             || flags.role.is_some()
+            || flags.registry.is_some()
         {
             return Err(usage(
-                "--stop takes only --inbox (not --outbox/--poll-ms/--retention/--once/--agent-*/--role)",
+                "--stop takes only --inbox (not --outbox/--poll-ms/--retention/--once/--agent-*/--role/--registry)",
             ));
         }
         let inbox = require_dir(flags.inbox, "--inbox")?;
@@ -3136,6 +3279,7 @@ fn parse_serve<'a>(mut iter: impl Iterator<Item = &'a String>) -> Result<Command
         agent_output,
         agent_result_key,
         role,
+        registry,
     } = flags;
 
     let inbox = require_dir(inbox, "--inbox")?;
@@ -3153,6 +3297,7 @@ fn parse_serve<'a>(mut iter: impl Iterator<Item = &'a String>) -> Result<Command
         agent_result_key,
         role,
         retention_ms,
+        registry,
     })
 }
 
@@ -3258,6 +3403,7 @@ fn parse_service_start<'a>(mut iter: impl Iterator<Item = &'a String>) -> Result
         agent_output,
         agent_result_key,
         role,
+        registry,
     } = flags;
 
     let control = optional_dir(control, "--control")?;
@@ -3269,6 +3415,11 @@ fn parse_service_start<'a>(mut iter: impl Iterator<Item = &'a String>) -> Result
     let inbox = resolve_client_path(require_dir(inbox, "--inbox")?, &start_cwd);
     let outbox = resolve_client_path(require_dir(outbox, "--outbox")?, &start_cwd);
     let agent_cwd = agent_cwd.map(|path| resolve_client_path(path, &start_cwd));
+    // The spec is submitted from this client but read back by `Run` in its own
+    // process — a relative --registry must be resolved here too, exactly like
+    // --inbox/--outbox/--agent-cwd, or it would instead resolve against the
+    // long-lived service's cwd.
+    let registry = registry.map(|path| resolve_client_path(path, &start_cwd));
     let spec = SessionSpec {
         schema: service::SESSION_SPEC_SCHEMA.to_string(),
         inbox,
@@ -3282,6 +3433,7 @@ fn parse_service_start<'a>(mut iter: impl Iterator<Item = &'a String>) -> Result
         agent_output,
         agent_result_key,
         role,
+        registry,
     };
     Ok(Command::Service(service::ServiceCommand::Start {
         control,
@@ -3590,12 +3742,15 @@ fn parse_task_cancel<'a>(mut iter: impl Iterator<Item = &'a String>) -> Result<C
 /// Parses the arguments following the `send` subcommand.
 ///
 /// Requires `--inbox <dir>` and exactly one message source (`--body <text>` xor
-/// `--in <path>`). `--to`/`--from`/`--conversation` describe a `--body`-built
-/// message and are rejected alongside `--in` (a full envelope carries its own).
-/// `--await` requires `--outbox <dir>`; `--outbox` and `--timeout-ms` are valid
-/// only with `--await`. Every valued flag also accepts the `--flag=value` form.
-/// A blank body, a missing/blank required dir, a non-positive `--timeout-ms`, or
-/// any other token is a usage error.
+/// `--in <path>`). `--to`/`--from`/`--conversation`/`--reply-to` describe a
+/// `--body`-built message and are rejected alongside `--in` (a full envelope
+/// carries its own). `--reply-to <name>` stamps `reply_to` on the envelope so a
+/// receiving `serve --registry --role` daemon routes its reply into that name's
+/// inbox instead of its own outbox. `--await` requires `--outbox <dir>`;
+/// `--outbox` and `--timeout-ms` are valid only with `--await`. Every valued
+/// flag also accepts the `--flag=value` form. A blank body, a missing/blank
+/// required dir, a non-positive `--timeout-ms`, or any other token is a usage
+/// error.
 fn parse_send<'a>(mut iter: impl Iterator<Item = &'a String>) -> Result<Command> {
     let mut inbox: Option<String> = None;
     let mut registry: Option<String> = None;
@@ -3604,6 +3759,7 @@ fn parse_send<'a>(mut iter: impl Iterator<Item = &'a String>) -> Result<Command>
     let mut to: Option<String> = None;
     let mut from: Option<String> = None;
     let mut conversation: Option<String> = None;
+    let mut reply_to: Option<String> = None;
     let mut await_reply = false;
     let mut outbox: Option<String> = None;
     let mut timeout_ms: Option<u64> = None;
@@ -3643,6 +3799,10 @@ fn parse_send<'a>(mut iter: impl Iterator<Item = &'a String>) -> Result<Command>
             other if other.starts_with("--conversation=") => {
                 conversation = Some(other["--conversation=".len()..].to_string());
             }
+            "--reply-to" => reply_to = Some(take("--reply-to")?),
+            other if other.starts_with("--reply-to=") => {
+                reply_to = Some(other["--reply-to=".len()..].to_string());
+            }
             "--await" => await_reply = true,
             "--outbox" => outbox = Some(take("--outbox")?),
             other if other.starts_with("--outbox=") => {
@@ -3665,9 +3825,9 @@ fn parse_send<'a>(mut iter: impl Iterator<Item = &'a String>) -> Result<Command>
             SendSource::Body(body)
         }
         (None, Some(path)) => {
-            if to.is_some() || from.is_some() || conversation.is_some() {
+            if to.is_some() || from.is_some() || conversation.is_some() || reply_to.is_some() {
                 return Err(usage(
-                    "--to/--from/--conversation apply to --body; --in supplies a complete envelope",
+                    "--to/--from/--conversation/--reply-to apply to --body; --in supplies a complete envelope",
                 ));
             }
             SendSource::Envelope(path)
@@ -3726,6 +3886,7 @@ fn parse_send<'a>(mut iter: impl Iterator<Item = &'a String>) -> Result<Command>
         to,
         from,
         conversation,
+        reply_to,
         await_reply,
         outbox,
         timeout_ms: timeout_ms.unwrap_or(DEFAULT_SEND_TIMEOUT_MS),
@@ -6001,6 +6162,70 @@ mod tests {
     }
 
     #[test]
+    fn parse_serve_accepts_registry_with_role() {
+        let cmd = parse_args(&argv(&[
+            "serve",
+            "--inbox=/tmp/in",
+            "--outbox=/tmp/out",
+            "--agent-cmd=/bin/true",
+            "--role=alice",
+            "--registry=/tmp/reg.json",
+        ]))
+        .expect("parses");
+        match cmd {
+            Command::Serve { registry, .. } => {
+                assert_eq!(registry.as_deref(), Some("/tmp/reg.json"))
+            }
+            other => panic!("expected Serve, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_serve_registry_without_role_is_a_usage_error() {
+        assert!(matches!(
+            parse_args(&argv(&[
+                "serve",
+                "--inbox=/tmp/in",
+                "--outbox=/tmp/out",
+                "--agent-cmd=/bin/true",
+                "--registry=/tmp/reg.json",
+            ]))
+            .unwrap_err(),
+            BatonError::Usage(_)
+        ));
+    }
+
+    #[test]
+    fn parse_serve_stop_rejects_registry() {
+        assert!(matches!(
+            parse_args(&argv(&[
+                "serve",
+                "--stop",
+                "--inbox=/tmp/in",
+                "--registry=/tmp/reg.json"
+            ]))
+            .unwrap_err(),
+            BatonError::Usage(_)
+        ));
+    }
+
+    #[test]
+    fn parse_service_start_registry_without_role_is_a_usage_error() {
+        assert!(matches!(
+            parse_args(&argv(&[
+                "service",
+                "start",
+                "--inbox=/tmp/in",
+                "--outbox=/tmp/out",
+                "--agent-cmd=/bin/true",
+                "--registry=/tmp/reg.json",
+            ]))
+            .unwrap_err(),
+            BatonError::Usage(_)
+        ));
+    }
+
+    #[test]
     fn execute_roles_prints_one_name_per_line() {
         let mut out = Vec::new();
         execute_roles(&["alice".to_string(), "bob".to_string()], &mut out).expect("writes");
@@ -6076,6 +6301,7 @@ mod tests {
                 agent_result_key: None,
                 role: None,
                 retention_ms: None,
+                registry: None,
             }
         );
     }
@@ -6164,6 +6390,7 @@ mod tests {
                 agent_result_key: None,
                 role: None,
                 retention_ms: None,
+                registry: None,
             }
         );
     }
@@ -6192,6 +6419,7 @@ mod tests {
                 agent_result_key: None,
                 role: None,
                 retention_ms: None,
+                registry: None,
             }
         );
     }
@@ -6322,6 +6550,7 @@ mod tests {
                 agent_result_key: None,
                 role: None,
                 retention_ms: None,
+                registry: None,
             }
         );
         assert!(matches!(
@@ -6391,6 +6620,7 @@ mod tests {
                 agent_result_key: None,
                 role: None,
                 retention_ms: None,
+                registry: None,
             }
         );
     }
@@ -6740,6 +6970,38 @@ mod tests {
                 assert_eq!(spec.inbox, expected("relative/inbox"));
                 assert_eq!(spec.outbox, expected("relative/outbox"));
                 assert_eq!(spec.agent_cwd.as_deref(), Some(expected_agent_cwd.as_str()));
+            }
+            other => panic!("expected Service(Start), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_service_start_resolves_relative_registry_from_client_cwd() {
+        let cwd = std::env::current_dir().expect("read current directory");
+        let cmd = parse_args(&argv(&[
+            "service",
+            "start",
+            "--control",
+            "/tmp/ctl",
+            "--inbox",
+            "/tmp/in",
+            "--outbox",
+            "/tmp/out",
+            "--agent-cmd",
+            "agent",
+            "--role",
+            "alice",
+            "--registry",
+            "relative/registry.json",
+        ]))
+        .expect("parses");
+        let expected = cwd
+            .join("relative/registry.json")
+            .to_string_lossy()
+            .into_owned();
+        match cmd {
+            Command::Service(service::ServiceCommand::Start { spec, .. }) => {
+                assert_eq!(spec.registry.as_deref(), Some(expected.as_str()));
             }
             other => panic!("expected Service(Start), got {other:?}"),
         }
@@ -7297,6 +7559,9 @@ mod tests {
             &mut sink,
             &test_meta(),
             None,
+            None,
+            &inbox,
+            None,
         )
         .expect("drain");
         assert!(matches!(drained, Drain::Drained(1)), "one request drained");
@@ -7317,6 +7582,9 @@ mod tests {
             &participant,
             &mut sink,
             &test_meta(),
+            None,
+            None,
+            &inbox,
             None,
         )
         .expect("second drain");
@@ -7350,6 +7618,9 @@ mod tests {
             &mut sink,
             &test_meta(),
             None,
+            None,
+            &inbox,
+            None,
         )
         .expect("drain");
         assert!(matches!(drained, Drain::Stopped), "sentinel ⇒ Stopped");
@@ -7382,6 +7653,9 @@ mod tests {
             &mut sink,
             &test_meta(),
             None,
+            None,
+            &inbox,
+            None,
         )
         .expect("drain");
         assert_eq!(json_files(&outbox).len(), 1);
@@ -7398,6 +7672,9 @@ mod tests {
             &mut sink,
             &test_meta(),
             None,
+            None,
+            &inbox,
+            None,
         )
         .expect("re-drain");
         assert_eq!(
@@ -7405,6 +7682,397 @@ mod tests {
             1,
             "keyed by request id ⇒ reprocess overwrites, single outbox file"
         );
+    }
+
+    // ---- `drain_mailbox` reply routing (#362) --------------------------------
+
+    /// Builds a `request`-kind envelope addressed like [`request_envelope`] but
+    /// with `reply_to` set, as a `send --reply-to <name>` sender would stamp it.
+    fn routed_request_envelope(reply_to: &str) -> MessageEnvelope {
+        let mut request = request_envelope();
+        request.reply_to = Some(reply_to.to_string());
+        request
+    }
+
+    /// Writes a routing registry naming `name` -> `target_inbox` (its `outbox`
+    /// is unused by routing, so it is stamped to a sibling directory) and loads
+    /// it, mirroring `registry::tests::write_temp`.
+    fn routing_registry(tag: &str, name: &str, target_inbox: &Path) -> Registry {
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "baton-cli-routing-registry-{}-{tag}.json",
+            std::process::id()
+        ));
+        let json = serde_json::json!({
+            "participants": {
+                name: {
+                    "inbox": target_inbox.to_string_lossy(),
+                    "outbox": target_inbox.join("unused-outbox").to_string_lossy(),
+                }
+            }
+        });
+        std::fs::write(&path, serde_json::to_string(&json).unwrap()).expect("write registry");
+        let registry = Registry::from_path(&path).expect("loads registry");
+        let _ = std::fs::remove_file(&path);
+        registry
+    }
+
+    /// A `reply_to`-addressed request routes its reply into the named peer's
+    /// `pending/`, not the daemon's own outbox (#362 AC4/AC5).
+    #[test]
+    fn drain_mailbox_routes_reply_into_named_peer_inbox() {
+        let root = TempRoot::new("route-happy");
+        let inbox = root.path.join("inbox");
+        let outbox = root.path.join("outbox");
+        let peer_inbox = root.path.join("peer-inbox");
+
+        let mailbox = Mailbox::open(&inbox).expect("open mailbox");
+        mailbox
+            .deliver(&routed_request_envelope("bob"))
+            .expect("deliver");
+        let registry = routing_registry("happy", "bob", &peer_inbox);
+        let participant = crate::participant::testing::ScriptedParticipant::new(["four"]);
+        let mut sink = NoopSink;
+
+        let drained = drain_mailbox(
+            &mailbox,
+            &outbox,
+            &participant,
+            &mut sink,
+            &test_meta(),
+            None,
+            Some(&registry),
+            &inbox,
+            Some("alice"),
+        )
+        .expect("drain");
+        assert!(matches!(drained, Drain::Drained(1)));
+        assert!(
+            json_files(&outbox).is_empty(),
+            "no outbox write on a routed reply"
+        );
+        assert_eq!(
+            json_files(&peer_inbox.join("pending")),
+            vec!["reply-alice-m-req-1.json".to_string()],
+            "routed reply lands in the peer's pending/ keyed by role+request id"
+        );
+    }
+
+    /// An exhausted-script (synthesized `kind: error`) reply routes exactly like
+    /// a normal response — the routing decision does not depend on `kind`.
+    #[test]
+    fn drain_mailbox_routes_a_synthesized_error_reply() {
+        let root = TempRoot::new("route-error");
+        let inbox = root.path.join("inbox");
+        let outbox = root.path.join("outbox");
+        let peer_inbox = root.path.join("peer-inbox");
+
+        let mailbox = Mailbox::open(&inbox).expect("open mailbox");
+        mailbox
+            .deliver(&routed_request_envelope("bob"))
+            .expect("deliver");
+        let registry = routing_registry("error", "bob", &peer_inbox);
+        // An empty script makes `ScriptedParticipant` synthesize a `kind: error`
+        // reply instead of a `kind: response` one.
+        let participant =
+            crate::participant::testing::ScriptedParticipant::new(Vec::<String>::new());
+        let mut sink = NoopSink;
+
+        drain_mailbox(
+            &mailbox,
+            &outbox,
+            &participant,
+            &mut sink,
+            &test_meta(),
+            None,
+            Some(&registry),
+            &inbox,
+            Some("alice"),
+        )
+        .expect("drain");
+        assert!(json_files(&outbox).is_empty());
+        let routed = json_files(&peer_inbox.join("pending"));
+        assert_eq!(routed, vec!["reply-alice-m-req-1.json".to_string()]);
+        let raw = std::fs::read_to_string(peer_inbox.join("pending").join(&routed[0]))
+            .expect("read routed reply");
+        assert!(raw.contains("\"kind\":\"error\""), "got: {raw}");
+    }
+
+    /// Every AC7 fallback: no `reply_to`, no `--registry`, an unresolvable
+    /// name, and a self-addressed route all leave today's outbox write
+    /// unchanged and push nothing.
+    #[test]
+    fn drain_mailbox_fallback_cases_keep_the_outbox_write() {
+        let root = TempRoot::new("route-fallback");
+        let participant =
+            crate::participant::testing::ScriptedParticipant::new(["one", "two", "three", "four"]);
+        let mut sink = NoopSink;
+
+        // Case 1: no `reply_to` on the request at all, registry present.
+        {
+            let inbox = root.path.join("inbox-no-reply-to");
+            let outbox = root.path.join("outbox-no-reply-to");
+            let peer_inbox = root.path.join("peer-no-reply-to");
+            let mailbox = Mailbox::open(&inbox).expect("open mailbox");
+            mailbox.deliver(&request_envelope()).expect("deliver");
+            let registry = routing_registry("no-reply-to", "bob", &peer_inbox);
+            drain_mailbox(
+                &mailbox,
+                &outbox,
+                &participant,
+                &mut sink,
+                &test_meta(),
+                None,
+                Some(&registry),
+                &inbox,
+                Some("alice"),
+            )
+            .expect("drain");
+            assert_eq!(json_files(&outbox), vec!["m-req-1.json".to_string()]);
+            assert!(!peer_inbox.join("pending").exists());
+        }
+
+        // Case 2: `reply_to` set, but this daemon has no `--registry`.
+        {
+            let inbox = root.path.join("inbox-no-registry");
+            let outbox = root.path.join("outbox-no-registry");
+            let mailbox = Mailbox::open(&inbox).expect("open mailbox");
+            mailbox
+                .deliver(&routed_request_envelope("bob"))
+                .expect("deliver");
+            drain_mailbox(
+                &mailbox,
+                &outbox,
+                &participant,
+                &mut sink,
+                &test_meta(),
+                None,
+                None,
+                &inbox,
+                Some("alice"),
+            )
+            .expect("drain");
+            assert_eq!(json_files(&outbox), vec!["m-req-1.json".to_string()]);
+        }
+
+        // Case 3: `reply_to` names a peer absent from the registry.
+        {
+            let inbox = root.path.join("inbox-unresolved");
+            let outbox = root.path.join("outbox-unresolved");
+            let peer_inbox = root.path.join("peer-unresolved");
+            let mailbox = Mailbox::open(&inbox).expect("open mailbox");
+            mailbox
+                .deliver(&routed_request_envelope("carol"))
+                .expect("deliver");
+            let registry = routing_registry("unresolved", "bob", &peer_inbox);
+            drain_mailbox(
+                &mailbox,
+                &outbox,
+                &participant,
+                &mut sink,
+                &test_meta(),
+                None,
+                Some(&registry),
+                &inbox,
+                Some("alice"),
+            )
+            .expect("drain");
+            assert_eq!(json_files(&outbox), vec!["m-req-1.json".to_string()]);
+        }
+
+        // Case 4: `reply_to` resolves back to this daemon's own inbox.
+        {
+            let inbox = root.path.join("inbox-self");
+            let outbox = root.path.join("outbox-self");
+            let mailbox = Mailbox::open(&inbox).expect("open mailbox");
+            mailbox
+                .deliver(&routed_request_envelope("alice"))
+                .expect("deliver");
+            let registry = routing_registry("self", "alice", &inbox);
+            drain_mailbox(
+                &mailbox,
+                &outbox,
+                &participant,
+                &mut sink,
+                &test_meta(),
+                None,
+                Some(&registry),
+                &inbox,
+                Some("alice"),
+            )
+            .expect("drain");
+            assert_eq!(json_files(&outbox), vec!["m-req-1.json".to_string()]);
+            assert!(json_files(&inbox.join("pending")).is_empty());
+        }
+    }
+
+    /// The derived routed id is `reply-<role>-<request-id>`; a role containing a
+    /// path separator makes that id fail [`mailbox::is_safe_key`], so the reply
+    /// falls back to the outbox rather than routing (or panicking on an invalid
+    /// filename).
+    #[test]
+    fn drain_mailbox_falls_back_when_the_derived_routed_id_is_unsafe() {
+        let root = TempRoot::new("route-unsafe-id");
+        let inbox = root.path.join("inbox");
+        let outbox = root.path.join("outbox");
+        let peer_inbox = root.path.join("peer-inbox");
+
+        let mailbox = Mailbox::open(&inbox).expect("open mailbox");
+        mailbox
+            .deliver(&routed_request_envelope("bob"))
+            .expect("deliver");
+        let registry = routing_registry("unsafe-id", "bob", &peer_inbox);
+        let participant = crate::participant::testing::ScriptedParticipant::new(["four"]);
+        let mut sink = NoopSink;
+
+        drain_mailbox(
+            &mailbox,
+            &outbox,
+            &participant,
+            &mut sink,
+            &test_meta(),
+            None,
+            Some(&registry),
+            &inbox,
+            Some("a/b"),
+        )
+        .expect("drain");
+        assert_eq!(json_files(&outbox), vec!["m-req-1.json".to_string()]);
+        assert!(!peer_inbox.join("pending").exists());
+    }
+
+    /// A reclaimed routed request re-drains into the *same* peer pending file —
+    /// one entry, not two — mirroring the outbox reprocess guarantee.
+    #[test]
+    fn drain_mailbox_reprocess_of_a_routed_reply_keeps_single_pending_entry() {
+        let root = TempRoot::new("route-reprocess");
+        let inbox = root.path.join("inbox");
+        let outbox = root.path.join("outbox");
+        let peer_inbox = root.path.join("peer-inbox");
+
+        let mailbox = Mailbox::open(&inbox).expect("open mailbox");
+        let registry = routing_registry("reprocess", "bob", &peer_inbox);
+        let participant = crate::participant::testing::ScriptedParticipant::new(["four", "four"]);
+        let mut sink = NoopSink;
+
+        mailbox
+            .deliver(&routed_request_envelope("bob"))
+            .expect("deliver");
+        drain_mailbox(
+            &mailbox,
+            &outbox,
+            &participant,
+            &mut sink,
+            &test_meta(),
+            None,
+            Some(&registry),
+            &inbox,
+            Some("alice"),
+        )
+        .expect("drain");
+        assert_eq!(json_files(&peer_inbox.join("pending")).len(), 1);
+
+        std::fs::remove_file(inbox.join("done").join("m-req-1.json")).expect("clear done");
+        mailbox
+            .deliver(&routed_request_envelope("bob"))
+            .expect("re-deliver");
+        drain_mailbox(
+            &mailbox,
+            &outbox,
+            &participant,
+            &mut sink,
+            &test_meta(),
+            None,
+            Some(&registry),
+            &inbox,
+            Some("alice"),
+        )
+        .expect("re-drain");
+        assert_eq!(
+            json_files(&peer_inbox.join("pending")).len(),
+            1,
+            "keyed by role+request id ⇒ reprocess overwrites, single pending entry"
+        );
+        assert!(json_files(&outbox).is_empty());
+    }
+
+    /// Two daemons with distinct `--role` values answering requests that share
+    /// one `message_id` derive two distinct routed ids — no collision in the
+    /// shared peer inbox.
+    #[test]
+    fn drain_mailbox_distinct_roles_avoid_routed_id_collision() {
+        let root = TempRoot::new("route-distinct-roles");
+        let peer_inbox = root.path.join("peer-inbox");
+        let registry = routing_registry("distinct-roles", "carol", &peer_inbox);
+        let mut sink = NoopSink;
+
+        for role in ["alice", "bob"] {
+            let inbox = root.path.join(format!("inbox-{role}"));
+            let outbox = root.path.join(format!("outbox-{role}"));
+            let mailbox = Mailbox::open(&inbox).expect("open mailbox");
+            mailbox
+                .deliver(&routed_request_envelope("carol"))
+                .expect("deliver");
+            let participant = crate::participant::testing::ScriptedParticipant::new(["reply"]);
+            drain_mailbox(
+                &mailbox,
+                &outbox,
+                &participant,
+                &mut sink,
+                &test_meta(),
+                None,
+                Some(&registry),
+                &inbox,
+                Some(role),
+            )
+            .expect("drain");
+        }
+
+        let mut routed = json_files(&peer_inbox.join("pending"));
+        routed.sort();
+        assert_eq!(
+            routed,
+            vec![
+                "reply-alice-m-req-1.json".to_string(),
+                "reply-bob-m-req-1.json".to_string(),
+            ]
+        );
+    }
+
+    /// A claimed request whose own `kind` is `response`/`error` (#362 AC6) is
+    /// dropped before any routing decision — no outbox write, no push, even
+    /// with a registry and a resolvable `reply_to` present.
+    #[test]
+    fn drain_mailbox_response_kind_request_produces_no_outbox_or_routed_file() {
+        let root = TempRoot::new("route-ac6");
+        let inbox = root.path.join("inbox");
+        let outbox = root.path.join("outbox");
+        let peer_inbox = root.path.join("peer-inbox");
+
+        let mailbox = Mailbox::open(&inbox).expect("open mailbox");
+        let mut claimed_kind_response = routed_request_envelope("bob");
+        claimed_kind_response.kind = MessageKind::Response;
+        mailbox.deliver(&claimed_kind_response).expect("deliver");
+        let registry = routing_registry("ac6", "bob", &peer_inbox);
+        let participant = crate::participant::testing::ScriptedParticipant::new(["four"]);
+        let mut sink = NoopSink;
+
+        let drained = drain_mailbox(
+            &mailbox,
+            &outbox,
+            &participant,
+            &mut sink,
+            &test_meta(),
+            None,
+            Some(&registry),
+            &inbox,
+            Some("alice"),
+        )
+        .expect("drain");
+        assert!(matches!(drained, Drain::Drained(1)));
+        assert!(json_files(&outbox).is_empty());
+        assert!(!peer_inbox.join("pending").exists());
+        assert_eq!(json_files(&inbox.join("done")).len(), 1);
     }
 
     // ---- `baton send` --------------------------------------------------------
@@ -7454,6 +8122,35 @@ mod tests {
                 to: None,
                 from: None,
                 conversation: None,
+                reply_to: None,
+                await_reply: false,
+                outbox: None,
+                timeout_ms: DEFAULT_SEND_TIMEOUT_MS,
+            }
+        );
+    }
+
+    #[test]
+    fn parses_send_body_with_reply_to() {
+        assert_eq!(
+            parse_args(&argv(&[
+                "send",
+                "--inbox",
+                "/tmp/mb",
+                "--body",
+                "hi",
+                "--reply-to",
+                "bob",
+            ]))
+            .expect("parses"),
+            Command::Send {
+                inbox: Some("/tmp/mb".to_string()),
+                registry: None,
+                source: SendSource::Body("hi".to_string()),
+                to: None,
+                from: None,
+                conversation: None,
+                reply_to: Some("bob".to_string()),
                 await_reply: false,
                 outbox: None,
                 timeout_ms: DEFAULT_SEND_TIMEOUT_MS,
@@ -7480,6 +8177,7 @@ mod tests {
                 to: None,
                 from: None,
                 conversation: None,
+                reply_to: None,
                 await_reply: true,
                 outbox: Some("/tmp/ob".to_string()),
                 timeout_ms: 1500,
@@ -7495,6 +8193,15 @@ mod tests {
             &["send", "--inbox", "/tmp/mb", "--body", "   "], // blank body
             &["send", "--inbox", "/tmp/mb", "--body", "hi", "--in", "/p"], // both sources
             &["send", "--inbox", "/tmp/mb", "--in", "/p", "--to", "x"], // addressing with --in
+            &[
+                "send",
+                "--inbox",
+                "/tmp/mb",
+                "--in",
+                "/p",
+                "--reply-to",
+                "bob",
+            ], // --reply-to with --in
             &["send", "--inbox", "/tmp/mb", "--body", "hi", "--await"], // --await sans --outbox
             &[
                 "send", "--inbox", "/tmp/mb", "--body", "hi", "--outbox", "/ob",
@@ -7549,6 +8256,7 @@ mod tests {
                 to: Some("reviewer".to_string()),
                 from: None,
                 conversation: None,
+                reply_to: None,
                 await_reply: false,
                 outbox: None,
                 timeout_ms: DEFAULT_SEND_TIMEOUT_MS,
@@ -7575,6 +8283,7 @@ mod tests {
                 to: Some("reviewer".to_string()),
                 from: None,
                 conversation: None,
+                reply_to: None,
                 await_reply: true,
                 outbox: None,
                 timeout_ms: DEFAULT_SEND_TIMEOUT_MS,
@@ -7920,6 +8629,7 @@ mod tests {
             Some("recipient".to_string()),
             Some("sender".to_string()),
             Some("c-1".to_string()),
+            None,
         )
         .expect("builds");
         assert_eq!(env.to, "recipient");
@@ -7927,11 +8637,25 @@ mod tests {
         assert_eq!(env.conversation_id, "c-1");
         assert_eq!(env.kind, MessageKind::Request);
         assert_eq!(env.body, "hi");
+        assert_eq!(env.reply_to, None);
         assert!(
             env.message_id.starts_with("c-1-"),
             "id derived from conversation: {}",
             env.message_id
         );
+    }
+
+    #[test]
+    fn build_send_envelope_from_body_stamps_reply_to() {
+        let env = build_send_envelope(
+            &SendSource::Body("hi".to_string()),
+            None,
+            None,
+            None,
+            Some("bob".to_string()),
+        )
+        .expect("builds");
+        assert_eq!(env.reply_to.as_deref(), Some("bob"));
     }
 
     #[test]
@@ -7945,6 +8669,7 @@ mod tests {
         .expect("write envelope");
         let env = build_send_envelope(
             &SendSource::Envelope(path.to_string_lossy().into_owned()),
+            None,
             None,
             None,
             None,

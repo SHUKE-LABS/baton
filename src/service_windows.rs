@@ -1004,6 +1004,7 @@ mod tests {
             agent_output: None,
             agent_result_key: None,
             role: None,
+            registry: None,
         }
     }
 

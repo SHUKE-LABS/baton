@@ -262,6 +262,7 @@ outcome.
 | `conversation_id` | string          | The conversation this message belongs to.                      |
 | `from` / `to`   | string            | Sender / recipient address.                                    |
 | `in_reply_to`   | string \| null    | The `message_id` this replies to, or `null`.                   |
+| `reply_to`      | string, omitted when absent | `baton send --reply-to <name>`'s routing hint: the mailbox name a `serve --registry --role` daemon should push its reply into, instead of leaving it in the outbox. Unlike `in_reply_to` this key is omitted (not `null`) when unset, so an envelope written before this field existed decodes unchanged. See [Mailbox § Routing a reply into the sender's inbox](mailbox.md#routing-a-reply-into-the-senders-inbox-send---reply-to--serve---registry). |
 | `kind`          | string            | One of `request`, `response`, `done`, `error`, `notify` (see below). |
 | `body`          | string            | The message body.                                              |
 | `ts_ms`         | number            | Emission time, Unix epoch milliseconds.                        |

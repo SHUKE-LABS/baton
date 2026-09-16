@@ -111,6 +111,11 @@ pub struct SessionSpec {
     pub agent_result_key: Option<String>,
     /// `baton serve --role`.
     pub role: Option<String>,
+    /// `baton serve --registry`; `None` ⇒ every reply goes to `outbox`, the
+    /// prior behaviour. `#[serde(default)]` so a spec persisted before this
+    /// field existed still decodes.
+    #[serde(default)]
+    pub registry: Option<String>,
 }
 
 /// A parsed `baton service` invocation.
@@ -1839,6 +1844,7 @@ mod imp {
                 agent_output: None,
                 agent_result_key: None,
                 role: None,
+                registry: None,
             }
         }
 
@@ -2102,6 +2108,38 @@ mod imp {
                 .expect("read legacy record")
                 .expect("legacy record exists");
             assert!(read.stderr_path.is_empty());
+        }
+
+        /// A session record persisted before `--registry` (#362) existed has
+        /// no `registry` key on its nested `spec`; it still decodes, with the
+        /// field defaulting to `None` rather than failing to parse.
+        #[test]
+        fn legacy_session_record_defaults_registry_to_none() {
+            let dir = TempDir::new("legacy-registry");
+            let record = SessionRecord {
+                id: "svc-legacy-registry".to_string(),
+                spec: spec("/tmp/in", "/tmp/out"),
+                pid: 4242,
+                started_at: Some("123456".to_string()),
+                start_epoch_secs: Some(123456),
+                stderr_path: "/tmp/stderr.log".to_string(),
+            };
+            let mut json = serde_json::to_value(record).expect("serialize record");
+            json.get_mut("spec")
+                .and_then(|spec| spec.as_object_mut())
+                .expect("spec object")
+                .remove("registry");
+            fs::create_dir_all(sessions_dir(&dir.path)).expect("create sessions dir");
+            fs::write(
+                session_record_path(&dir.path, "svc-legacy-registry").expect("record path"),
+                serde_json::to_vec(&json).expect("serialize legacy record"),
+            )
+            .expect("write legacy record");
+
+            let read = read_session_record(&dir.path, "svc-legacy-registry")
+                .expect("read legacy record")
+                .expect("legacy record exists");
+            assert_eq!(read.spec.registry, None);
         }
 
         /// A legacy macOS task rescued by its spawn instant is upgraded once

@@ -18,7 +18,7 @@ socket.
 baton serve --inbox <dir> --outbox <dir> [--poll-ms <n>] [--retention <duration>] [--once]
             [--agent-cmd <program> [--agent-arg <arg>]... [--agent-cwd <dir>] [--agent-timeout-ms <n>]
              [--agent-output raw|json [--agent-result-key <key>]]]
-            [--role <name>]
+            [--role <name>] [--registry <path>]
 baton serve --stop --inbox <dir>
 ```
 
@@ -55,6 +55,11 @@ baton serve --stop --inbox <dir>
   exchange is also recorded as a per-role
   [session](configuration.md#per-role-session-recording) under
   `roles/<name>/sessions/<conversation_id>.jsonl`.
+- `--registry <path>` — routing table (same format/loader as `send`/`status`;
+  see [Routing registry](#routing-registry-name--mailbox)); requires `--role`,
+  since a routed reply's derived id names this daemon by role. Loaded once at
+  startup, fail-fast. See [Routing a reply into the sender's
+  inbox](#routing-a-reply-into-the-senders-inbox-send---reply-to--serve---registry).
 - `--stop` — cooperatively stop the `serve` running on `--inbox` (see
   [Shutdown](#shutdown-cooperative-graceful-stop)); takes only `--inbox`.
 
@@ -177,7 +182,7 @@ single-instance lock, so it posts to an inbox a live `serve` already owns; and i
 runs no provider call, so it needs no credential.
 
 ```
-baton send (--inbox <dir> | --registry <path>) (--body <text> [--to <role>] | --in <path>) [--from <id>] [--conversation <id>] [--await [--outbox <dir>] [--timeout-ms <n>]]
+baton send (--inbox <dir> | --registry <path>) (--body <text> [--to <role>] [--reply-to <name>] | --in <path>) [--from <id>] [--conversation <id>] [--await [--outbox <dir>] [--timeout-ms <n>]]
 ```
 
 - `--inbox <dir>` — the mailbox root; the request is written to its `pending/`.
@@ -192,6 +197,13 @@ baton send (--inbox <dir> | --registry <path>) (--body <text> [--to <role>] | --
   time-derived conversation id); the `message_id` is derived so no external id
   source is needed. With `--registry`, `--to <role>` is required (it is both the
   routing key and the envelope `to`).
+- `--reply-to <name>` — with `--body`, stamp this on the request's `reply_to`
+  field (mutually exclusive with `--in`, which carries its own envelope). It
+  is intent only: `send` itself still writes to `--inbox`/`--registry`
+  exactly as without the flag. A receiving `serve --registry --role` daemon
+  is what resolves `name` and routes its reply accordingly — see [Routing a
+  reply into the sender's
+  inbox](#routing-a-reply-into-the-senders-inbox-send---reply-to--serve---registry).
 - `--in <path>` — read a complete envelope from a file instead (mutually
   exclusive with `--body`; the addressing flags do not apply — the envelope
   carries its own; with `--registry` its `to` is the routing role).
@@ -437,3 +449,44 @@ directory + a registry entry", not hand-assembling per-process env.
   roster is fixed for the run.
 - **No `to`-based routing** — the driver picks the next recipient by ring order;
   the registry only resolves names to mailboxes.
+
+### Routing a reply into the sender's inbox (`send --reply-to` + `serve --registry`)
+
+By default a `serve` reply always lands in `--outbox`, whether or not anyone is
+polling it — for a headless peer (itself a `serve` daemon with no `--await`
+client) that file simply sits there unread. `--reply-to` closes that gap: it
+turns the reply into a normal inbound turn on the peer's own mailbox instead.
+
+1. The sender passes `send --body ... --reply-to <name>`, stamping `reply_to:
+   "<name>"` on the request envelope (`baton.message/v1`; omitted from the
+   JSON when unset, so an older envelope or an older `serve` decoding a new
+   one is unaffected).
+2. The answering daemon runs with `serve --registry <path> --role <name>`.
+   After it answers a claimed request, if the request carries a `reply_to`
+   and it resolves in the registry, the reply is delivered into that
+   participant's `pending/` (via the same lock-free `deliver_to` path
+   `send` uses) instead of written to this daemon's `--outbox`. Its
+   `message_id` is `reply-<this-daemon's-role>-<request message_id>` —
+   discriminating replies from distinct daemons that happen to answer
+   requests sharing one `message_id`, and keeping the same-request reprocess
+   guarantee (one entry, overwritten, not two).
+3. The reply falls back to today's unchanged `--outbox` write whenever any
+   precondition does not hold: the request carries no `reply_to`; this
+   daemon has no `--registry`; the name does not resolve in the registry; the
+   resolved target is this daemon's own inbox (a self-route, which would
+   otherwise loop); or the derived id is not a
+   [safe mailbox key](#routing-registry-name--mailbox). A `deliver_to`
+   I/O failure at routing time also falls back, after a warning on stderr —
+   it never aborts the daemon or drops the reply outright.
+
+**AC6 — a claimed reply answers nothing.** A claimed request whose own `kind`
+is `response` or `error` has, by definition, nobody expecting an answer to it:
+running the exchange and writing (or routing) its output would only produce a
+second unread file one hop later. `serve` instead prints one stderr line
+naming the dropped message and marks it `done` without answering — with or
+without `--registry`.
+
+`--reply-to` and `--registry` are independent of the [ring
+driver](#non-goals-v1) above: they compose two long-lived `serve` daemons into
+a two-way conversation without a driver process in between, while
+`converse-ring` remains the tool for an orchestrated N-party run.
