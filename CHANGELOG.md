@@ -10,6 +10,11 @@ versioning.
 
 _Generated from release tags with `bash scripts/release.sh generate-changelog`._
 
+## v0.13.0 (2026-09-16)
+
+### Features
+- feat(cli): add global --pretty flag for human-friendly JSON output (#370) (#371)
+
 ## v0.12.0 … v0.9.4 (2026-09-15)
 
 ### Features
