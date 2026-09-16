@@ -1417,7 +1417,7 @@ fn drain_mailbox(
         let Some(claimed) = mailbox.claim_next()? else {
             return Ok(Drain::Drained(processed));
         };
-        let mut response = execute_exchange(participant, sink, meta, &claimed.request);
+        let response = execute_exchange(participant, sink, meta, &claimed.request);
         // Record the per-role seat session (#82) when serving with a `--role`. A
         // recording failure is observability, not the reply — downgrade it to a
         // warning rather than abort the drain, matching [`emit`].
@@ -1445,7 +1445,7 @@ fn drain_mailbox(
         }
         if !try_route_reply(
             &claimed.request,
-            &mut response,
+            &response,
             &claimed.key,
             registry,
             own_inbox,
@@ -1475,7 +1475,7 @@ fn drain_mailbox(
 /// also falls through, after a warning — never aborts the drain.
 fn try_route_reply(
     request: &MessageEnvelope,
-    response: &mut MessageEnvelope,
+    response: &MessageEnvelope,
     request_key: &str,
     registry: Option<&Registry>,
     own_inbox: &Path,
@@ -1503,10 +1503,14 @@ fn try_route_reply(
     if !mailbox::is_safe_key(&routed_id) {
         return false;
     }
-    response.message_id = routed_id;
-    match mailbox::deliver_to(&target.inbox, response) {
+    // Mutate a clone, never the caller's `response`: a failed `deliver_to`
+    // below falls through to the caller's unchanged `deliver_response` write
+    // (#362 AC7), which must see the original, unrouted envelope.
+    let mut routed = response.clone();
+    routed.message_id = routed_id;
+    match mailbox::deliver_to(&target.inbox, &routed) {
         Ok(_) => {
-            emit(sink, &ExchangeEvent::message_sent(now_ms(), response));
+            emit(sink, &ExchangeEvent::message_sent(now_ms(), &routed));
             true
         }
         Err(err) => {
@@ -7732,7 +7736,7 @@ mod tests {
             .expect("deliver");
         let registry = routing_registry("happy", "bob", &peer_inbox);
         let participant = crate::participant::testing::ScriptedParticipant::new(["four"]);
-        let mut sink = NoopSink;
+        let mut sink = RecordingSink::new();
 
         let drained = drain_mailbox(
             &mailbox,
@@ -7755,6 +7759,15 @@ mod tests {
             json_files(&peer_inbox.join("pending")),
             vec!["reply-alice-m-req-1.json".to_string()],
             "routed reply lands in the peer's pending/ keyed by role+request id"
+        );
+        // AC8: a routed delivery emits the same `MessageSent` event `send`
+        // itself would emit.
+        assert!(
+            sink.events
+                .iter()
+                .any(|event| matches!(event, ExchangeEvent::MessageSent { .. })),
+            "routed delivery should emit MessageSent, got: {:?}",
+            sink.events
         );
     }
 
@@ -7904,6 +7917,73 @@ mod tests {
             assert_eq!(json_files(&outbox), vec!["m-req-1.json".to_string()]);
             assert!(json_files(&inbox.join("pending")).is_empty());
         }
+    }
+
+    /// A `deliver_to` failure at routing time falls back to the *unchanged*
+    /// outbox write — byte-identical to what an unrouted daemon would have
+    /// written, not a write carrying the routed `message_id` `try_route_reply`
+    /// derived before the push failed (#362 AC7).
+    #[test]
+    fn drain_mailbox_falls_back_unchanged_when_deliver_to_fails() {
+        let root = TempRoot::new("route-deliver-fail");
+        let mut sink = NoopSink;
+
+        // Control: the identical request, answered with no registry at all, to
+        // capture the golden (never-routed) reply byte-for-byte.
+        let control_inbox = root.path.join("control-inbox");
+        let control_outbox = root.path.join("control-outbox");
+        let control_mailbox = Mailbox::open(&control_inbox).expect("open control mailbox");
+        control_mailbox
+            .deliver(&request_envelope())
+            .expect("deliver");
+        drain_mailbox(
+            &control_mailbox,
+            &control_outbox,
+            &crate::participant::testing::ScriptedParticipant::new(["four"]),
+            &mut sink,
+            &test_meta(),
+            None,
+            None,
+            &control_inbox,
+            None,
+        )
+        .expect("control drain");
+        let golden = std::fs::read_to_string(control_outbox.join("m-req-1.json"))
+            .expect("read golden reply");
+
+        // A registry entry whose inbox cannot be created: a regular file sits
+        // where a directory component is needed, so `deliver_to`'s
+        // `create_dir_all` fails.
+        let blocker = root.path.join("blocker-file");
+        std::fs::write(&blocker, b"not a directory").expect("create blocking file");
+        let broken_target = blocker.join("inbox");
+        let registry = routing_registry("deliver-fail", "bob", &broken_target);
+
+        let inbox = root.path.join("inbox");
+        let outbox = root.path.join("outbox");
+        let mailbox = Mailbox::open(&inbox).expect("open mailbox");
+        mailbox
+            .deliver(&routed_request_envelope("bob"))
+            .expect("deliver");
+        drain_mailbox(
+            &mailbox,
+            &outbox,
+            &crate::participant::testing::ScriptedParticipant::new(["four"]),
+            &mut sink,
+            &test_meta(),
+            None,
+            Some(&registry),
+            &inbox,
+            Some("alice"),
+        )
+        .expect("drain");
+
+        let fallback =
+            std::fs::read_to_string(outbox.join("m-req-1.json")).expect("read fallback reply");
+        assert_eq!(
+            fallback, golden,
+            "a failed routed push must fall back to the byte-identical unrouted reply"
+        );
     }
 
     /// The derived routed id is `reply-<role>-<request-id>`; a role containing a

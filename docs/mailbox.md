@@ -457,6 +457,11 @@ polling it — for a headless peer (itself a `serve` daemon with no `--await`
 client) that file simply sits there unread. `--reply-to` closes that gap: it
 turns the reply into a normal inbound turn on the peer's own mailbox instead.
 
+| Envelope field  | Type                         | Meaning                                                                                                   |
+|-----------------|------------------------------|-------------------------------------------------------------------------------------------------------------|
+| `reply_to`      | string, omitted when absent | Set by `send --reply-to <name>` on a **request**: the mailbox name the answering `serve --registry --role` daemon should route its reply into, instead of leaving it in `--outbox`. Omitted (not `null`) when unset, so an envelope written before this field existed decodes unchanged. |
+| `in_reply_to`   | string \| null               | Set by `serve` on a **reply**: the `message_id` of the request it answers, always present (`null` when there is none), used for outbox keying and correlation — unrelated to `reply_to`'s routing intent. |
+
 1. The sender passes `send --body ... --reply-to <name>`, stamping `reply_to:
    "<name>"` on the request envelope (`baton.message/v1`; omitted from the
    JSON when unset, so an older envelope or an older `serve` decoding a new

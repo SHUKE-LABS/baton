@@ -3025,6 +3025,7 @@ mod imp {
             agent.agent_output = Some("json".to_string());
             agent.agent_result_key = Some("result".to_string());
             agent.role = Some("alice".to_string());
+            agent.registry = Some("/tmp/registry.json".to_string());
             assert_eq!(
                 serve_argv(&agent),
                 vec![
@@ -3045,6 +3046,8 @@ mod imp {
                     "result",
                     "--role",
                     "alice",
+                    "--registry",
+                    "/tmp/registry.json",
                 ]
             );
         }
