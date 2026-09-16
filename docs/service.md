@@ -96,7 +96,7 @@ baton service run [--control <dir>] [--task-retention <duration>]
 baton service start [--control <dir>] --inbox <dir> --outbox <dir> [--poll-ms <n>]
                     [--agent-cmd <program> [--agent-arg <arg>]... [--agent-cwd <dir>]
                      [--agent-timeout-ms <n>] [--agent-output raw|json [--agent-result-key <key>]]]
-                    [--role <name>]
+                    [--role <name>] [--registry <path>]
 baton service status [--control <dir>] [--session <id>]
 baton service stop [--control <dir>] --session <id> [--force]
 baton service teardown [--control <dir>] [--force]
@@ -115,15 +115,18 @@ baton service teardown [--control <dir>] [--force]
   usage error if given as `0` — the window must be strictly positive. Omitted,
   it defaults to 24 hours.
 - **`service start`** accepts the session-shaping subset of `baton serve`'s
-  flags shown in the synopsis above (`--poll-ms`, `--agent-*`, and `--role`),
-  alongside its required `--inbox` and `--outbox` options. The optional
-  `--control` selects an explicit control directory; when omitted, the shared
-  per-user default described above is used. The
+  flags shown in the synopsis above (`--poll-ms`, `--agent-*`, `--role`, and
+  `--registry`), alongside its required `--inbox` and `--outbox` options. The
+  optional `--control` selects an explicit control directory; when omitted,
+  the shared per-user default described above is used. The
   session-shaping flags become the session's `SessionSpec`, reconstructed into
   an equivalent `baton serve` argv by `run` — including
   `--agent-timeout-ms 0`, the explicit no-deadline external-agent mode (the
   turn runs until the agent finishes; `service stop` / `service teardown`
-  still terminate the in-flight turn's whole process tree). Direct
+  still terminate the in-flight turn's whole process tree). `--registry`
+  (see [Mailbox § Routing a reply into the sender's
+  inbox](mailbox.md#routing-a-reply-into-the-senders-inbox-send---reply-to--serve---registry))
+  requires `--role`, exactly as for direct `baton serve`. Direct
   `baton serve` lifecycle flags such as `--once` and `--stop` are not accepted;
   service-managed lifecycle is handled by `service run`, `service stop`, and
   `service teardown`.
@@ -131,11 +134,11 @@ baton service teardown [--control <dir>] [--force]
   child and persisted its record — it never waits on a served turn.
   Fails fast, with a clear error, if no `service run`
   is currently live on `--control`, rather than hanging on a request no one
-  will ever answer. Relative `--inbox`, `--outbox`, and `--agent-cwd` values
-  are resolved against the submitting client's current working directory and
-  persisted as absolute paths before the request is sent; resolution is
-  lexical and does not canonicalize or require the target to exist at
-  submission time. Absolute values are preserved unchanged. An admission
+  will ever answer. Relative `--inbox`, `--outbox`, `--agent-cwd`, and
+  `--registry` values are resolved against the submitting client's current
+  working directory and persisted as absolute paths before the request is
+  sent; resolution is lexical and does not canonicalize or require the target
+  to exist at submission time. Absolute values are preserved unchanged. An admission
   failure `run` can name once it has claimed the request — the `baton serve`
   child could not be spawned or corroborated, or its session record could not
   be written — comes back as an `error` response, so the client exits non-zero

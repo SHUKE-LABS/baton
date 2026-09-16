@@ -1013,6 +1013,10 @@ pub(super) fn serve_argv(spec: &SessionSpec) -> Vec<String> {
         argv.push("--role".to_string());
         argv.push(role.clone());
     }
+    if let Some(registry) = &spec.registry {
+        argv.push("--registry".to_string());
+        argv.push(registry.clone());
+    }
     argv
 }
 

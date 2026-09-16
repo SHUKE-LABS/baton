@@ -125,6 +125,13 @@ pub struct MessageEnvelope {
     pub ts_ms: u64,
     /// The provider call this message wrapped, if any (zero-or-one).
     pub exchange: Option<WrappedExchange>,
+    /// The routing name (`send --reply-to <name>`) the sender wants its reply
+    /// delivered to as an inbound turn, instead of left in the outbox. `None`
+    /// (the default, and omitted from serialized JSON) preserves today's
+    /// outbox-only behavior. `#[serde(default)]` so an envelope file written
+    /// before this field existed still parses.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reply_to: Option<String>,
 }
 
 impl MessageEnvelope {
@@ -151,6 +158,7 @@ impl MessageEnvelope {
             body: body.into(),
             ts_ms,
             exchange: None,
+            reply_to: None,
         }
     }
 }
@@ -219,6 +227,50 @@ mod tests {
             serde_json::from_str(&serde_json::to_string(&some).unwrap()).unwrap();
         assert_eq!(some, back);
         assert_eq!(back.in_reply_to.as_deref(), Some("m-0"));
+    }
+
+    /// `reply_to` is omitted from the wire form when absent, present and
+    /// round-trips when set, and a pre-existing envelope written before this
+    /// field existed (no `reply_to` key at all) still parses to `None`.
+    #[test]
+    fn reply_to_is_omitted_when_absent_and_round_trips_when_present() {
+        let none = base();
+        assert_eq!(none.reply_to, None);
+        let json = serde_json::to_string(&none).expect("serializes");
+        let value: Value = serde_json::from_str(&json).expect("json");
+        assert!(
+            value.get("reply_to").is_none(),
+            "reply_to should be omitted when None, got: {json}"
+        );
+        let back: MessageEnvelope = serde_json::from_str(&json).expect("parses");
+        assert_eq!(none, back);
+
+        let mut some = base();
+        some.reply_to = Some("bob".to_string());
+        let json = serde_json::to_string(&some).expect("serializes");
+        let value: Value = serde_json::from_str(&json).expect("json");
+        assert_eq!(value["reply_to"], "bob");
+        let back: MessageEnvelope = serde_json::from_str(&json).expect("parses");
+        assert_eq!(some, back);
+    }
+
+    /// A `baton.message/v1` envelope written before `reply_to` existed lacks
+    /// the key entirely — `#[serde(default)]` must still parse it, not error.
+    #[test]
+    fn parses_a_legacy_envelope_missing_the_reply_to_key() {
+        let legacy = r#"{
+            "schema": "baton.message/v1",
+            "message_id": "m-1",
+            "conversation_id": "c-1",
+            "from": "agent-a",
+            "to": "agent-b",
+            "in_reply_to": null,
+            "kind": "request",
+            "body": "hello",
+            "ts_ms": 1700000000000
+        }"#;
+        let parsed: MessageEnvelope = serde_json::from_str(legacy).expect("parses");
+        assert_eq!(parsed.reply_to, None);
     }
 
     /// Every `kind` variant round-trips and carries its snake_case wire value.
