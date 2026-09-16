@@ -399,7 +399,8 @@ enum SendSource {
 /// on stderr with a non-zero exit code.
 pub fn run() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    match parse_args(&args)? {
+    let Invocation { command, pretty } = parse_invocation(&args)?;
+    match command {
         Command::Help => {
             let stdout = std::io::stdout();
             execute_help(stdout.lock())
@@ -507,7 +508,7 @@ pub fn run() -> Result<()> {
             // completed exchange.
             let request = read_request_envelope(open_input(in_path.as_deref())?)?;
             let response = execute_exchange(&participant, sink.as_mut(), &meta, &request);
-            write_response_envelope(&response, open_output(out_path.as_deref())?)
+            write_response_envelope(&response, pretty, open_output(out_path.as_deref())?)
         }
         #[cfg(not(feature = "local"))]
         Command::Exchange { .. } => Err(local_feature_required("exchange", "leg exchange")),
@@ -837,6 +838,7 @@ pub fn run() -> Result<()> {
                 Duration::from_millis(timeout_ms),
                 Duration::from_millis(SEND_POLL_INTERVAL_MS),
                 sink.as_mut(),
+                pretty,
                 stdout.lock(),
             )
         }
@@ -870,7 +872,7 @@ pub fn run() -> Result<()> {
             };
             let status = mailbox::status(&root, Duration::from_millis(threshold_ms))?;
             let stdout = std::io::stdout();
-            execute_status(&status, threshold_ms, stdout.lock())
+            execute_status(&status, threshold_ms, pretty, stdout.lock())
         }
         Command::MailboxPrune {
             mailbox,
@@ -889,6 +891,7 @@ pub fn run() -> Result<()> {
                 outbox_removed,
                 older_than_ms,
                 outbox.is_some(),
+                pretty,
                 stdout.lock(),
             )
         }
@@ -943,11 +946,11 @@ pub fn run() -> Result<()> {
         }
         Command::Service(cmd) => {
             let stdout = std::io::stdout();
-            service::execute_service(cmd, stdout.lock())
+            service::execute_service(cmd, pretty, stdout.lock())
         }
         Command::Task(cmd) => {
             let stdout = std::io::stdout();
-            service::execute_task(cmd, stdout.lock())
+            service::execute_task(cmd, pretty, stdout.lock())
         }
     }
 }
@@ -960,6 +963,11 @@ fn execute_help(mut out: impl Write) -> Result<()> {
     writeln!(out, "Global options:").map_err(io_err)?;
     writeln!(out, "  -h, --help     Print help and exit.").map_err(io_err)?;
     writeln!(out, "  -V, --version  Print version and exit.").map_err(io_err)?;
+    writeln!(
+        out,
+        "  --pretty       Render user-facing JSON output multi-line indented (2-space) instead of one minified line."
+    )
+    .map_err(io_err)?;
     writeln!(
         out,
         "  service/task --control defaults to BATON_HOME/service or HOME/.baton/service (USERPROFILE on Windows); use --control for an isolated control plane."
@@ -1426,6 +1434,7 @@ fn execute_send(
     timeout: Duration,
     poll_interval: Duration,
     sink: &mut dyn EventSink,
+    pretty: bool,
     mut out: impl Write,
 ) -> Result<()> {
     mailbox::deliver_to(inbox, envelope)?;
@@ -1448,7 +1457,23 @@ fn execute_send(
     }
 
     emit(sink, &ExchangeEvent::reply_consumed(now_ms(), &reply));
-    write_response_envelope(&reply, out)
+    write_response_envelope(&reply, pretty, out)
+}
+
+/// Serializes one user-facing JSON value: minified by default, multi-line
+/// 2-space-indented under `--pretty`. The single formatting seam for every
+/// consumer-facing JSON output, so the two forms can never drift apart.
+pub(crate) fn to_user_json<T: serde::Serialize>(
+    value: &T,
+    pretty: bool,
+    what: &str,
+) -> Result<String> {
+    let result = if pretty {
+        serde_json::to_string_pretty(value)
+    } else {
+        serde_json::to_string(value)
+    };
+    result.map_err(|err| BatonError::Io(format!("could not serialize {what}: {err}")))
 }
 
 /// Writes a mailbox `status` snapshot as one JSON line to `out`.
@@ -1460,7 +1485,12 @@ fn execute_send(
 /// and used for `overdue`, `daemon` whether a live serve holds the lock, and
 /// `overdue` whether the oldest claim has run past `max_runtime_ms`.
 /// Parameterised over [`Write`] so it is unit-testable with an in-memory buffer.
-fn execute_status(status: &MailboxStatus, max_runtime_ms: u64, mut out: impl Write) -> Result<()> {
+fn execute_status(
+    status: &MailboxStatus,
+    max_runtime_ms: u64,
+    pretty: bool,
+    mut out: impl Write,
+) -> Result<()> {
     let state = match status.state {
         MailboxState::IdleDone => "idle-done",
         MailboxState::Busy => "busy",
@@ -1470,17 +1500,29 @@ fn execute_status(status: &MailboxStatus, max_runtime_ms: u64, mut out: impl Wri
         MailboxDaemon::Live => "live",
         MailboxDaemon::Absent => "absent",
     };
-    let claim_age = match status.claim_age_ms {
-        Some(ms) => ms.to_string(),
-        None => "null".to_string(),
+    let report = MailboxStatusReport {
+        state,
+        queue_depth: status.queue_depth,
+        claim_age_ms: status.claim_age_ms,
+        max_runtime_ms,
+        daemon,
+        overdue: status.overdue,
     };
-    let overdue = if status.overdue { "true" } else { "false" };
-    writeln!(
-        out,
-        "{{\"state\":\"{state}\",\"queue_depth\":{},\"claim_age_ms\":{claim_age},\"max_runtime_ms\":{max_runtime_ms},\"daemon\":\"{daemon}\",\"overdue\":{overdue}}}",
-        status.queue_depth
-    )
-    .map_err(io_err)
+    let json = to_user_json(&report, pretty, "mailbox status")?;
+    writeln!(out, "{json}").map_err(io_err)
+}
+
+/// The serde form of the mailbox `status` line. Field order is the wire
+/// contract — the compact form must stay byte-identical to the pre-`--pretty`
+/// hand-rolled output.
+#[derive(serde::Serialize)]
+struct MailboxStatusReport<'a> {
+    state: &'a str,
+    queue_depth: usize,
+    claim_age_ms: Option<u64>,
+    max_runtime_ms: u64,
+    daemon: &'a str,
+    overdue: bool,
 }
 
 /// Renders one `baton mailbox prune` result as a single JSON line: how many
@@ -1494,21 +1536,29 @@ fn execute_mailbox_prune(
     outbox_removed: usize,
     older_than_ms: u64,
     with_outbox: bool,
+    pretty: bool,
     mut out: impl Write,
 ) -> Result<()> {
-    if with_outbox {
-        writeln!(
-            out,
-            "{{\"removed\":{removed},\"outbox_removed\":{outbox_removed},\"older_than_ms\":{older_than_ms}}}"
-        )
-        .map_err(io_err)
-    } else {
-        writeln!(
-            out,
-            "{{\"removed\":{removed},\"older_than_ms\":{older_than_ms}}}"
-        )
-        .map_err(io_err)
-    }
+    let report = MailboxPruneReport {
+        removed,
+        // Only reported with `--outbox`: absent from the wire otherwise, so the
+        // two-field line stays byte-identical to the pre-`--outbox` contract.
+        outbox_removed: with_outbox.then_some(outbox_removed),
+        older_than_ms,
+    };
+    let json = to_user_json(&report, pretty, "mailbox prune result")?;
+    writeln!(out, "{json}").map_err(io_err)
+}
+
+/// The serde form of the `baton mailbox prune` line. Field order is the wire
+/// contract — the compact forms must stay byte-identical to the pre-`--pretty`
+/// hand-rolled output, both with and without `--outbox`.
+#[derive(serde::Serialize)]
+struct MailboxPruneReport {
+    removed: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    outbox_removed: Option<usize>,
+    older_than_ms: u64,
 }
 
 /// Polls `outbox` for the reply keyed by `key`, claiming it atomically, until it
@@ -1614,9 +1664,12 @@ fn read_request_envelope(input: impl Read) -> Result<MessageEnvelope> {
 }
 
 /// Writes `envelope` as one JSON line to `output`.
-fn write_response_envelope(envelope: &MessageEnvelope, mut output: impl Write) -> Result<()> {
-    let line = serde_json::to_string(envelope)
-        .map_err(|err| BatonError::Io(format!("could not serialize response envelope: {err}")))?;
+fn write_response_envelope(
+    envelope: &MessageEnvelope,
+    pretty: bool,
+    mut output: impl Write,
+) -> Result<()> {
+    let line = to_user_json(envelope, pretty, "response envelope")?;
     writeln!(output, "{line}").map_err(io_err)
 }
 
@@ -2272,6 +2325,43 @@ fn open_append_sink(path: &str) -> Result<Box<dyn EventSink>> {
         .open(path)
         .map_err(|err| BatonError::Io(format!("failed to open --resume file {path:?}: {err}")))?;
     Ok(Box::new(WriterSink::new(file)))
+}
+
+/// One parsed invocation: the resolved [`Command`] plus the global output
+/// flags accepted on either side of the subcommand token.
+#[derive(Debug)]
+struct Invocation {
+    command: Command,
+    /// `--pretty` was given: user-facing JSON renders multi-line indented
+    /// instead of one minified line. Machine consumers omit the flag and see
+    /// the unchanged compact contract.
+    pretty: bool,
+}
+
+/// Parses CLI arguments (already stripped of the binary name) into an
+/// [`Invocation`], extracting the global `--pretty` flag.
+///
+/// Token ownership: every argv token exactly equal to `--pretty` is stripped
+/// here, before subcommand dispatch, and each occurrence sets the same
+/// boolean — repeated or mixed before/after-subcommand occurrences collapse
+/// idempotently, and subparsers never see the token. The value form
+/// `--pretty=<x>` is deliberately not matched: it falls through to the
+/// subcommand parser and is rejected there as an unexpected argument, since
+/// the flag takes no value.
+fn parse_invocation(args: &[String]) -> Result<Invocation> {
+    let mut pretty = false;
+    let mut command_args = Vec::with_capacity(args.len());
+    for arg in args {
+        if arg == "--pretty" {
+            pretty = true;
+        } else {
+            command_args.push(arg.clone());
+        }
+    }
+    Ok(Invocation {
+        command: parse_args(&command_args)?,
+        pretty,
+    })
 }
 
 /// Parses CLI arguments (already stripped of the binary name) into a [`Command`].
@@ -5833,7 +5923,7 @@ mod tests {
         );
 
         let mut buf: Vec<u8> = Vec::new();
-        write_response_envelope(&response, &mut buf).expect("writes");
+        write_response_envelope(&response, false, &mut buf).expect("writes");
         // Exactly one JSON line.
         let text = String::from_utf8(buf).expect("utf8");
         assert_eq!(text.lines().count(), 1, "one envelope, one line");
@@ -7738,7 +7828,7 @@ mod tests {
     #[test]
     fn execute_mailbox_prune_renders_one_json_line() {
         let mut out = Vec::new();
-        execute_mailbox_prune(12, 0, 604_800_000, false, &mut out).expect("render");
+        execute_mailbox_prune(12, 0, 604_800_000, false, false, &mut out).expect("render");
         assert_eq!(
             String::from_utf8(out).unwrap(),
             "{\"removed\":12,\"older_than_ms\":604800000}\n"
@@ -7746,7 +7836,7 @@ mod tests {
 
         // Nothing pruned still reports the window it was measured against.
         let mut out = Vec::new();
-        execute_mailbox_prune(0, 0, 900_000, false, &mut out).expect("render");
+        execute_mailbox_prune(0, 0, 900_000, false, false, &mut out).expect("render");
         assert_eq!(
             String::from_utf8(out).unwrap(),
             "{\"removed\":0,\"older_than_ms\":900000}\n"
@@ -7755,7 +7845,7 @@ mod tests {
         // With an outbox, the same window additionally reports the replies it
         // removed — the three-field contract.
         let mut out = Vec::new();
-        execute_mailbox_prune(2, 7, 604_800_000, true, &mut out).expect("render");
+        execute_mailbox_prune(2, 7, 604_800_000, true, false, &mut out).expect("render");
         assert_eq!(
             String::from_utf8(out).unwrap(),
             "{\"removed\":2,\"outbox_removed\":7,\"older_than_ms\":604800000}\n"
@@ -7772,7 +7862,7 @@ mod tests {
             daemon: MailboxDaemon::Live,
         };
         let mut out = Vec::new();
-        execute_status(&busy, 900_000, &mut out).expect("render");
+        execute_status(&busy, 900_000, false, &mut out).expect("render");
         assert_eq!(
             String::from_utf8(out).unwrap(),
             "{\"state\":\"busy\",\"queue_depth\":3,\"claim_age_ms\":4200,\"max_runtime_ms\":900000,\"daemon\":\"live\",\"overdue\":false}\n"
@@ -7786,7 +7876,7 @@ mod tests {
             daemon: MailboxDaemon::Absent,
         };
         let mut out = Vec::new();
-        execute_status(&idle, 900_000, &mut out).expect("render");
+        execute_status(&idle, 900_000, false, &mut out).expect("render");
         assert_eq!(
             String::from_utf8(out).unwrap(),
             "{\"state\":\"idle-done\",\"queue_depth\":0,\"claim_age_ms\":null,\"max_runtime_ms\":900000,\"daemon\":\"absent\",\"overdue\":false}\n"
@@ -7800,7 +7890,7 @@ mod tests {
             daemon: MailboxDaemon::Absent,
         };
         let mut out = Vec::new();
-        execute_status(&stale, 60_000, &mut out).expect("render");
+        execute_status(&stale, 60_000, false, &mut out).expect("render");
         assert_eq!(
             String::from_utf8(out).unwrap(),
             "{\"state\":\"crashed-stale\",\"queue_depth\":1,\"claim_age_ms\":999999,\"max_runtime_ms\":60000,\"daemon\":\"absent\",\"overdue\":true}\n"
@@ -7816,7 +7906,7 @@ mod tests {
             daemon: MailboxDaemon::Live,
         };
         let mut out = Vec::new();
-        execute_status(&overdue_live, 900_000, &mut out).expect("render");
+        execute_status(&overdue_live, 900_000, false, &mut out).expect("render");
         assert_eq!(
             String::from_utf8(out).unwrap(),
             "{\"state\":\"busy\",\"queue_depth\":0,\"claim_age_ms\":900001,\"max_runtime_ms\":900000,\"daemon\":\"live\",\"overdue\":true}\n"
@@ -7879,6 +7969,7 @@ mod tests {
             Duration::from_millis(0),
             Duration::from_millis(1),
             &mut sink,
+            false,
             &mut out,
         )
         .expect("delivers");
@@ -7910,6 +8001,7 @@ mod tests {
             Duration::from_millis(500),
             Duration::from_millis(1),
             &mut sink,
+            false,
             &mut out,
         )
         .expect("consumes reply");
@@ -7948,6 +8040,7 @@ mod tests {
             Duration::from_millis(500),
             Duration::from_millis(1),
             &mut sink,
+            false,
             &mut out,
         )
         .expect_err("mismatch is a hard error");
@@ -7980,6 +8073,7 @@ mod tests {
             Duration::from_millis(10),
             Duration::from_millis(2),
             &mut sink,
+            false,
             &mut out,
         )
         .expect_err("times out with no reply");
@@ -8331,5 +8425,151 @@ mod tests {
         }
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn parses_pretty_flag_before_after_and_repeated() {
+        // After the subcommand token.
+        let inv = parse_invocation(&argv(&["status", "--mailbox", "/tmp/mb", "--pretty"]))
+            .expect("parses after subcommand");
+        assert!(inv.pretty);
+        assert_eq!(
+            inv.command,
+            Command::Status {
+                mailbox: Some("/tmp/mb".to_string()),
+                registry: None,
+                role: None,
+                max_runtime_ms: None,
+            }
+        );
+
+        // Before the subcommand token.
+        let inv = parse_invocation(&argv(&["--pretty", "status", "--mailbox", "/tmp/mb"]))
+            .expect("parses before subcommand");
+        assert!(inv.pretty);
+
+        // Repeated / mixed occurrences collapse idempotently.
+        let inv = parse_invocation(&argv(&[
+            "--pretty",
+            "status",
+            "--pretty",
+            "--mailbox",
+            "/tmp/mb",
+        ]))
+        .expect("parses repeated");
+        assert!(inv.pretty);
+
+        // Absent flag: the minified default.
+        let inv = parse_invocation(&argv(&["status", "--mailbox", "/tmp/mb"])).expect("parses");
+        assert!(!inv.pretty);
+
+        // The value form is not the global: the subcommand parser rejects it.
+        assert!(
+            matches!(
+                parse_invocation(&argv(&["status", "--mailbox", "/tmp/mb", "--pretty=x"]))
+                    .unwrap_err(),
+                BatonError::Usage(_)
+            ),
+            "the value form is a subcommand-level unexpected argument"
+        );
+    }
+
+    #[test]
+    fn execute_status_pretty_round_trips_the_compact_form() {
+        let status = MailboxStatus {
+            state: MailboxState::Busy,
+            queue_depth: 3,
+            claim_age_ms: Some(4200),
+            overdue: false,
+            daemon: MailboxDaemon::Live,
+        };
+
+        let mut plain = Vec::new();
+        execute_status(&status, 900_000, false, &mut plain).expect("render");
+        let mut pretty = Vec::new();
+        execute_status(&status, 900_000, true, &mut pretty).expect("render");
+
+        let plain_text = String::from_utf8(plain).unwrap();
+        let pretty_text = String::from_utf8(pretty).unwrap();
+        assert!(pretty_text.trim().contains('\n'), "pretty is multi-line");
+        let plain_json: serde_json::Value =
+            serde_json::from_str(plain_text.trim()).expect("plain is JSON");
+        let pretty_json: serde_json::Value =
+            serde_json::from_str(pretty_text.trim()).expect("pretty is JSON");
+        assert_eq!(plain_json, pretty_json);
+    }
+
+    #[test]
+    fn execute_mailbox_prune_pretty_round_trips_both_shapes() {
+        for (removed, outbox_removed, with_outbox) in [(12usize, 0usize, false), (2, 7, true)] {
+            let mut plain = Vec::new();
+            execute_mailbox_prune(
+                removed,
+                outbox_removed,
+                604_800_000,
+                with_outbox,
+                false,
+                &mut plain,
+            )
+            .expect("render");
+            let mut pretty = Vec::new();
+            execute_mailbox_prune(
+                removed,
+                outbox_removed,
+                604_800_000,
+                with_outbox,
+                true,
+                &mut pretty,
+            )
+            .expect("render");
+
+            let plain_text = String::from_utf8(plain).unwrap();
+            let pretty_text = String::from_utf8(pretty).unwrap();
+            assert!(pretty_text.trim().contains('\n'), "pretty is multi-line");
+            let plain_json: serde_json::Value =
+                serde_json::from_str(plain_text.trim()).expect("plain is JSON");
+            let pretty_json: serde_json::Value =
+                serde_json::from_str(pretty_text.trim()).expect("pretty is JSON");
+            assert_eq!(plain_json, pretty_json);
+            // The outbox shape carries the third key; the plain shape omits it.
+            assert_eq!(plain_json["outbox_removed"].is_null(), !with_outbox);
+        }
+    }
+
+    #[test]
+    fn write_response_envelope_pretty_round_trips_fixed_envelope() {
+        let envelope = MessageEnvelope::new(
+            "m-fixed",
+            "conv-fixed",
+            "agent-a",
+            "agent-b",
+            MessageKind::Response,
+            "pong",
+            1_700_000_000_000,
+        );
+
+        let mut plain = Vec::new();
+        write_response_envelope(&envelope, false, &mut plain).expect("writes");
+        let mut pretty = Vec::new();
+        write_response_envelope(&envelope, true, &mut pretty).expect("writes");
+
+        let plain_text = String::from_utf8(plain).unwrap();
+        let pretty_text = String::from_utf8(pretty).unwrap();
+        assert!(pretty_text.trim().contains('\n'), "pretty is multi-line");
+        let plain_json: serde_json::Value =
+            serde_json::from_str(plain_text.trim()).expect("plain is JSON");
+        let pretty_json: serde_json::Value =
+            serde_json::from_str(pretty_text.trim()).expect("pretty is JSON");
+        assert_eq!(plain_json, pretty_json);
+        assert_eq!(pretty_json["in_reply_to"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn help_documents_pretty_under_global_options() {
+        let mut out = Vec::new();
+        execute_help(&mut out).expect("help renders");
+        let text = String::from_utf8(out).unwrap();
+        let globals = text.split("Global options:").nth(1).expect("globals block");
+        assert!(globals.contains("--pretty"), "help documents --pretty");
     }
 }

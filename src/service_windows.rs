@@ -521,7 +521,7 @@ impl ServicePlatform for WindowsServicePlatform {
 }
 
 /// Dispatches one parsed [`ServiceCommand`].
-pub(super) fn dispatch(cmd: ServiceCommand, mut out: impl Write) -> Result<()> {
+pub(super) fn dispatch(cmd: ServiceCommand, pretty: bool, mut out: impl Write) -> Result<()> {
     match cmd {
         ServiceCommand::Run {
             control,
@@ -539,7 +539,7 @@ pub(super) fn dispatch(cmd: ServiceCommand, mut out: impl Write) -> Result<()> {
         }
         ServiceCommand::Status { control, session } => {
             let control = crate::roles::resolve_control_dir(control)?;
-            execute_status(&control, session.as_deref(), out)
+            execute_status(&control, session.as_deref(), pretty, out)
         }
         ServiceCommand::Stop {
             control,
@@ -557,7 +557,7 @@ pub(super) fn dispatch(cmd: ServiceCommand, mut out: impl Write) -> Result<()> {
 }
 
 /// Dispatches one parsed [`TaskCommand`].
-pub(super) fn dispatch_task(cmd: TaskCommand, mut out: impl Write) -> Result<()> {
+pub(super) fn dispatch_task(cmd: TaskCommand, pretty: bool, mut out: impl Write) -> Result<()> {
     match cmd {
         TaskCommand::Start { control, spec } => {
             let control = crate::roles::resolve_control_dir(control)?;
@@ -566,7 +566,7 @@ pub(super) fn dispatch_task(cmd: TaskCommand, mut out: impl Write) -> Result<()>
         }
         TaskCommand::Status { control, task } => {
             let control = crate::roles::resolve_control_dir(control)?;
-            execute_task_status::<WindowsServicePlatform>(&control, task.as_deref(), out)
+            execute_task_status::<WindowsServicePlatform>(&control, task.as_deref(), pretty, out)
         }
         TaskCommand::Cancel { control, task } => {
             let control = crate::roles::resolve_control_dir(control)?;
@@ -2193,7 +2193,7 @@ mod tests {
     fn task_status_reports_nothing_for_a_reaped_task() {
         let control = temp_control("status-reaped");
         let mut out = Vec::new();
-        execute_task_status::<WindowsServicePlatform>(&control, Some("task-gone"), &mut out)
+        execute_task_status::<WindowsServicePlatform>(&control, Some("task-gone"), false, &mut out)
             .expect("status for missing task");
         let json: serde_json::Value = serde_json::from_slice(&out).expect("json");
         assert_eq!(json["tasks"].as_array().unwrap().len(), 0);

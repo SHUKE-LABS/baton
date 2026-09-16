@@ -172,8 +172,8 @@ pub enum ServiceCommand {
 
 /// Runs `cmd` to completion, writing any human-readable output to `out`.
 #[cfg(any(unix, windows))]
-pub fn execute_service(cmd: ServiceCommand, out: impl Write) -> Result<()> {
-    imp::dispatch(cmd, out)
+pub fn execute_service(cmd: ServiceCommand, pretty: bool, out: impl Write) -> Result<()> {
+    imp::dispatch(cmd, pretty, out)
 }
 
 /// `baton service` has no supported implementation on this host: process
@@ -181,7 +181,7 @@ pub fn execute_service(cmd: ServiceCommand, out: impl Write) -> Result<()> {
 /// no implementation on this host. Fails clearly rather than silently
 /// degrading the ownership guarantee.
 #[cfg(not(any(unix, windows)))]
-pub fn execute_service(cmd: ServiceCommand, _out: impl Write) -> Result<()> {
+pub fn execute_service(cmd: ServiceCommand, _pretty: bool, _out: impl Write) -> Result<()> {
     let _ = cmd;
     Err(BatonError::Io(
         "baton service requires a supported host (Linux, macOS, or Windows)".to_string(),
@@ -197,14 +197,14 @@ pub fn execute_service(cmd: ServiceCommand, _out: impl Write) -> Result<()> {
 /// `Status`/`Stop` do for a [`SessionRecord`](imp), so both keep working even
 /// when `Run` itself is not currently alive.
 #[cfg(any(unix, windows))]
-pub fn execute_task(cmd: TaskCommand, out: impl Write) -> Result<()> {
-    imp::dispatch_task(cmd, out)
+pub fn execute_task(cmd: TaskCommand, pretty: bool, out: impl Write) -> Result<()> {
+    imp::dispatch_task(cmd, pretty, out)
 }
 
 /// `baton task` has no supported implementation on this host; see
 /// [`execute_service`]'s non-Unix stub for why.
 #[cfg(not(any(unix, windows)))]
-pub fn execute_task(cmd: TaskCommand, _out: impl Write) -> Result<()> {
+pub fn execute_task(cmd: TaskCommand, _pretty: bool, _out: impl Write) -> Result<()> {
     let _ = cmd;
     Err(BatonError::Io(
         "baton task requires a supported host (Linux, macOS, or Windows)".to_string(),
@@ -586,7 +586,7 @@ mod imp {
     type TaskTick = task_tick::TaskTick;
 
     /// Dispatches one parsed [`ServiceCommand`].
-    pub(super) fn dispatch(cmd: ServiceCommand, mut out: impl Write) -> Result<()> {
+    pub(super) fn dispatch(cmd: ServiceCommand, pretty: bool, mut out: impl Write) -> Result<()> {
         match cmd {
             ServiceCommand::Run {
                 control,
@@ -604,7 +604,7 @@ mod imp {
             }
             ServiceCommand::Status { control, session } => {
                 let control = crate::roles::resolve_control_dir(control)?;
-                execute_status(&control, session.as_deref(), out)
+                execute_status(&control, session.as_deref(), pretty, out)
             }
             ServiceCommand::Stop {
                 control,
@@ -622,7 +622,7 @@ mod imp {
     }
 
     /// Dispatches one parsed [`TaskCommand`].
-    pub(super) fn dispatch_task(cmd: TaskCommand, mut out: impl Write) -> Result<()> {
+    pub(super) fn dispatch_task(cmd: TaskCommand, pretty: bool, mut out: impl Write) -> Result<()> {
         match cmd {
             TaskCommand::Start { control, spec } => {
                 let control = crate::roles::resolve_control_dir(control)?;
@@ -631,7 +631,7 @@ mod imp {
             }
             TaskCommand::Status { control, task } => {
                 let control = crate::roles::resolve_control_dir(control)?;
-                execute_task_status::<UnixServicePlatform>(&control, task.as_deref(), out)
+                execute_task_status::<UnixServicePlatform>(&control, task.as_deref(), pretty, out)
             }
             TaskCommand::Cancel { control, task } => {
                 let control = crate::roles::resolve_control_dir(control)?;
@@ -3042,7 +3042,7 @@ mod imp {
             let _guard = serialize_forks_and_locks();
             let dir = TempDir::new("status-fresh");
             let mut out = Vec::new();
-            execute_status(&dir.path, None, &mut out).expect("status");
+            execute_status(&dir.path, None, false, &mut out).expect("status");
             let json: serde_json::Value = serde_json::from_slice(&out).expect("json");
             assert_eq!(json["service_running"], false);
             assert_eq!(json["sessions"].as_array().unwrap().len(), 0);
@@ -3068,7 +3068,7 @@ mod imp {
             write_session_record(&dir.path, &record).expect("write");
 
             let mut out = Vec::new();
-            execute_status(&dir.path, None, &mut out).expect("status");
+            execute_status(&dir.path, None, false, &mut out).expect("status");
             let json: serde_json::Value = serde_json::from_slice(&out).expect("json");
             assert_eq!(json["service_running"], true);
             let sessions = json["sessions"].as_array().unwrap();
@@ -3090,7 +3090,7 @@ mod imp {
                 .expect("write stale info");
 
             let mut out = Vec::new();
-            execute_status(&dir.path, None, &mut out).expect("status");
+            execute_status(&dir.path, None, false, &mut out).expect("status");
             let json: serde_json::Value = serde_json::from_slice(&out).expect("json");
             assert_eq!(json["service_running"], false);
             assert!(json.get("daemon").is_none());
@@ -3106,7 +3106,7 @@ mod imp {
             let _held = acquire_control_lock(&dir.path).expect("lock");
 
             let mut out = Vec::new();
-            execute_status(&dir.path, None, &mut out).expect("status");
+            execute_status(&dir.path, None, false, &mut out).expect("status");
             let json: serde_json::Value = serde_json::from_slice(&out).expect("json");
             assert_eq!(json["service_running"], true);
             assert!(json.get("daemon").is_none());
@@ -3124,7 +3124,7 @@ mod imp {
                 .expect("write invalid info");
 
             let mut out = Vec::new();
-            execute_status(&dir.path, None, &mut out).expect("status");
+            execute_status(&dir.path, None, false, &mut out).expect("status");
             let json: serde_json::Value = serde_json::from_slice(&out).expect("json");
             assert_eq!(json["service_running"], true);
             assert!(json.get("daemon").is_none());
@@ -3997,8 +3997,13 @@ mod imp {
             let _guard = serialize_forks_and_locks();
             let dir = TempDir::new("status-reaped");
             let mut out = Vec::new();
-            execute_task_status::<UnixServicePlatform>(&dir.path, Some("task-gone"), &mut out)
-                .expect("status for missing task");
+            execute_task_status::<UnixServicePlatform>(
+                &dir.path,
+                Some("task-gone"),
+                false,
+                &mut out,
+            )
+            .expect("status for missing task");
             let json: serde_json::Value = serde_json::from_slice(&out).expect("json");
             assert_eq!(json["tasks"].as_array().unwrap().len(), 0);
         }
@@ -5167,6 +5172,7 @@ mod imp {
             execute_task_status::<UnixServicePlatform>(
                 &dir.path,
                 Some("task-group-drain"),
+                false,
                 &mut status,
             )
             .expect("status while group remains");
@@ -7369,6 +7375,7 @@ mod imp {
             execute_task_status::<UnixServicePlatform>(
                 &dir.path,
                 Some("task-unresolved"),
+                false,
                 &mut status,
             )
             .expect("status unresolved task");
@@ -7448,7 +7455,8 @@ mod imp {
             write_task_record(&dir.path, &record).expect("write");
 
             let mut out = Vec::new();
-            execute_task_status::<UnixServicePlatform>(&dir.path, None, &mut out).expect("status");
+            execute_task_status::<UnixServicePlatform>(&dir.path, None, false, &mut out)
+                .expect("status");
             let json: serde_json::Value = serde_json::from_slice(&out).expect("json");
             let tasks = json["tasks"].as_array().unwrap();
             assert_eq!(tasks.len(), 1);
