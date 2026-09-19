@@ -10,7 +10,10 @@ versioning.
 
 _Generated from release tags with `bash scripts/release.sh generate-changelog`._
 
-## v0.14.2 … v0.14.1 (2026-09-19)
+## v0.15.0 … v0.14.1 (2026-09-19)
+
+### Features
+- feat(serve): opt-in batching for --agent-cmd via --agent-batch-max/--agent-input (#379)
 
 ### Docs
 - docs(mailbox): state the inbox/outbox delivery model once (#377)
