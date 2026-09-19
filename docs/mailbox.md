@@ -5,6 +5,52 @@ posts to it and consumes the correlated reply, the liveness probe over the same
 mailbox, the operator prune that bounds its dedup ledger, and the routing registry
 that resolves a role name to a mailbox pair.
 
+## Delivery surfaces: inbox in, outbox terminal
+
+Every verb below describes one mailbox surface correctly in isolation, but the
+fact that matters for reasoning about the transport as a whole is this:
+**an inbox is the only surface a message can be delivered to, and an outbox is
+a terminus, not a send queue.**
+
+1. `<inbox>/pending/` is the only place a message can be delivered to. `send`
+   writes there, either directly via `--inbox` or resolved by name via
+   `--registry`.
+2. `serve` claims a request from `pending/`, runs it through the participant
+   seam, writes the reply to `<outbox>/<request message_id>.json`, and retires
+   the request to `done/`.
+3. **Nothing in baton reads an outbox and forwards it.** An outbox is a
+   per-request archive of what this daemon answered — written and sealed.
+4. The outbox has exactly two documented consumers: `send --await` (which
+   atomically renames the file out to claim it) and a human or tool reading it
+   for forensics. **A deployment which never calls `send --await` never reads
+   its outboxes** — that is a supported configuration, not an oversight; see
+   [`--retention`](#retention-pruning-from-the-daemon-baton-serve---retention)
+   and [`mailbox prune --outbox`](#pruning-the-dedup-ledger-baton-mailbox-prune)
+   for bounding its growth.
+5. The only path by which a reply reaches a peer's inbox is an explicit send
+   into that inbox — either a fresh `baton send`, or `serve`'s [routed
+   reply](#routing-a-reply-into-the-senders-inbox-send---reply-to--serve---registry)
+   (`send --reply-to` + `serve --registry --role`), which bypasses the outbox
+   rather than copying from it.
+
+```mermaid
+flowchart LR
+  subgraph A["peer A"]
+    AI["inbox/pending"]
+    AO["outbox<br/>(archive)"]
+  end
+  subgraph B["peer B"]
+    BI["inbox/pending"]
+    BO["outbox<br/>(archive)"]
+  end
+  A0(["baton send --to B"]) --> BI
+  BI -->|"serve claims"| BS["serve --agent-cmd"]
+  BS -->|"reply"| BO
+  BS -.->|"only with send --reply-to + serve --registry --role"| AI
+  BO -.->|"only baton send --await"| A0
+  BO -.-x|"never forwarded"| AI
+```
+
 ## Serving a mailbox (`baton serve`)
 
 Where `exchange` is a synchronous round-trip over pipes, `baton serve` gives that
@@ -237,6 +283,13 @@ on `in_reply_to` / `conversation_id`, exactly as they must for `serve`.
 
 Both the send and the consumed reply are recorded to `BATON_EVENT_LOG` (as
 `message_sent` / `reply_consumed` lines on the same trail), when it is set.
+
+`--await` is the outbox's only automatic reader (see [Delivery
+surfaces](#delivery-surfaces-inbox-in-outbox-terminal)): a deployment that
+never calls it never reads its outboxes, so an unbounded outbox grows
+unnoticed unless bounded by
+[`--retention`](#retention-pruning-from-the-daemon-baton-serve---retention) or
+[`mailbox prune --outbox`](#pruning-the-dedup-ledger-baton-mailbox-prune).
 
 ## Mailbox liveness (`baton status`)
 
