@@ -10,6 +10,11 @@ versioning.
 
 _Generated from release tags with `bash scripts/release.sh generate-changelog`._
 
+## v0.14.1 (2026-09-19)
+
+### Docs
+- docs(mailbox): state the inbox/outbox delivery model once (#377)
+
 ## v0.14.0 … v0.13.0 (2026-09-16)
 
 ### Features
