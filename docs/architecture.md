@@ -29,6 +29,12 @@ Two facts follow from that stance and frame everything below:
 2. Whether Baton **owns a provider** at all depends on which participant path
    you run — the next section.
 
+A mailbox peer's "correlated response envelope" is written once, to an
+outbox, and never forwarded onward from there — see [mailbox.md § Delivery
+surfaces: inbox in, outbox
+terminal](mailbox.md#delivery-surfaces-inbox-in-outbox-terminal) for the full
+model.
+
 ## The two participant paths
 
 This is the central architectural fact: **Baton has two participant paths, and
