@@ -63,7 +63,8 @@ socket.
 ```
 baton serve --inbox <dir> --outbox <dir> [--poll-ms <n>] [--retention <duration>] [--once]
             [--agent-cmd <program> [--agent-arg <arg>]... [--agent-cwd <dir>] [--agent-timeout-ms <n>]
-             [--agent-output raw|json [--agent-result-key <key>]]]
+             [--agent-output raw|json [--agent-result-key <key>]]
+             [--agent-batch-max <n>] [--agent-input body|batch-json]]
             [--role <name>] [--registry <path>]
 baton serve --stop --inbox <dir>
 ```
@@ -89,6 +90,19 @@ baton serve --stop --inbox <dir>
   in-flight turn (bounded or not); `service stop` / `service teardown` are what
   terminate an in-flight turn's whole process tree (see
   [Service](service.md#lifecycle-contract)).
+- `--agent-batch-max <n>` (requires `--agent-cmd`) — claim up to `n` pending
+  messages into **one** `--agent-cmd` invocation, fanning its single reply
+  back to every claimed member instead of running once per message; omitted
+  (or `1`), behavior is unchanged. `--agent-input body|batch-json` (requires
+  `--agent-cmd`) selects the child's stdin shape — `body` (default) is the
+  raw message body and is only valid at batch size `1`; `batch-json` is
+  `{"batch": [<envelope>, ...]}` and is required whenever
+  `--agent-batch-max` is above `1`. See [Batching in the external-agent
+  role](external-agent.md#batching---agent-batch-max--agent-input) for the
+  full contract (stdin shape, `BATON_BATCH_SIZE`, per-member fan-out,
+  all-members failure). `--stop` is observed **between** batches, never
+  while one is being filled or answered — see
+  [Shutdown](#shutdown-cooperative-graceful-stop).
 - `--role <name>` — resolve the answering identity from the role's
   [home directory](configuration.md#role-homes-rolesname) (`roles/<name>/`), so a party is stood
   up by name instead of hand-assembled env vars. In-process mode (legacy
@@ -128,7 +142,10 @@ A sender delivers by writing a temp file and `rename(2)`-ing it into the inbox,
 so `serve` never observes a partial envelope. Each message then moves through one
 atomic rename per state: `pending → claimed → done`. A crash mid-answer leaves
 the message in `claimed/`; the next start **reclaims** it back to `pending/`, so
-no in-flight message is lost. A single `serve` answers pending messages in
+no in-flight message is lost. With `--agent-batch-max` above `1`, a crash mid-run
+leaves every member of that batch in `claimed/`, and the next start reclaims and
+redelivers all of them the same way — reclaim is per-request, so batching changes
+nothing about how many messages a crash can strand or how they come back. A single `serve` answers pending messages in
 delivery-time (FIFO) order — ascending mtime, ties broken by file name — not the
 filesystem's directory-listing order. The response is written to
 `<outbox>/<request message_id>.json` — keyed by the *request* id (the reply's

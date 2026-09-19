@@ -22,6 +22,8 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use serde::Serialize;
+
 use crate::error::{BatonError, Result};
 #[cfg(feature = "local")]
 use crate::events::ExchangeMeta;
@@ -46,6 +48,21 @@ use crate::transport::Transport;
 pub trait Participant {
     /// Consumes a `request` envelope and returns the correlated response.
     fn respond(&self, request: &MessageEnvelope) -> MessageEnvelope;
+
+    /// Answers a batch of one-or-more claimed requests, returning exactly one
+    /// response per request in the same order.
+    ///
+    /// The default forwards each request through [`respond`](Self::respond)
+    /// independently — today's per-message behavior, unchanged for every
+    /// participant. [`ExternalAgentParticipant`] overrides this to run a
+    /// single child invocation for the whole batch and fan its one reply out
+    /// to every member (`baton serve --agent-batch-max`).
+    fn respond_batch(&self, requests: &[MessageEnvelope]) -> Vec<MessageEnvelope> {
+        requests
+            .iter()
+            .map(|request| self.respond(request))
+            .collect()
+    }
 }
 
 /// An in-process, LLM-backed participant: a system prompt + a [`Transport`].
@@ -428,6 +445,23 @@ pub struct ExternalAgentParticipant {
     /// otherwise inherit from this process's environment, so a role-less serve
     /// never leaks a stale `BATON_ROLE` (#361).
     role: Option<String>,
+    /// How [`Participant::respond_batch`] shapes stdin for the requests it
+    /// answers in one child invocation (`baton serve --agent-input`).
+    /// Defaults to [`AgentInputMode::Body`], today's shape.
+    input_mode: AgentInputMode,
+}
+
+/// Selects the stdin shape [`ExternalAgentParticipant::respond_batch`] feeds
+/// the child (`baton serve --agent-input`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentInputMode {
+    /// The raw request body on stdin — today's shape (`#68`). Only ever used
+    /// with a single-request batch: the CLI parser requires `BatchJson`
+    /// whenever `--agent-batch-max` allows more than one.
+    Body,
+    /// A single JSON object `{"batch": [<request envelope>, ...]}` on stdin,
+    /// one element per claimed member in claim order (oldest `ts_ms` first).
+    BatchJson,
 }
 
 /// Isolates the agent's final *result* from its raw stdout.
@@ -513,6 +547,7 @@ impl ExternalAgentParticipant {
             inbox: None,
             outbox: None,
             role: None,
+            input_mode: AgentInputMode::Body,
         }
     }
 
@@ -542,6 +577,13 @@ impl ExternalAgentParticipant {
     /// inherited value (#361).
     pub fn with_role(mut self, role: impl Into<String>) -> Self {
         self.role = Some(role.into());
+        self
+    }
+
+    /// Sets the stdin shape [`Participant::respond_batch`] uses
+    /// (`baton serve --agent-input`). Defaults to [`AgentInputMode::Body`].
+    pub fn with_input_mode(mut self, mode: AgentInputMode) -> Self {
+        self.input_mode = mode;
         self
     }
 
@@ -587,6 +629,72 @@ impl ExternalAgentParticipant {
             ));
         }
         Ok(body)
+    }
+
+    /// Runs one headless agent turn over a whole claimed batch, returning the
+    /// single reply body every member fans out to, or an `Err` describing the
+    /// machinery failure (the same surface as [`try_respond`](Self::try_respond),
+    /// generalized to the batch's stdin shape and env layer).
+    ///
+    /// `requests` is never empty — [`drain_mailbox`](crate::cli) only calls
+    /// this after claiming at least one message.
+    fn try_respond_batch(&self, requests: &[MessageEnvelope]) -> Result<String> {
+        let stdin = self.batch_stdin(requests)?;
+        let mut envs = self.envs.clone();
+        envs.extend(self.turn_envs_batch(requests));
+        let env_removals: &[&str] = if self.role.is_none() {
+            &["BATON_ROLE"]
+        } else {
+            &[]
+        };
+
+        let (stdout, stderr) = capture_child_output(
+            &self.program,
+            &self.args,
+            &envs,
+            env_removals,
+            Some(&self.cwd),
+            &stdin,
+            self.read_timeout,
+        )?;
+
+        // Stamped under the *last* (newest) member's id, mirroring the
+        // `BATON_*` env layer's "stamped from the last member" rule.
+        let last = requests.last().expect("non-empty batch");
+        self.persist_stderr(&last.message_id, &stderr);
+
+        if stdout.trim().is_empty() {
+            return Err(BatonError::Decode(
+                "external agent produced no output".to_string(),
+            ));
+        }
+        let body = self.output.extract(&stdout)?;
+        if body.trim().is_empty() {
+            return Err(BatonError::Decode(
+                "external agent produced an empty result".to_string(),
+            ));
+        }
+        Ok(body)
+    }
+
+    /// Builds the child's stdin for a batch, per [`AgentInputMode`]. Under
+    /// [`AgentInputMode::Body`] this is the sole request's raw body — the CLI
+    /// parser only ever allows that mode with a single-request batch. Under
+    /// [`AgentInputMode::BatchJson`] it is `{"batch": [...]}`, one full
+    /// request envelope per member, in `requests`' order.
+    fn batch_stdin(&self, requests: &[MessageEnvelope]) -> Result<Vec<u8>> {
+        match self.input_mode {
+            AgentInputMode::Body => Ok(requests[0].body.clone().into_bytes()),
+            AgentInputMode::BatchJson => {
+                #[derive(Serialize)]
+                struct BatchPayload<'a> {
+                    batch: &'a [MessageEnvelope],
+                }
+                serde_json::to_vec(&BatchPayload { batch: requests }).map_err(|err| {
+                    BatonError::Decode(format!("could not encode batch-json stdin: {err}"))
+                })
+            }
+        }
     }
 
     /// Best-effort persist of agent stderr. A failed write must not turn a
@@ -653,6 +761,17 @@ impl ExternalAgentParticipant {
         }
         envs
     }
+
+    /// Builds the `BATON_*` environment layer for a batch turn: today's
+    /// [`turn_envs`](Self::turn_envs) from the **last** (newest) member, plus
+    /// `BATON_BATCH_SIZE` — `1` for a single-request batch, so an unbatched
+    /// `serve --agent-cmd` run is unchanged except for that one addition.
+    fn turn_envs_batch(&self, requests: &[MessageEnvelope]) -> Vec<(String, String)> {
+        let last = requests.last().expect("non-empty batch");
+        let mut envs = self.turn_envs(last);
+        envs.push(("BATON_BATCH_SIZE".to_string(), requests.len().to_string()));
+        envs
+    }
 }
 
 impl Participant for ExternalAgentParticipant {
@@ -673,6 +792,39 @@ impl Participant for ExternalAgentParticipant {
                 response
             }
             Err(err) => synthesize_error_response(request, &err.to_string()),
+        }
+    }
+
+    /// Runs one child invocation for the whole batch (`try_respond_batch`),
+    /// then fans its single body — or, on a machinery failure, one synthesized
+    /// error — out to every member, each correlated to its own
+    /// `conversation_id`/`from`/`to`/`message_id`.
+    fn respond_batch(&self, requests: &[MessageEnvelope]) -> Vec<MessageEnvelope> {
+        match self.try_respond_batch(requests) {
+            Ok(body) => requests
+                .iter()
+                .map(|request| {
+                    let ts_ms = now_ms();
+                    let mut response = MessageEnvelope::new(
+                        fresh_message_id(&request.conversation_id, ts_ms),
+                        request.conversation_id.clone(),
+                        request.to.clone(),
+                        request.from.clone(),
+                        MessageKind::Response,
+                        body.clone(),
+                        ts_ms,
+                    );
+                    response.in_reply_to = Some(request.message_id.clone());
+                    response
+                })
+                .collect(),
+            Err(err) => {
+                let message = err.to_string();
+                requests
+                    .iter()
+                    .map(|request| synthesize_error_response(request, &message))
+                    .collect()
+            }
         }
     }
 }
@@ -1140,8 +1292,10 @@ pub mod testing {
     /// (so tests need no wall clock): preserved `conversation_id`, `in_reply_to`
     /// set, and addressing swapped — the reply is from the request's recipient,
     /// to its sender. Shared by every fake here so they correlate identically to
-    /// [`super::LocalParticipant`].
-    fn correlated_reply(
+    /// [`super::LocalParticipant`]. `pub(crate)` so other modules' tests (e.g.
+    /// `cli`'s `drain_mailbox` batch tests) can build the same correlated shape
+    /// for their own fakes.
+    pub(crate) fn correlated_reply(
         request: &MessageEnvelope,
         kind: MessageKind,
         body: impl Into<String>,
@@ -2411,6 +2565,184 @@ mod tests {
         let response = participant.respond(&request_with_body("m-req-1", "go"));
         assert_eq!(response.kind, MessageKind::Response);
         assert!(!dir.path.join("agent-stderr").exists());
+    }
+
+    // -- ExternalAgentParticipant::respond_batch ---------------------------
+    //
+    // `respond()` above stays untouched by the batching change (proven by the
+    // tests above still passing unmodified); these drive `respond_batch`
+    // directly, the seam `drain_mailbox`'s `--agent-batch-max` calls into.
+
+    /// A length-1 batch under the default `Body` mode produces the same reply
+    /// shape as `respond()` on the same request: raw body delivered on stdin,
+    /// one correlated `kind: "response"` envelope with the addressing swapped
+    /// the same way.
+    #[test]
+    fn external_agent_respond_batch_body_mode_single_matches_respond_shape() {
+        let dir = TempDir::new("ext-batch-body-single");
+        let script = "cat > seen.txt; printf 'edited seen.txt'";
+        let via_respond = external_agent(script, &dir.path, Duration::from_secs(5));
+        let request = request_with_body("m-req-1", "please edit seen.txt");
+        let direct = via_respond.respond(&request);
+
+        let dir2 = TempDir::new("ext-batch-body-single-2");
+        let via_batch = external_agent(script, &dir2.path, Duration::from_secs(5));
+        let responses = via_batch.respond_batch(std::slice::from_ref(&request));
+
+        assert_eq!(responses.len(), 1);
+        let batched = &responses[0];
+        assert_eq!(batched.kind, direct.kind);
+        assert_eq!(batched.body, direct.body);
+        assert_eq!(batched.conversation_id, direct.conversation_id);
+        assert_eq!(batched.from, direct.from);
+        assert_eq!(batched.to, direct.to);
+        assert_eq!(batched.in_reply_to, direct.in_reply_to);
+        // The raw body was delivered on stdin in both paths.
+        let stdin_seen = std::fs::read_to_string(dir2.path.join("seen.txt")).expect("side effect");
+        assert_eq!(stdin_seen, "please edit seen.txt");
+    }
+
+    /// Env script extended to also print `BATON_BATCH_SIZE`, for asserting its
+    /// value directly (the base [`ECHO_BATON_ENV_SCRIPT`] predates batching).
+    const ECHO_BATON_ENV_AND_BATCH_SIZE_SCRIPT: &str = "cat >/dev/null; \
+        printf 'MESSAGE_ID=[%s]\\n' \"$BATON_MESSAGE_ID\"; \
+        printf 'BATCH_SIZE=[%s]\\n' \"$BATON_BATCH_SIZE\"";
+
+    /// `Body` mode at batch length 1 stamps `BATON_BATCH_SIZE=1` alongside the
+    /// unchanged `BATON_*` set, and reads the sole request's raw body — the
+    /// default-flag compatibility criterion (`--agent-batch-max` omitted).
+    #[test]
+    fn external_agent_respond_batch_body_mode_stamps_batch_size_one() {
+        let dir = TempDir::new("ext-batch-body-size-one");
+        let participant = external_agent(
+            ECHO_BATON_ENV_AND_BATCH_SIZE_SCRIPT,
+            &dir.path,
+            Duration::from_secs(5),
+        );
+        let request = request_with_body("m-req-1", "go");
+
+        let responses = participant.respond_batch(std::slice::from_ref(&request));
+
+        assert_eq!(responses.len(), 1);
+        assert_eq!(responses[0].body, "MESSAGE_ID=[m-req-1]\nBATCH_SIZE=[1]\n");
+    }
+
+    /// Under `BatchJson`, stdin is one JSON object `{"batch": [...]}` carrying
+    /// every claimed envelope in slice order — the shape `--agent-input
+    /// batch-json` promises.
+    #[test]
+    fn external_agent_respond_batch_json_mode_stdin_shape_and_order() {
+        let dir = TempDir::new("ext-batch-json-stdin");
+        // The stub records raw stdin to a file so the test can decode it,
+        // then answers with one free-text result for the whole batch.
+        let participant = ExternalAgentParticipant::new(
+            "sh",
+            ["-c", "cat > stdin.json; printf 'handled'"],
+            std::iter::empty::<(String, String)>(),
+            &dir.path,
+            OutputAdapter::Raw,
+            Some(Duration::from_secs(5)),
+        )
+        .with_input_mode(AgentInputMode::BatchJson);
+        let requests = vec![
+            request_with_body("m-req-1", "first"),
+            request_with_body("m-req-2", "second"),
+            request_with_body("m-req-3", "third"),
+        ];
+
+        let responses = participant.respond_batch(&requests);
+
+        assert_eq!(responses.len(), 3);
+        for (request, response) in requests.iter().zip(&responses) {
+            assert_eq!(response.body, "handled");
+            assert_eq!(
+                response.in_reply_to.as_deref(),
+                Some(request.message_id.as_str())
+            );
+        }
+
+        let stdin_seen = std::fs::read_to_string(dir.path.join("stdin.json")).expect("stdin file");
+        let decoded: serde_json::Value =
+            serde_json::from_str(&stdin_seen).expect("stdin is valid JSON");
+        let batch = decoded
+            .get("batch")
+            .and_then(|v| v.as_array())
+            .expect("stdin has a `batch` array");
+        assert_eq!(batch.len(), 3);
+        let ids: Vec<&str> = batch
+            .iter()
+            .map(|entry| entry.get("message_id").and_then(|v| v.as_str()).unwrap())
+            .collect();
+        assert_eq!(ids, vec!["m-req-1", "m-req-2", "m-req-3"]);
+    }
+
+    /// `respond_batch`'s `BATON_*` env (and `BATON_BATCH_SIZE`) is sourced from
+    /// the **last** (newest) member, not the first — mirroring how a single
+    /// invocation can only carry one envelope's worth of addressing.
+    #[test]
+    fn external_agent_respond_batch_env_sourced_from_last_member() {
+        let dir = TempDir::new("ext-batch-env-last");
+        let participant = ExternalAgentParticipant::new(
+            "sh",
+            ["-c", ECHO_BATON_ENV_AND_BATCH_SIZE_SCRIPT],
+            std::iter::empty::<(String, String)>(),
+            &dir.path,
+            OutputAdapter::Raw,
+            Some(Duration::from_secs(5)),
+        )
+        .with_input_mode(AgentInputMode::BatchJson);
+        let requests = vec![
+            request_with_body("m-req-1", "first"),
+            request_with_body("m-req-2", "second"),
+        ];
+
+        let responses = participant.respond_batch(&requests);
+
+        assert_eq!(responses.len(), 2);
+        // The one child invocation saw the *last* member's message id, plus
+        // the full batch size — not the first member's id.
+        assert_eq!(responses[0].body, "MESSAGE_ID=[m-req-2]\nBATCH_SIZE=[2]\n");
+        assert_eq!(responses[1].body, responses[0].body);
+    }
+
+    /// A machinery failure (non-zero exit) during a batched invocation fans a
+    /// synthesized error out to **every** claimed member, not just one — a
+    /// batch never silently drops a message on failure.
+    #[test]
+    fn external_agent_respond_batch_fans_out_synthesized_error_to_every_member() {
+        let dir = TempDir::new("ext-batch-error-fanout");
+        let participant = ExternalAgentParticipant::new(
+            "sh",
+            ["-c", "cat >/dev/null; exit 1"],
+            std::iter::empty::<(String, String)>(),
+            &dir.path,
+            OutputAdapter::Raw,
+            Some(Duration::from_secs(5)),
+        )
+        .with_input_mode(AgentInputMode::BatchJson);
+        let requests = vec![
+            request_with_body("m-req-1", "first"),
+            request_with_body("m-req-2", "second"),
+            request_with_body("m-req-3", "third"),
+        ];
+
+        let responses = participant.respond_batch(&requests);
+
+        assert_eq!(responses.len(), 3);
+        for (request, response) in requests.iter().zip(&responses) {
+            assert_eq!(response.kind, MessageKind::Error);
+            assert_eq!(response.conversation_id, "conv-42");
+            assert_eq!(
+                response.in_reply_to.as_deref(),
+                Some(request.message_id.as_str())
+            );
+            assert_eq!(response.from, "agent-b");
+            assert_eq!(response.to, "agent-a");
+            assert!(
+                response.exchange.is_none(),
+                "no nested record on a machinery failure"
+            );
+        }
     }
 
     // -- MailboxParticipant -----------------------------------------------

@@ -92,6 +92,40 @@ A headless agent can use these to know who is talking to it, whether the turn
 is a `request`/`response`/`error`/`notify`, and correlate it with an earlier
 turn — without the wrapper re-encoding any of that into the body.
 
+## Batching: `--agent-batch-max` / `--agent-input`
+
+By default `serve` spawns one `--agent-cmd` run per claimed message. Two
+opt-in flags let it instead claim a bounded batch of pending messages and
+answer them with **one** invocation:
+
+- `--agent-batch-max <n>` (requires `--agent-cmd`) — the most pending messages
+  one invocation may claim (default `1`, unchanged behavior). `serve` fills a
+  batch up to `n` from whatever is already claimable without waiting for more
+  to arrive: if fewer than `n` are pending it runs with what it has rather
+  than blocking for a full batch. `--stop` is observed **between** batches,
+  never while a batch is being filled or answered — the same "never mid-run"
+  guarantee `--agent-timeout-ms` already gives a single message.
+- `--agent-input body|batch-json` (requires `--agent-cmd`) — the child's
+  stdin shape:
+  - `body` (default) — the raw message body, exactly as today. Only valid
+    with `--agent-batch-max 1` (or omitted): a single body can't represent
+    more than one member.
+  - `batch-json` — stdin is `{"batch": [<envelope>, ...]}`, the claimed
+    `baton.message/v1` envelopes in claim order (oldest first). Required
+    whenever `--agent-batch-max` is above `1`.
+
+The `BATON_*` environment above is stamped from the **newest** (last-claimed)
+member, plus one addition: `BATON_BATCH_SIZE` — the number of members in this
+invocation (`1` outside batching). The single reply fans out: the same
+extracted body becomes each member's own reply, correlated to that member's
+own `message_id`/`from` — every claimed message gets an answer, not just the
+newest. If the invocation fails for any reason (spawn failure, non-zero exit,
+empty output, an unextractable JSON result, or a timeout), every claimed
+member gets its own synthesized `kind: "error"` reply — a batch never drops a
+message silently. A crash (`SIGKILL`) mid-batch leaves every claimed member
+in `claimed/`; the next `serve` start reclaims and redelivers all of them,
+same as a single-message crash today.
+
 ## System prompt and MCP: the caller's job
 
 Baton has no first-class flag for system prompt or MCP config in agent mode —
