@@ -1982,7 +1982,9 @@ printf 'batched reply'"#,
     let stdin_raw = std::fs::read_to_string(&captured_stdin).expect("read captured stdin");
     let stdin_json: serde_json::Value =
         serde_json::from_str(&stdin_raw).expect("batch-json stdin parses as JSON");
-    let batch = stdin_json["batch"].as_array().expect("stdin has a batch array");
+    let batch = stdin_json["batch"]
+        .as_array()
+        .expect("stdin has a batch array");
     assert_eq!(batch.len(), 3, "batch carries every claimed member");
     let seen_ids: Vec<&str> = batch
         .iter()
@@ -2002,7 +2004,10 @@ printf 'batched reply'"#,
             .unwrap_or_else(|| panic!("missing reply correlated to batch-happy-{index}"));
         assert_eq!(reply["kind"], "response");
         assert_eq!(reply["body"], "batched reply");
-        assert_eq!(reply["to"], *from, "reply routes back to its own originator");
+        assert_eq!(
+            reply["to"], *from,
+            "reply routes back to its own originator"
+        );
     }
 
     assert_eq!(count_dir(&inbox.join("pending")), 0);
@@ -2039,7 +2044,10 @@ fn external_agent_serve_batching_answers_concurrent_send_await_clients() {
         "--agent-input",
         "batch-json",
     ]);
-    serve.env_clear().stdout(Stdio::null()).stderr(Stdio::piped());
+    serve
+        .env_clear()
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
     let serve_child = serve.spawn().expect("spawn batching serve");
 
     let inbox_a = inbox.clone();
@@ -2092,7 +2100,11 @@ fn external_agent_serve_batching_answers_concurrent_send_await_clients() {
             "each client must correlate to its own distinct request, not a shared/duplicated one"
         );
     }
-    assert_eq!(correlated_ids.len(), 3, "all 3 clients got distinct replies");
+    assert_eq!(
+        correlated_ids.len(),
+        3,
+        "all 3 clients got distinct replies"
+    );
 }
 
 /// `--agent-batch-max` is a ceiling, not a wait target: with fewer pending
@@ -2314,7 +2326,10 @@ sleep 30"#,
         "--agent-input",
         "batch-json",
     ]);
-    serve.env_clear().stdout(Stdio::null()).stderr(Stdio::null());
+    serve
+        .env_clear()
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
     let mut serve_child = serve.spawn().expect("spawn blocking batching serve");
 
     let ready_deadline = integration_test_deadline();
@@ -2329,7 +2344,11 @@ sleep 30"#,
     serve_child.kill().expect("SIGKILL the batching serve");
     serve_child.wait().expect("reap killed serve");
 
-    assert_eq!(count_dir(&inbox.join("pending")), 0, "nothing left pending mid-batch");
+    assert_eq!(
+        count_dir(&inbox.join("pending")),
+        0,
+        "nothing left pending mid-batch"
+    );
     assert_eq!(
         count_dir(&inbox.join("claimed")),
         3,
@@ -2431,7 +2450,9 @@ printf 'lone reply'"#,
         .env("BATON_TEST_STDIN", &captured_stdin)
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
-    let out = serve.output().expect("run single-member batch-json serve --once");
+    let out = serve
+        .output()
+        .expect("run single-member batch-json serve --once");
     assert!(
         out.status.success(),
         "serve should exit 0; stderr: {}",

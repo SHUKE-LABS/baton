@@ -1472,8 +1472,10 @@ fn drain_mailbox(
                 ),
             );
         }
-        let requests: Vec<MessageEnvelope> =
-            batch.iter().map(|claimed| claimed.request.clone()).collect();
+        let requests: Vec<MessageEnvelope> = batch
+            .iter()
+            .map(|claimed| claimed.request.clone())
+            .collect();
         let responses = participant.respond_batch(&requests);
 
         for (claimed, response) in batch.into_iter().zip(responses) {
@@ -3389,9 +3391,7 @@ fn parse_serve<'a>(mut iter: impl Iterator<Item = &'a String>) -> Result<Command
     // `SessionSpecFlags::validate`'s identical rule for the other agent-run
     // flags).
     if flags.agent_cmd.is_none() && (agent_batch_max.is_some() || agent_input.is_some()) {
-        return Err(usage(
-            "--agent-batch-max/--agent-input require --agent-cmd",
-        ));
+        return Err(usage("--agent-batch-max/--agent-input require --agent-cmd"));
     }
     // A `body`-mode child receives exactly one request's raw bytes on stdin,
     // so a batch of more than one has nowhere to put the extra members.
@@ -4227,10 +4227,7 @@ fn parse_agent_timeout_ms(raw: &str, flag: &str) -> Result<u64> {
 
 /// Takes the next token as `flag`'s value, or a usage error naming `flag` when
 /// the argument list ends first.
-fn take_value<'a>(
-    iter: &mut impl Iterator<Item = &'a String>,
-    flag: &str,
-) -> Result<String> {
+fn take_value<'a>(iter: &mut impl Iterator<Item = &'a String>, flag: &str) -> Result<String> {
     iter.next()
         .cloned()
         .ok_or_else(|| usage(&format!("{flag} requires a value")))
@@ -6793,8 +6790,13 @@ mod tests {
         for flag in ["--agent-batch-max=3", "--agent-input=batch-json"] {
             assert!(
                 matches!(
-                    parse_args(&argv(&["serve", "--inbox=/tmp/in", "--outbox=/tmp/out", flag]))
-                        .unwrap_err(),
+                    parse_args(&argv(&[
+                        "serve",
+                        "--inbox=/tmp/in",
+                        "--outbox=/tmp/out",
+                        flag
+                    ]))
+                    .unwrap_err(),
                     BatonError::Usage(_)
                 ),
                 "{flag} without --agent-cmd should be a usage error"
@@ -6835,8 +6837,14 @@ mod tests {
 
     #[test]
     fn build_input_mode_maps_selectors() {
-        assert_eq!(build_input_mode(None).expect("body default"), AgentInputMode::Body);
-        assert_eq!(build_input_mode(Some("body")).expect("body"), AgentInputMode::Body);
+        assert_eq!(
+            build_input_mode(None).expect("body default"),
+            AgentInputMode::Body
+        );
+        assert_eq!(
+            build_input_mode(Some("body")).expect("body"),
+            AgentInputMode::Body
+        );
         assert_eq!(
             build_input_mode(Some("batch-json")).expect("batch-json"),
             AgentInputMode::BatchJson
@@ -6873,15 +6881,17 @@ mod tests {
         ));
         // `--agent-batch-max=1` (the default) never needs the guard, with or
         // without an explicit `--agent-input=body`.
-        assert!(parse_args(&argv(&[
-            "serve",
-            "--inbox=/tmp/in",
-            "--outbox=/tmp/out",
-            "--agent-cmd=claude",
-            "--agent-batch-max=1",
-            "--agent-input=body",
-        ]))
-        .is_ok());
+        assert!(
+            parse_args(&argv(&[
+                "serve",
+                "--inbox=/tmp/in",
+                "--outbox=/tmp/out",
+                "--agent-cmd=claude",
+                "--agent-batch-max=1",
+                "--agent-input=body",
+            ]))
+            .is_ok()
+        );
     }
 
     #[test]
@@ -8046,9 +8056,15 @@ mod tests {
         let outbox = root.path.join("outbox");
 
         let mailbox = Mailbox::open(&inbox).expect("open mailbox");
-        mailbox.deliver(&request_with_id("m-1", "one")).expect("deliver 1");
-        mailbox.deliver(&request_with_id("m-2", "two")).expect("deliver 2");
-        mailbox.deliver(&request_with_id("m-3", "three")).expect("deliver 3");
+        mailbox
+            .deliver(&request_with_id("m-1", "one"))
+            .expect("deliver 1");
+        mailbox
+            .deliver(&request_with_id("m-2", "two"))
+            .expect("deliver 2");
+        mailbox
+            .deliver(&request_with_id("m-3", "three"))
+            .expect("deliver 3");
 
         let participant = BatchSizeRecordingParticipant::new();
         let mut sink = NoopSink;
@@ -8077,7 +8093,11 @@ mod tests {
         replies.sort();
         assert_eq!(
             replies,
-            vec!["m-1.json".to_string(), "m-2.json".to_string(), "m-3.json".to_string()]
+            vec![
+                "m-1.json".to_string(),
+                "m-2.json".to_string(),
+                "m-3.json".to_string()
+            ]
         );
         assert_eq!(json_files(&inbox.join("done")).len(), 3);
         assert!(json_files(&inbox.join("pending")).is_empty());
@@ -8093,8 +8113,12 @@ mod tests {
         let outbox = root.path.join("outbox");
 
         let mailbox = Mailbox::open(&inbox).expect("open mailbox");
-        mailbox.deliver(&request_with_id("m-1", "one")).expect("deliver 1");
-        mailbox.deliver(&request_with_id("m-2", "two")).expect("deliver 2");
+        mailbox
+            .deliver(&request_with_id("m-1", "one"))
+            .expect("deliver 1");
+        mailbox
+            .deliver(&request_with_id("m-2", "two"))
+            .expect("deliver 2");
 
         let participant = BatchSizeRecordingParticipant::new();
         let mut sink = NoopSink;
@@ -8132,8 +8156,15 @@ mod tests {
         let outbox = root.path.join("outbox");
 
         let mailbox = Mailbox::open(&inbox).expect("open mailbox");
-        for (id, body) in [("m-1", "one"), ("m-2", "two"), ("m-3", "three"), ("m-4", "four")] {
-            mailbox.deliver(&request_with_id(id, body)).expect("deliver");
+        for (id, body) in [
+            ("m-1", "one"),
+            ("m-2", "two"),
+            ("m-3", "three"),
+            ("m-4", "four"),
+        ] {
+            mailbox
+                .deliver(&request_with_id(id, body))
+                .expect("deliver");
         }
 
         let participant = BatchSizeRecordingParticipant::new();
@@ -8198,7 +8229,10 @@ mod tests {
         )
         .expect("drain");
 
-        assert!(matches!(drained, Drain::Drained(2)), "both members complete");
+        assert!(
+            matches!(drained, Drain::Drained(2)),
+            "both members complete"
+        );
         assert_eq!(
             *participant.seen_batch_sizes.borrow(),
             vec![2],

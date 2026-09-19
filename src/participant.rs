@@ -58,7 +58,10 @@ pub trait Participant {
     /// single child invocation for the whole batch and fan its one reply out
     /// to every member (`baton serve --agent-batch-max`).
     fn respond_batch(&self, requests: &[MessageEnvelope]) -> Vec<MessageEnvelope> {
-        requests.iter().map(|request| self.respond(request)).collect()
+        requests
+            .iter()
+            .map(|request| self.respond(request))
+            .collect()
     }
 }
 
@@ -2621,10 +2624,7 @@ mod tests {
         let responses = participant.respond_batch(std::slice::from_ref(&request));
 
         assert_eq!(responses.len(), 1);
-        assert_eq!(
-            responses[0].body,
-            "MESSAGE_ID=[m-req-1]\nBATCH_SIZE=[1]\n"
-        );
+        assert_eq!(responses[0].body, "MESSAGE_ID=[m-req-1]\nBATCH_SIZE=[1]\n");
     }
 
     /// Under `BatchJson`, stdin is one JSON object `{"batch": [...]}` carrying
@@ -2655,7 +2655,10 @@ mod tests {
         assert_eq!(responses.len(), 3);
         for (request, response) in requests.iter().zip(&responses) {
             assert_eq!(response.body, "handled");
-            assert_eq!(response.in_reply_to.as_deref(), Some(request.message_id.as_str()));
+            assert_eq!(
+                response.in_reply_to.as_deref(),
+                Some(request.message_id.as_str())
+            );
         }
 
         let stdin_seen = std::fs::read_to_string(dir.path.join("stdin.json")).expect("stdin file");
@@ -2729,10 +2732,16 @@ mod tests {
         for (request, response) in requests.iter().zip(&responses) {
             assert_eq!(response.kind, MessageKind::Error);
             assert_eq!(response.conversation_id, "conv-42");
-            assert_eq!(response.in_reply_to.as_deref(), Some(request.message_id.as_str()));
+            assert_eq!(
+                response.in_reply_to.as_deref(),
+                Some(request.message_id.as_str())
+            );
             assert_eq!(response.from, "agent-b");
             assert_eq!(response.to, "agent-a");
-            assert!(response.exchange.is_none(), "no nested record on a machinery failure");
+            assert!(
+                response.exchange.is_none(),
+                "no nested record on a machinery failure"
+            );
         }
     }
 
