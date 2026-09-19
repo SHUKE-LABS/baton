@@ -1737,6 +1737,7 @@ fn external_agent_serve_forwards_raw_args_and_mailbox_body() {
     let stub = root.path.join("agent-stub");
     let captured_args = root.path.join("agent-args.txt");
     let captured_stdin = root.path.join("agent-stdin.txt");
+    let captured_batch_size = root.path.join("agent-batch-size.txt");
 
     // The stub is the actual `--agent-cmd` executable. Its positional arguments
     // are recorded before it returns a deterministic free-text response.
@@ -1746,6 +1747,7 @@ fn external_agent_serve_forwards_raw_args_and_mailbox_body() {
 set -eu
 cat > "$BATON_TEST_STDIN"
 printf '%s\n' "$@" > "$BATON_TEST_ARGS"
+printf '%s' "$BATON_BATCH_SIZE" > "$BATON_TEST_BATCH_SIZE"
 printf 'stub response'
 "#,
     )
@@ -1790,6 +1792,7 @@ printf 'stub response'
         .env_clear()
         .env("BATON_TEST_ARGS", &captured_args)
         .env("BATON_TEST_STDIN", &captured_stdin)
+        .env("BATON_TEST_BATCH_SIZE", &captured_batch_size)
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
     let serve_child = serve.spawn().expect("spawn external-agent serve");
@@ -1847,6 +1850,13 @@ printf 'stub response'
         std::fs::read_to_string(&captured_stdin).expect("read captured agent stdin"),
         request_body
     );
+    // `--agent-batch-max`/`--agent-input` omitted: the default-flag
+    // compatibility criterion — raw body on stdin (asserted above) plus
+    // `BATON_BATCH_SIZE=1`.
+    assert_eq!(
+        std::fs::read_to_string(&captured_batch_size).expect("read captured batch size"),
+        "1"
+    );
 
     let response: serde_json::Value =
         serde_json::from_slice(&send_output.stdout).expect("awaited response is JSON");
@@ -1856,6 +1866,587 @@ printf 'stub response'
         response["in_reply_to"].is_string(),
         "mailbox response correlates to the request"
     );
+}
+
+/// Writes an executable `#!/bin/sh` stub at `path` with `body` as its script
+/// content (the caller supplies everything after the shebang).
+#[cfg(unix)]
+fn write_stub(path: &Path, body: &str) {
+    std::fs::write(path, format!("#!/bin/sh\nset -eu\n{body}\n")).expect("write agent stub");
+    let mut permissions = std::fs::metadata(path)
+        .expect("stat agent stub")
+        .permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(path, permissions).expect("make agent stub executable");
+}
+
+/// Reads every `outbox` reply into a map keyed by `in_reply_to`, so a test can
+/// look up the reply that answers a specific seeded request by its
+/// `message_id` regardless of file-write order.
+#[cfg(unix)]
+fn read_outbox_by_in_reply_to(
+    outbox: &std::path::Path,
+) -> std::collections::HashMap<String, serde_json::Value> {
+    std::fs::read_dir(outbox)
+        .expect("read outbox")
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.path().extension().and_then(|ext| ext.to_str()) == Some("json"))
+        .map(|entry| {
+            let raw = std::fs::read_to_string(entry.path()).expect("read outbox reply");
+            let value: serde_json::Value =
+                serde_json::from_str(&raw).expect("outbox reply is JSON");
+            let in_reply_to = value["in_reply_to"]
+                .as_str()
+                .expect("reply correlates via in_reply_to")
+                .to_string();
+            (in_reply_to, value)
+        })
+        .collect()
+}
+
+/// A batch invocation is one `--agent-cmd` run answering every claimed member
+/// at once: `--agent-batch-max 3 --agent-input batch-json` claims all 3
+/// seeded pending messages into a single ordered `{"batch": [...]}` stdin
+/// payload, and the one stub reply fans out as each member's own correlated
+/// response — not a single reply, not just the newest member answered.
+#[cfg(unix)]
+#[test]
+fn external_agent_serve_batches_pending_into_one_ordered_invocation() {
+    use baton::mailbox;
+    use baton::message::{MessageEnvelope, MessageKind};
+
+    let root = TempMailbox::new("batch-happy-path");
+    let inbox = root.path.join("inbox");
+    let outbox = root.path.join("outbox");
+    let stub = root.path.join("agent-stub");
+    let invocation_count = root.path.join("invocation-count.txt");
+    let captured_stdin = root.path.join("agent-stdin.txt");
+
+    write_stub(
+        &stub,
+        r#"cat > "$BATON_TEST_STDIN"
+printf 'x' >> "$BATON_TEST_COUNT"
+printf 'batched reply'"#,
+    );
+
+    let members = ["member-a", "member-b", "member-c"];
+    for (index, from) in members.iter().enumerate() {
+        let request = MessageEnvelope::new(
+            format!("batch-happy-{index}"),
+            "batch-happy-conv",
+            *from,
+            "worker",
+            MessageKind::Request,
+            format!("body from {from}"),
+            1_700_000_000_000 + index as u64,
+        );
+        mailbox::deliver_to(&inbox, &request).expect("seed pending request");
+        // Distinct mtimes so `claim_next`'s mtime ordering matches seed order.
+        thread::sleep(Duration::from_millis(5));
+    }
+
+    let mut serve = Command::new(env!("CARGO_BIN_EXE_baton"));
+    serve.args([
+        "serve",
+        "--inbox",
+        inbox.to_str().unwrap(),
+        "--outbox",
+        outbox.to_str().unwrap(),
+        "--once",
+        "--agent-cmd",
+        stub.to_str().unwrap(),
+        "--agent-batch-max",
+        "3",
+        "--agent-input",
+        "batch-json",
+    ]);
+    serve
+        .env_clear()
+        .env("BATON_TEST_STDIN", &captured_stdin)
+        .env("BATON_TEST_COUNT", &invocation_count)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    let out = serve.output().expect("run batching serve --once");
+    assert!(
+        out.status.success(),
+        "serve should exit 0; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    assert_eq!(
+        std::fs::read_to_string(&invocation_count).expect("read invocation count"),
+        "x",
+        "3 pending under --agent-batch-max 3 must claim into exactly one invocation"
+    );
+
+    let stdin_raw = std::fs::read_to_string(&captured_stdin).expect("read captured stdin");
+    let stdin_json: serde_json::Value =
+        serde_json::from_str(&stdin_raw).expect("batch-json stdin parses as JSON");
+    let batch = stdin_json["batch"].as_array().expect("stdin has a batch array");
+    assert_eq!(batch.len(), 3, "batch carries every claimed member");
+    let seen_ids: Vec<&str> = batch
+        .iter()
+        .map(|entry| entry["message_id"].as_str().expect("member has message_id"))
+        .collect();
+    assert_eq!(
+        seen_ids,
+        vec!["batch-happy-0", "batch-happy-1", "batch-happy-2"],
+        "batch-json stdin preserves claim order (oldest first)"
+    );
+
+    let replies = read_outbox_by_in_reply_to(&outbox);
+    assert_eq!(replies.len(), 3, "every member gets its own reply");
+    for (index, from) in members.iter().enumerate() {
+        let reply = replies
+            .get(&format!("batch-happy-{index}"))
+            .unwrap_or_else(|| panic!("missing reply correlated to batch-happy-{index}"));
+        assert_eq!(reply["kind"], "response");
+        assert_eq!(reply["body"], "batched reply");
+        assert_eq!(reply["to"], *from, "reply routes back to its own originator");
+    }
+
+    assert_eq!(count_dir(&inbox.join("pending")), 0);
+    assert_eq!(count_dir(&inbox.join("claimed")), 0);
+    assert_eq!(count_dir(&inbox.join("done")), 3);
+}
+
+/// Real concurrent `baton send --await` clients each get back their own
+/// correlated reply from a live batching daemon — batching answers a whole
+/// batch at once, but never conflates or cross-delivers members.
+#[cfg(unix)]
+#[test]
+fn external_agent_serve_batching_answers_concurrent_send_await_clients() {
+    let root = TempMailbox::new("batch-concurrent");
+    let inbox = root.path.join("inbox");
+    let outbox = root.path.join("outbox");
+    let stub = root.path.join("agent-stub");
+
+    write_stub(&stub, "cat > /dev/null\nprintf 'concurrent reply'");
+
+    let mut serve = Command::new(env!("CARGO_BIN_EXE_baton"));
+    serve.args([
+        "serve",
+        "--inbox",
+        inbox.to_str().unwrap(),
+        "--outbox",
+        outbox.to_str().unwrap(),
+        "--poll-ms",
+        "10",
+        "--agent-cmd",
+        stub.to_str().unwrap(),
+        "--agent-batch-max",
+        "3",
+        "--agent-input",
+        "batch-json",
+    ]);
+    serve.env_clear().stdout(Stdio::null()).stderr(Stdio::piped());
+    let serve_child = serve.spawn().expect("spawn batching serve");
+
+    let inbox_a = inbox.clone();
+    let outbox_a = outbox.clone();
+    let handles: Vec<_> = ["alpha", "beta", "gamma"]
+        .into_iter()
+        .map(|tag| {
+            let inbox = inbox_a.clone();
+            let outbox = outbox_a.clone();
+            thread::spawn(move || {
+                send_awaiting_reply(
+                    &inbox,
+                    &outbox,
+                    &format!("batch-concurrent-{tag}"),
+                    &format!("hello from {tag}"),
+                )
+            })
+        })
+        .collect();
+    let outputs: Vec<_> = handles
+        .into_iter()
+        .map(|handle| handle.join().expect("send thread panicked"))
+        .collect();
+
+    let (stop, served) = stop_and_reap(&inbox, serve_child);
+    assert!(stop.status.success());
+    assert!(
+        served.status.success(),
+        "serve should exit 0; stderr: {}",
+        String::from_utf8_lossy(&served.stderr)
+    );
+
+    let mut correlated_ids = std::collections::HashSet::new();
+    for out in &outputs {
+        assert!(
+            out.status.success(),
+            "each send --await should succeed; stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let response: serde_json::Value =
+            serde_json::from_slice(&out.stdout).expect("awaited response is JSON");
+        assert_eq!(response["kind"], "response");
+        assert_eq!(response["body"], "concurrent reply");
+        let in_reply_to = response["in_reply_to"]
+            .as_str()
+            .expect("response correlates via in_reply_to")
+            .to_string();
+        assert!(
+            correlated_ids.insert(in_reply_to),
+            "each client must correlate to its own distinct request, not a shared/duplicated one"
+        );
+    }
+    assert_eq!(correlated_ids.len(), 3, "all 3 clients got distinct replies");
+}
+
+/// `--agent-batch-max` is a ceiling, not a wait target: with fewer pending
+/// messages than the max, `serve` runs with what it already has rather than
+/// blocking for a full batch.
+#[cfg(unix)]
+#[test]
+fn external_agent_serve_batch_bounded_by_available_pending_not_max() {
+    use baton::mailbox;
+    use baton::message::{MessageEnvelope, MessageKind};
+
+    let root = TempMailbox::new("batch-bounded");
+    let inbox = root.path.join("inbox");
+    let outbox = root.path.join("outbox");
+    let stub = root.path.join("agent-stub");
+    let invocation_count = root.path.join("invocation-count.txt");
+    let captured_stdin = root.path.join("agent-stdin.txt");
+
+    write_stub(
+        &stub,
+        r#"cat > "$BATON_TEST_STDIN"
+printf 'x' >> "$BATON_TEST_COUNT"
+printf 'partial batch reply'"#,
+    );
+
+    for (index, from) in ["member-a", "member-b"].iter().enumerate() {
+        let request = MessageEnvelope::new(
+            format!("batch-bounded-{index}"),
+            "batch-bounded-conv",
+            *from,
+            "worker",
+            MessageKind::Request,
+            "body",
+            1_700_000_000_000 + index as u64,
+        );
+        mailbox::deliver_to(&inbox, &request).expect("seed pending request");
+    }
+
+    let mut serve = Command::new(env!("CARGO_BIN_EXE_baton"));
+    serve.args([
+        "serve",
+        "--inbox",
+        inbox.to_str().unwrap(),
+        "--outbox",
+        outbox.to_str().unwrap(),
+        "--once",
+        "--agent-cmd",
+        stub.to_str().unwrap(),
+        "--agent-batch-max",
+        "5",
+        "--agent-input",
+        "batch-json",
+    ]);
+    serve
+        .env_clear()
+        .env("BATON_TEST_STDIN", &captured_stdin)
+        .env("BATON_TEST_COUNT", &invocation_count)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    let out = serve.output().expect("run bounded-batch serve --once");
+    assert!(
+        out.status.success(),
+        "serve should exit 0; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    assert_eq!(
+        std::fs::read_to_string(&invocation_count).expect("read invocation count"),
+        "x",
+        "2 pending under --agent-batch-max 5 must still claim into exactly one invocation"
+    );
+    let stdin_json: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(&captured_stdin).expect("read captured stdin"),
+    )
+    .expect("batch-json stdin parses as JSON");
+    assert_eq!(
+        stdin_json["batch"]
+            .as_array()
+            .expect("stdin has a batch array")
+            .len(),
+        2,
+        "the batch must never wait/pad for a 3rd member that never arrives"
+    );
+
+    let replies = read_outbox_by_in_reply_to(&outbox);
+    assert_eq!(replies.len(), 2);
+    assert!(replies.contains_key("batch-bounded-0"));
+    assert!(replies.contains_key("batch-bounded-1"));
+    assert_eq!(count_dir(&inbox.join("pending")), 0);
+    assert_eq!(count_dir(&inbox.join("claimed")), 0);
+    assert_eq!(count_dir(&inbox.join("done")), 2);
+}
+
+/// A batch invocation is all-or-nothing per member: if the single
+/// `--agent-cmd` run fails (here, a non-zero exit), every claimed member gets
+/// its own synthesized `kind: "error"` reply — a batch never drops a message
+/// silently and never answers only the newest member.
+#[cfg(unix)]
+#[test]
+fn external_agent_serve_batch_failure_fans_out_error_to_every_member() {
+    use baton::mailbox;
+    use baton::message::{MessageEnvelope, MessageKind};
+
+    let root = TempMailbox::new("batch-failure");
+    let inbox = root.path.join("inbox");
+    let outbox = root.path.join("outbox");
+    let stub = root.path.join("agent-stub");
+
+    write_stub(&stub, "cat > /dev/null\nexit 1");
+
+    let members = ["member-a", "member-b", "member-c"];
+    for (index, from) in members.iter().enumerate() {
+        let request = MessageEnvelope::new(
+            format!("batch-failure-{index}"),
+            "batch-failure-conv",
+            *from,
+            "worker",
+            MessageKind::Request,
+            "body",
+            1_700_000_000_000 + index as u64,
+        );
+        mailbox::deliver_to(&inbox, &request).expect("seed pending request");
+    }
+
+    let mut serve = Command::new(env!("CARGO_BIN_EXE_baton"));
+    serve.args([
+        "serve",
+        "--inbox",
+        inbox.to_str().unwrap(),
+        "--outbox",
+        outbox.to_str().unwrap(),
+        "--once",
+        "--agent-cmd",
+        stub.to_str().unwrap(),
+        "--agent-batch-max",
+        "3",
+        "--agent-input",
+        "batch-json",
+    ]);
+    serve
+        .env_clear()
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    let out = serve.output().expect("run failing-batch serve --once");
+    assert!(
+        out.status.success(),
+        "serve keeps running even when the agent invocation fails; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let replies = read_outbox_by_in_reply_to(&outbox);
+    assert_eq!(replies.len(), 3, "every member gets its own error reply");
+    for (index, from) in members.iter().enumerate() {
+        let reply = replies
+            .get(&format!("batch-failure-{index}"))
+            .unwrap_or_else(|| panic!("missing error reply correlated to batch-failure-{index}"));
+        assert_eq!(reply["kind"], "error");
+        assert_eq!(reply["to"], *from);
+    }
+    assert_eq!(count_dir(&inbox.join("pending")), 0);
+    assert_eq!(count_dir(&inbox.join("claimed")), 0);
+    assert_eq!(count_dir(&inbox.join("done")), 3);
+}
+
+/// A crash (`SIGKILL`) mid-batch must not lose or half-answer a batch: every
+/// claimed member sits untouched in `claimed/` until the next `serve` start
+/// reclaims and redelivers all of them — the same crash-safety guarantee a
+/// single message already had, now proven across a whole batch.
+#[cfg(unix)]
+#[test]
+fn external_agent_serve_batch_sigkill_reclaims_every_claimed_member() {
+    use baton::mailbox;
+    use baton::message::{MessageEnvelope, MessageKind};
+
+    let root = TempMailbox::new("batch-sigkill");
+    let inbox = root.path.join("inbox");
+    let outbox = root.path.join("outbox");
+    let blocking_stub = root.path.join("agent-stub-blocking");
+    let recovery_stub = root.path.join("agent-stub-recovery");
+    let agent_started = root.path.join("agent-started");
+
+    write_stub(
+        &blocking_stub,
+        r#"cat > /dev/null
+touch "$1"
+sleep 30"#,
+    );
+    write_stub(&recovery_stub, "cat > /dev/null\nprintf 'recovered reply'");
+
+    let members = ["member-a", "member-b", "member-c"];
+    for (index, from) in members.iter().enumerate() {
+        let request = MessageEnvelope::new(
+            format!("batch-sigkill-{index}"),
+            "batch-sigkill-conv",
+            *from,
+            "worker",
+            MessageKind::Request,
+            "body",
+            1_700_000_000_000 + index as u64,
+        );
+        mailbox::deliver_to(&inbox, &request).expect("seed pending request");
+    }
+
+    let mut serve = Command::new(env!("CARGO_BIN_EXE_baton"));
+    serve.args([
+        "serve",
+        "--inbox",
+        inbox.to_str().unwrap(),
+        "--outbox",
+        outbox.to_str().unwrap(),
+        "--poll-ms",
+        "10",
+        "--agent-cmd",
+        blocking_stub.to_str().unwrap(),
+        "--agent-arg",
+        agent_started.to_str().unwrap(),
+        "--agent-batch-max",
+        "3",
+        "--agent-input",
+        "batch-json",
+    ]);
+    serve.env_clear().stdout(Stdio::null()).stderr(Stdio::null());
+    let mut serve_child = serve.spawn().expect("spawn blocking batching serve");
+
+    let ready_deadline = integration_test_deadline();
+    while !agent_started.exists() && std::time::Instant::now() < ready_deadline {
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        agent_started.exists(),
+        "the batch invocation must reach its blocking agent turn"
+    );
+
+    serve_child.kill().expect("SIGKILL the batching serve");
+    serve_child.wait().expect("reap killed serve");
+
+    assert_eq!(count_dir(&inbox.join("pending")), 0, "nothing left pending mid-batch");
+    assert_eq!(
+        count_dir(&inbox.join("claimed")),
+        3,
+        "all 3 claimed members must survive the crash untouched"
+    );
+    assert_eq!(count_dir(&inbox.join("done")), 0);
+
+    let mut recovery = Command::new(env!("CARGO_BIN_EXE_baton"));
+    recovery.args([
+        "serve",
+        "--inbox",
+        inbox.to_str().unwrap(),
+        "--outbox",
+        outbox.to_str().unwrap(),
+        "--once",
+        "--agent-cmd",
+        recovery_stub.to_str().unwrap(),
+        "--agent-batch-max",
+        "3",
+        "--agent-input",
+        "batch-json",
+    ]);
+    recovery
+        .env_clear()
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    let recovery_out = recovery.output().expect("run recovery serve --once");
+    assert!(
+        recovery_out.status.success(),
+        "recovery serve should exit 0; stderr: {}",
+        String::from_utf8_lossy(&recovery_out.stderr)
+    );
+
+    let replies = read_outbox_by_in_reply_to(&outbox);
+    assert_eq!(replies.len(), 3, "every reclaimed member gets answered");
+    for (index, from) in members.iter().enumerate() {
+        let reply = replies
+            .get(&format!("batch-sigkill-{index}"))
+            .unwrap_or_else(|| panic!("missing reply correlated to batch-sigkill-{index}"));
+        assert_eq!(reply["kind"], "response");
+        assert_eq!(reply["body"], "recovered reply");
+        assert_eq!(reply["to"], *from);
+    }
+    assert_eq!(count_dir(&inbox.join("pending")), 0);
+    assert_eq!(count_dir(&inbox.join("claimed")), 0);
+    assert_eq!(count_dir(&inbox.join("done")), 3);
+}
+
+/// `--agent-batch-max 1 --agent-input batch-json` still wraps its single
+/// claimed member as a one-element batch, not a bare envelope and not the
+/// raw body — `batch-json`'s shape is independent of how many members fill
+/// it.
+#[cfg(unix)]
+#[test]
+fn external_agent_serve_batch_json_single_member_is_one_element_batch() {
+    use baton::mailbox;
+    use baton::message::{MessageEnvelope, MessageKind};
+
+    let root = TempMailbox::new("batch-json-single");
+    let inbox = root.path.join("inbox");
+    let outbox = root.path.join("outbox");
+    let stub = root.path.join("agent-stub");
+    let captured_stdin = root.path.join("agent-stdin.txt");
+
+    write_stub(
+        &stub,
+        r#"cat > "$BATON_TEST_STDIN"
+printf 'lone reply'"#,
+    );
+
+    let request = MessageEnvelope::new(
+        "batch-json-single-0",
+        "batch-json-single-conv",
+        "member-a",
+        "worker",
+        MessageKind::Request,
+        "body",
+        1_700_000_000_000,
+    );
+    mailbox::deliver_to(&inbox, &request).expect("seed pending request");
+
+    let mut serve = Command::new(env!("CARGO_BIN_EXE_baton"));
+    serve.args([
+        "serve",
+        "--inbox",
+        inbox.to_str().unwrap(),
+        "--outbox",
+        outbox.to_str().unwrap(),
+        "--once",
+        "--agent-cmd",
+        stub.to_str().unwrap(),
+        "--agent-batch-max",
+        "1",
+        "--agent-input",
+        "batch-json",
+    ]);
+    serve
+        .env_clear()
+        .env("BATON_TEST_STDIN", &captured_stdin)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    let out = serve.output().expect("run single-member batch-json serve --once");
+    assert!(
+        out.status.success(),
+        "serve should exit 0; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let stdin_json: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(&captured_stdin).expect("read captured stdin"),
+    )
+    .expect("batch-json stdin parses as JSON");
+    let batch = stdin_json["batch"]
+        .as_array()
+        .expect("stdin is a batch object, not a bare envelope or raw body");
+    assert_eq!(batch.len(), 1);
+    assert_eq!(batch[0]["message_id"], "batch-json-single-0");
 }
 
 #[cfg(feature = "local")]

@@ -47,7 +47,7 @@ use crate::model::{AssistantReply, Conversation, Prompt};
 #[cfg(feature = "local")]
 use crate::participant::LocalParticipant;
 use crate::participant::{
-    ExternalAgentParticipant, MailboxParticipant, OutputAdapter, Participant,
+    AgentInputMode, ExternalAgentParticipant, MailboxParticipant, OutputAdapter, Participant,
 };
 use crate::registry::Registry;
 use crate::roles::{Identity, RolesHome};
@@ -86,11 +86,12 @@ pub const USAGE: &str = concat!(
     "baton converse-ring --registry <path> --roster <a,b,c> (--seed <text> | --seed-file <path>) [--await-ms <n>] [--out <path>]\n",
     "    Drive an N-party round-robin conversation across registry-resolved mailbox peers.\n",
     "\n",
-    "baton serve --inbox <dir> --outbox <dir> [--poll-ms <n>] [--retention <duration>] [--once] [--agent-cmd <program> [--agent-arg <arg>]... [--agent-cwd <dir>] [--agent-timeout-ms <n>] [--agent-output raw|json [--agent-result-key <key>]]] [--role <name>] [--registry <path>]\n",
+    "baton serve --inbox <dir> --outbox <dir> [--poll-ms <n>] [--retention <duration>] [--once] [--agent-cmd <program> [--agent-arg <arg>]... [--agent-cwd <dir>] [--agent-timeout-ms <n>] [--agent-output raw|json [--agent-result-key <key>]] [--agent-batch-max <n>] [--agent-input body|batch-json]] [--role <name>] [--registry <path>]\n",
     "baton serve --stop --inbox <dir>\n",
     "    Drain a mailbox with an external agent (`--agent-cmd`) or in-process provider; `--stop` requests a cooperative shutdown of a running daemon.\n",
     "    `--retention <duration>` prunes aged `done/` entries and unconsumed outbox replies between polls (at most once per 60s); `0` is rejected; omitting it keeps pruning manual.\n",
     "    `--agent-timeout-ms 0` waits indefinitely for the agent (no read deadline); a positive value is a bounded read timeout; omitting it keeps the 600000 ms default.\n",
+    "    `--agent-batch-max <n>` (requires `--agent-cmd`) claims up to `n` pending messages into one `--agent-cmd` invocation, fanning its single reply back to every claimed member; omitting it keeps today's one-invocation-per-message behavior. `--agent-input body|batch-json` (requires `--agent-cmd`) selects the child's stdin shape: `body` (default) is the raw message body, `batch-json` is `{\"batch\": [<envelope>, ...]}`; `--agent-batch-max` above `1` requires `--agent-input batch-json`.\n",
     "    `--registry <path>` (requires `--role`) routes a claimed request's `reply_to` name into that peer's inbox instead of `--outbox`.\n",
     "\n",
     "baton send (--inbox <dir> | --registry <path>) (--body <text> [--to <role>] [--reply-to <name>] | --in <path>) [--from <id>] [--conversation <id>] [--await [--outbox <dir>] [--timeout-ms <n>]]\n",
@@ -286,6 +287,14 @@ enum Command {
         /// pushed into the resolved peer's inbox instead of `outbox`. `None` ⇒
         /// every reply goes to `outbox`, the prior behaviour.
         registry: Option<String>,
+        /// `--agent-batch-max <n>`: the most pending messages one `--agent-cmd`
+        /// invocation answers together. `None` ⇒ `1`, today's one-message-per-
+        /// invocation behaviour. Requires `agent_cmd`; `>1` requires
+        /// `agent_input` to be `batch-json`.
+        agent_batch_max: Option<u64>,
+        /// `--agent-input body|batch-json`: the child's stdin shape. `None` ⇒
+        /// `body` (today's raw request body). Requires `agent_cmd`.
+        agent_input: Option<String>,
     },
     /// Cooperatively stop a running `baton serve` on `inbox` (Option C graceful
     /// shutdown): drop a stop sentinel the daemon observes between messages, so
@@ -640,6 +649,8 @@ pub fn run() -> Result<()> {
             role,
             retention_ms,
             registry,
+            agent_batch_max,
+            agent_input,
         } => {
             #[cfg(windows)]
             service::adopt_windows_service_job()?;
@@ -697,6 +708,7 @@ pub fn run() -> Result<()> {
                         None => Some(Duration::from_millis(DEFAULT_AGENT_TIMEOUT_MS)),
                     };
                     let output = build_output_adapter(agent_output.as_deref(), agent_result_key)?;
+                    let input_mode = build_input_mode(agent_input.as_deref())?;
                     // The participant stays backend-neutral: agent_args passes
                     // straight through, unmodified — all agent-specific flag
                     // knowledge (system prompt, MCP, etc.) lives in the caller's
@@ -717,7 +729,8 @@ pub fn run() -> Result<()> {
                     )
                     .with_stderr_dir(stderr_dir)
                     .with_inbox(PathBuf::from(&inbox))
-                    .with_outbox(PathBuf::from(&outbox));
+                    .with_outbox(PathBuf::from(&outbox))
+                    .with_input_mode(input_mode);
                     // BATON_ROLE is stamped only with `--role`; without it,
                     // `ExternalAgentParticipant` actively strips any inherited
                     // value rather than merely omitting it (#361).
@@ -776,6 +789,12 @@ pub fn run() -> Result<()> {
             let retention_window = retention_ms.map(Duration::from_millis);
             let mut last_retention_pass: Option<Instant> = None;
             let own_inbox = Path::new(&inbox);
+            // `agent_batch_max`/`agent_input` are parser-validated to require
+            // `agent_cmd`, so `LocalParticipant` always sees the default `1`
+            // here — `respond_batch`'s default impl then answers it exactly as
+            // `respond` always has.
+            let batch_max: usize = usize::try_from(agent_batch_max.unwrap_or(1))
+                .map_err(|_| usage("--agent-batch-max is too large for this platform"))?;
             loop {
                 match drain_mailbox(
                     &mailbox,
@@ -787,6 +806,7 @@ pub fn run() -> Result<()> {
                     registry.as_ref(),
                     own_inbox,
                     role.as_deref(),
+                    batch_max,
                 )? {
                     // Cooperative stop observed between messages ⇒ exit 0.
                     Drain::Stopped => break,
@@ -1224,6 +1244,12 @@ fn execute_ask_with_warning(
 ///
 /// Parameterised over [`Participant`]/[`EventSink`] so it is unit-testable with
 /// fakes.
+///
+/// Only [`Command::Exchange`] (`#[cfg(feature = "local")]`) still calls this
+/// directly; `drain_mailbox` inlines the same request/outcome event pair
+/// itself so it can wrap a whole batch's [`Participant::respond_batch`] call
+/// instead of one [`Participant::respond`] call.
+#[cfg(feature = "local")]
 fn execute_exchange(
     participant: &dyn Participant,
     sink: &mut dyn EventSink,
@@ -1383,20 +1409,28 @@ fn retention_pass(inbox: &Path, outbox: &Path, window: Duration, last: &mut Opti
 /// instead — see [`try_route_reply`]), and returns how many were processed —
 /// unless a cooperative stop is observed.
 ///
-/// The stop sentinel is checked **between messages** (at the top of each claim
-/// iteration), so an in-flight `respond()` is never interrupted mid-call: a stop
-/// dropped while a message is being answered is seen only after that message
+/// The stop sentinel is checked **between batches** (at the top of each claim
+/// iteration, before a new batch starts forming), so an in-flight
+/// `respond_batch()` is never interrupted mid-call: a stop dropped while a
+/// batch is being answered is seen only after every member of that batch
 /// completes to `done`, then the pass returns [`Drain::Stopped`].
 ///
-/// Each message runs the same [`execute_exchange`] path as `baton exchange` — so
-/// the response envelope and the `BATON_EVENT_LOG` trail are produced identically
-/// — then advances `claimed → done`. A claimed request whose own `kind` is
-/// `response` or `error` is never answered at all (#362 AC6): the exchange still
-/// runs and the seat session still records, but nothing is written to `outbox`
-/// and nothing is pushed — closing the unread-reply-file problem instead of
+/// Each pass claims one **batch**: the first `claim_next()`, then up to
+/// `agent_batch_max - 1` more non-blocking claims — stopping as soon as
+/// `pending/` is empty, never waiting for it to fill (`agent_batch_max` is 1
+/// for every caller except `serve --agent-batch-max`, so every existing
+/// caller still answers exactly one message per pass). Every member's
+/// `ExchangeEvent::Request` is emitted (mirroring [`execute_exchange`]) before
+/// the one [`Participant::respond_batch`] call that answers the whole batch,
+/// then each `(claimed, response)` pair advances `claimed → done` exactly as
+/// a single-message pass always has. A claimed request whose own `kind` is
+/// `response` or `error` is never answered at all (#362 AC6): the batch call
+/// still runs (nothing distinguishes it from the outside) and the seat
+/// session still records, but nothing is written to `outbox` and nothing is
+/// pushed for that member — closing the unread-reply-file problem instead of
 /// relocating it one hop further. Parameterised over [`Participant`] /
 /// [`EventSink`] so it is unit-testable with fakes and a tempdir mailbox, no
-/// network. A single pass: the caller decides whether to loop.
+/// network.
 #[allow(clippy::too_many_arguments)]
 fn drain_mailbox(
     mailbox: &Mailbox,
@@ -1408,54 +1442,89 @@ fn drain_mailbox(
     registry: Option<&Registry>,
     own_inbox: &Path,
     role: Option<&str>,
+    agent_batch_max: usize,
 ) -> Result<Drain> {
     let mut processed = 0;
     loop {
         if mailbox.poll_stop()? {
             return Ok(Drain::Stopped);
         }
-        let Some(claimed) = mailbox.claim_next()? else {
+        let Some(first) = mailbox.claim_next()? else {
             return Ok(Drain::Drained(processed));
         };
-        let response = execute_exchange(participant, sink, meta, &claimed.request);
-        // Record the per-role seat session (#82) when serving with a `--role`. A
-        // recording failure is observability, not the reply — downgrade it to a
-        // warning rather than abort the drain, matching [`emit`].
-        if let Some(recorder) = recorder
-            && let Err(err) = recorder.record_turn(&claimed.request, &response)
-        {
-            eprintln!("warning: failed to record role session: {err}");
+        let mut batch = vec![first];
+        while batch.len() < agent_batch_max.max(1) {
+            match mailbox.claim_next()? {
+                Some(claimed) => batch.push(claimed),
+                None => break,
+            }
         }
-        // A `response`/`error` claimed request has nobody expecting an answer:
-        // running the exchange on it would only produce a second unread file,
-        // one hop later. Drop the output, complete, and move on.
-        if matches!(
-            claimed.request.kind,
-            MessageKind::Response | MessageKind::Error
-        ) {
-            eprintln!(
-                "serve: dropping reply for claimed {} envelope {}; nothing answers a {} directly",
-                claimed.request.kind.as_wire_str(),
-                claimed.key,
-                claimed.request.kind.as_wire_str()
+
+        for claimed in &batch {
+            emit(
+                sink,
+                &ExchangeEvent::correlated_request(
+                    now_ms(),
+                    meta,
+                    &claimed.request.body,
+                    Some(&claimed.request.conversation_id),
+                    &claimed.request.message_id,
+                ),
             );
+        }
+        let requests: Vec<MessageEnvelope> =
+            batch.iter().map(|claimed| claimed.request.clone()).collect();
+        let responses = participant.respond_batch(&requests);
+
+        for (claimed, response) in batch.into_iter().zip(responses) {
+            if let Some(wrapped) = &response.exchange {
+                emit(
+                    sink,
+                    &ExchangeEvent::from_outcome_correlated(
+                        &wrapped.exchange.outcome,
+                        &claimed.request.message_id,
+                    ),
+                );
+            }
+            // Record the per-role seat session (#82) when serving with a `--role`.
+            // A recording failure is observability, not the reply — downgrade it
+            // to a warning rather than abort the drain, matching [`emit`].
+            if let Some(recorder) = recorder
+                && let Err(err) = recorder.record_turn(&claimed.request, &response)
+            {
+                eprintln!("warning: failed to record role session: {err}");
+            }
+            // A `response`/`error` claimed request has nobody expecting an answer:
+            // running the exchange on it would only produce a second unread file,
+            // one hop later. Drop the output, complete, and move on.
+            if matches!(
+                claimed.request.kind,
+                MessageKind::Response | MessageKind::Error
+            ) {
+                eprintln!(
+                    "serve: dropping reply for claimed {} envelope {}; nothing answers a {} directly",
+                    claimed.request.kind.as_wire_str(),
+                    claimed.key,
+                    claimed.request.kind.as_wire_str()
+                );
+                mailbox.complete(claimed)?;
+                processed += 1;
+                continue;
+            }
+            if !try_route_reply(
+                &claimed.request,
+                &response,
+                &claimed.key,
+                registry,
+                own_inbox,
+                role,
+                sink,
+            ) {
+                mailbox.deliver_response(outbox, &claimed.key, &response)?;
+            }
             mailbox.complete(claimed)?;
             processed += 1;
-            continue;
         }
-        if !try_route_reply(
-            &claimed.request,
-            &response,
-            &claimed.key,
-            registry,
-            own_inbox,
-            role,
-            sink,
-        ) {
-            mailbox.deliver_response(outbox, &claimed.key, &response)?;
-        }
-        mailbox.complete(claimed)?;
-        processed += 1;
     }
 }
 
@@ -1853,6 +1922,19 @@ fn build_output_adapter(
         }),
         other => Err(usage(&format!(
             "--agent-output must be 'raw' or 'json', got {other:?}"
+        ))),
+    }
+}
+
+/// Resolves the `--agent-input` selector into an [`AgentInputMode`].
+/// `None`/`"body"` ⇒ the raw request body on stdin (today's shape);
+/// `"batch-json"` ⇒ `{"batch": [...]}`. Any other selector is a usage error.
+fn build_input_mode(selector: Option<&str>) -> Result<AgentInputMode> {
+    match selector.unwrap_or("body") {
+        "body" => Ok(AgentInputMode::Body),
+        "batch-json" => Ok(AgentInputMode::BatchJson),
+        other => Err(usage(&format!(
+            "--agent-input must be 'body' or 'batch-json', got {other:?}"
         ))),
     }
 }
@@ -3228,20 +3310,49 @@ impl SessionSpecFlags {
 /// non-blank) and accepts an optional `--poll-ms <n>` (positive integer, default
 /// [`DEFAULT_SERVE_POLL_MS`]) and the `--once` flag. `--registry <path>`
 /// resolves `reply_to`-routed replies and requires `--role <name>` (the
-/// derived reply id names the role). The cooperative-stop form (`--stop`)
+/// derived reply id names the role). `--agent-batch-max <n>` (requires
+/// `--agent-cmd`; `>1` requires `--agent-input batch-json`) claims up to `n`
+/// pending messages into one `--agent-cmd` invocation, fanning its reply to
+/// every member; `--agent-input body|batch-json` (requires `--agent-cmd`)
+/// selects the child's stdin shape. The cooperative-stop form (`--stop`)
 /// requires only `--inbox` and rejects the daemon-only flags (`--outbox`,
-/// `--poll-ms`, `--once`, `--registry`). Every valued flag also accepts the
-/// `--flag=value` form. A flag without a value, a blank/missing required dir, a
-/// non-positive `--poll-ms`, or any other token is a usage error.
+/// `--poll-ms`, `--once`, `--registry`, `--agent-batch-max`, `--agent-input`).
+/// Every valued flag also accepts the `--flag=value` form. A flag without a
+/// value, a blank/missing required dir, a non-positive `--poll-ms`, or any
+/// other token is a usage error.
 fn parse_serve<'a>(mut iter: impl Iterator<Item = &'a String>) -> Result<Command> {
     let mut flags = SessionSpecFlags::default();
     let mut once = false;
     let mut stop = false;
+    // `--agent-batch-max`/`--agent-input` are `serve`-only (not shared with
+    // `service start`/`SessionSpec`, which reconstructs its argv from a fixed
+    // field set — see `SessionSpec`'s doc comment), so they are parsed here
+    // directly rather than through `SessionSpecFlags`.
+    let mut agent_batch_max: Option<u64> = None;
+    let mut agent_input: Option<String> = None;
 
     while let Some(arg) = iter.next() {
         match arg.as_str() {
             "--once" => once = true,
             "--stop" => stop = true,
+            "--agent-batch-max" => {
+                agent_batch_max = Some(parse_positive_ms(
+                    &take_value(&mut iter, "--agent-batch-max")?,
+                    "--agent-batch-max",
+                )?);
+            }
+            other if other.starts_with("--agent-batch-max=") => {
+                agent_batch_max = Some(parse_positive_ms(
+                    &other["--agent-batch-max=".len()..],
+                    "--agent-batch-max",
+                )?);
+            }
+            "--agent-input" => {
+                agent_input = Some(take_value(&mut iter, "--agent-input")?);
+            }
+            other if other.starts_with("--agent-input=") => {
+                agent_input = Some(other["--agent-input=".len()..].to_string());
+            }
             other => {
                 if !flags.parse_flag(other, &mut iter)? {
                     return Err(usage(&format!("unexpected argument {other:?}")));
@@ -3259,6 +3370,8 @@ fn parse_serve<'a>(mut iter: impl Iterator<Item = &'a String>) -> Result<Command
             || flags.retention_ms.is_some()
             || flags.agent_cmd.is_some()
             || flags.has_agent_run_flags()
+            || agent_batch_max.is_some()
+            || agent_input.is_some()
             || flags.role.is_some()
             || flags.registry.is_some()
         {
@@ -3271,6 +3384,24 @@ fn parse_serve<'a>(mut iter: impl Iterator<Item = &'a String>) -> Result<Command
     }
 
     flags.validate()?;
+    // The agent-batching flags only qualify `--agent-cmd`; without it they
+    // would be silently ignored, so reject them rather than mislead (mirrors
+    // `SessionSpecFlags::validate`'s identical rule for the other agent-run
+    // flags).
+    if flags.agent_cmd.is_none() && (agent_batch_max.is_some() || agent_input.is_some()) {
+        return Err(usage(
+            "--agent-batch-max/--agent-input require --agent-cmd",
+        ));
+    }
+    // A `body`-mode child receives exactly one request's raw bytes on stdin,
+    // so a batch of more than one has nowhere to put the extra members.
+    // Rather than silently drop them, require the caller to opt into the
+    // shape that actually carries them all.
+    if agent_batch_max.is_some_and(|n| n > 1) && agent_input.as_deref() != Some("batch-json") {
+        return Err(usage(
+            "--agent-batch-max > 1 requires --agent-input batch-json",
+        ));
+    }
     let SessionSpecFlags {
         inbox,
         outbox,
@@ -3300,6 +3431,8 @@ fn parse_serve<'a>(mut iter: impl Iterator<Item = &'a String>) -> Result<Command
         agent_output,
         agent_result_key,
         role,
+        agent_batch_max,
+        agent_input,
         retention_ms,
         registry,
     })
@@ -4090,6 +4223,17 @@ fn parse_agent_timeout_ms(raw: &str, flag: &str) -> Result<u64> {
             "{flag} must be a non-negative integer, got {raw:?}"
         ))
     })
+}
+
+/// Takes the next token as `flag`'s value, or a usage error naming `flag` when
+/// the argument list ends first.
+fn take_value<'a>(
+    iter: &mut impl Iterator<Item = &'a String>,
+    flag: &str,
+) -> Result<String> {
+    iter.next()
+        .cloned()
+        .ok_or_else(|| usage(&format!("{flag} requires a value")))
 }
 
 /// Requires a non-blank directory value for `flag`.
@@ -6306,6 +6450,8 @@ mod tests {
                 role: None,
                 retention_ms: None,
                 registry: None,
+                agent_batch_max: None,
+                agent_input: None,
             }
         );
     }
@@ -6395,6 +6541,8 @@ mod tests {
                 role: None,
                 retention_ms: None,
                 registry: None,
+                agent_batch_max: None,
+                agent_input: None,
             }
         );
     }
@@ -6424,6 +6572,8 @@ mod tests {
                 role: None,
                 retention_ms: None,
                 registry: None,
+                agent_batch_max: None,
+                agent_input: None,
             }
         );
     }
@@ -6555,6 +6705,8 @@ mod tests {
                 role: None,
                 retention_ms: None,
                 registry: None,
+                agent_batch_max: None,
+                agent_input: None,
             }
         );
         assert!(matches!(
@@ -6568,6 +6720,188 @@ mod tests {
             .unwrap_err(),
             BatonError::Usage(_)
         ));
+    }
+
+    #[test]
+    fn parse_serve_accepts_agent_batch_max_and_input() {
+        assert_eq!(
+            parse_args(&argv(&[
+                "serve",
+                "--inbox=/tmp/in",
+                "--outbox=/tmp/out",
+                "--agent-cmd=claude",
+                "--agent-batch-max",
+                "3",
+                "--agent-input",
+                "batch-json",
+            ]))
+            .expect("parses"),
+            Command::Serve {
+                inbox: "/tmp/in".to_string(),
+                outbox: "/tmp/out".to_string(),
+                poll_ms: DEFAULT_SERVE_POLL_MS,
+                once: false,
+                agent_cmd: Some("claude".to_string()),
+                agent_args: vec![],
+                agent_cwd: None,
+                agent_timeout_ms: None,
+                agent_output: None,
+                agent_result_key: None,
+                role: None,
+                retention_ms: None,
+                registry: None,
+                agent_batch_max: Some(3),
+                agent_input: Some("batch-json".to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_serve_accepts_agent_batch_max_and_input_equals_form() {
+        assert_eq!(
+            parse_args(&argv(&[
+                "serve",
+                "--inbox=/tmp/in",
+                "--outbox=/tmp/out",
+                "--agent-cmd=claude",
+                "--agent-batch-max=1",
+                "--agent-input=body",
+            ]))
+            .expect("parses"),
+            Command::Serve {
+                inbox: "/tmp/in".to_string(),
+                outbox: "/tmp/out".to_string(),
+                poll_ms: DEFAULT_SERVE_POLL_MS,
+                once: false,
+                agent_cmd: Some("claude".to_string()),
+                agent_args: vec![],
+                agent_cwd: None,
+                agent_timeout_ms: None,
+                agent_output: None,
+                agent_result_key: None,
+                role: None,
+                retention_ms: None,
+                registry: None,
+                agent_batch_max: Some(1),
+                agent_input: Some("body".to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_serve_agent_batch_max_and_input_require_agent_cmd() {
+        for flag in ["--agent-batch-max=3", "--agent-input=batch-json"] {
+            assert!(
+                matches!(
+                    parse_args(&argv(&["serve", "--inbox=/tmp/in", "--outbox=/tmp/out", flag]))
+                        .unwrap_err(),
+                    BatonError::Usage(_)
+                ),
+                "{flag} without --agent-cmd should be a usage error"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_serve_agent_batch_max_non_numeric_or_zero_is_usage_error() {
+        for value in ["0", "not-a-number", "-1"] {
+            assert!(
+                matches!(
+                    parse_args(&argv(&[
+                        "serve",
+                        "--inbox=/tmp/in",
+                        "--outbox=/tmp/out",
+                        "--agent-cmd=claude",
+                        &format!("--agent-batch-max={value}"),
+                    ]))
+                    .unwrap_err(),
+                    BatonError::Usage(_)
+                ),
+                "--agent-batch-max={value} should be a usage error"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_serve_rejects_unknown_agent_input() {
+        // Like `--agent-output` (see `parse_serve_rejects_unknown_agent_output`),
+        // the selector string itself is validated later by `build_input_mode`,
+        // not at parse time — `parse_serve` only checks the flag combination.
+        assert!(matches!(
+            build_input_mode(Some("xml")).unwrap_err(),
+            BatonError::Usage(_)
+        ));
+    }
+
+    #[test]
+    fn build_input_mode_maps_selectors() {
+        assert_eq!(build_input_mode(None).expect("body default"), AgentInputMode::Body);
+        assert_eq!(build_input_mode(Some("body")).expect("body"), AgentInputMode::Body);
+        assert_eq!(
+            build_input_mode(Some("batch-json")).expect("batch-json"),
+            AgentInputMode::BatchJson
+        );
+    }
+
+    #[test]
+    fn parse_serve_agent_batch_max_above_one_requires_batch_json() {
+        // Omitted `--agent-input` (default `body`) can't carry more than one
+        // request's body, so `--agent-batch-max` above 1 requires the caller
+        // to opt into `batch-json` explicitly.
+        assert!(matches!(
+            parse_args(&argv(&[
+                "serve",
+                "--inbox=/tmp/in",
+                "--outbox=/tmp/out",
+                "--agent-cmd=claude",
+                "--agent-batch-max=2",
+            ]))
+            .unwrap_err(),
+            BatonError::Usage(_)
+        ));
+        assert!(matches!(
+            parse_args(&argv(&[
+                "serve",
+                "--inbox=/tmp/in",
+                "--outbox=/tmp/out",
+                "--agent-cmd=claude",
+                "--agent-batch-max=2",
+                "--agent-input=body",
+            ]))
+            .unwrap_err(),
+            BatonError::Usage(_)
+        ));
+        // `--agent-batch-max=1` (the default) never needs the guard, with or
+        // without an explicit `--agent-input=body`.
+        assert!(parse_args(&argv(&[
+            "serve",
+            "--inbox=/tmp/in",
+            "--outbox=/tmp/out",
+            "--agent-cmd=claude",
+            "--agent-batch-max=1",
+            "--agent-input=body",
+        ]))
+        .is_ok());
+    }
+
+    #[test]
+    fn parse_serve_stop_rejects_agent_batch_max_and_input() {
+        for flag in ["--agent-batch-max=3", "--agent-input=batch-json"] {
+            assert!(
+                matches!(
+                    parse_args(&argv(&["serve", "--stop", "--inbox=/tmp/in", flag])).unwrap_err(),
+                    BatonError::Usage(_)
+                ),
+                "{flag} should be meaningless for the stop client"
+            );
+        }
+    }
+
+    #[test]
+    fn usage_documents_agent_batch_max_and_input() {
+        assert!(USAGE.contains("--agent-batch-max"), "{USAGE}");
+        assert!(USAGE.contains("--agent-input"), "{USAGE}");
+        assert!(USAGE.contains("batch-json"), "{USAGE}");
     }
 
     #[test]
@@ -6625,6 +6959,8 @@ mod tests {
                 role: None,
                 retention_ms: None,
                 registry: None,
+                agent_batch_max: None,
+                agent_input: None,
             }
         );
     }
@@ -7566,6 +7902,7 @@ mod tests {
             None,
             &inbox,
             None,
+            1,
         )
         .expect("drain");
         assert!(matches!(drained, Drain::Drained(1)), "one request drained");
@@ -7590,6 +7927,7 @@ mod tests {
             None,
             &inbox,
             None,
+            1,
         )
         .expect("second drain");
         assert!(
@@ -7625,6 +7963,7 @@ mod tests {
             None,
             &inbox,
             None,
+            1,
         )
         .expect("drain");
         assert!(matches!(drained, Drain::Stopped), "sentinel ⇒ Stopped");
@@ -7634,6 +7973,239 @@ mod tests {
             "the pending message is left unprocessed"
         );
         assert!(json_files(&outbox).is_empty(), "no reply written");
+    }
+
+    // ---- `drain_mailbox` batching (`--agent-batch-max`) ----------------------
+
+    /// Builds a `request`-kind envelope like [`request_envelope`] but with a
+    /// chosen id/body, so a batch test can seed several distinct pending
+    /// messages and correlate each one's own reply.
+    fn request_with_id(id: &str, body: &str) -> MessageEnvelope {
+        MessageEnvelope::new(
+            id,
+            "conv-42",
+            "agent-a",
+            "agent-b",
+            MessageKind::Request,
+            body,
+            1_700_000_000_000,
+        )
+    }
+
+    /// A [`Participant`] whose `respond_batch` records the size of every batch
+    /// it was called with (proving `drain_mailbox` groups a whole batch into
+    /// one call, not one call per member), then answers each member with its
+    /// own request id echoed into the body so a test can tell members apart.
+    struct BatchSizeRecordingParticipant {
+        seen_batch_sizes: std::cell::RefCell<Vec<usize>>,
+    }
+
+    impl BatchSizeRecordingParticipant {
+        fn new() -> Self {
+            Self {
+                seen_batch_sizes: std::cell::RefCell::new(Vec::new()),
+            }
+        }
+    }
+
+    impl Participant for BatchSizeRecordingParticipant {
+        fn respond(&self, request: &MessageEnvelope) -> MessageEnvelope {
+            self.seen_batch_sizes.borrow_mut().push(1);
+            crate::participant::testing::correlated_reply(
+                request,
+                MessageKind::Response,
+                format!("echo:{}", request.message_id),
+            )
+        }
+
+        fn respond_batch(&self, requests: &[MessageEnvelope]) -> Vec<MessageEnvelope> {
+            self.seen_batch_sizes.borrow_mut().push(requests.len());
+            requests
+                .iter()
+                .map(|request| {
+                    crate::participant::testing::correlated_reply(
+                        request,
+                        MessageKind::Response,
+                        format!("echo:{}", request.message_id),
+                    )
+                })
+                .collect()
+        }
+    }
+
+    /// Three pending messages with `agent_batch_max: 3` are claimed into a
+    /// single `respond_batch` call (not three `respond` calls), each gets its
+    /// own correlated outbox reply, and `processed` counts the 3 members —
+    /// matching AC "exactly one invocation ... 3 outbox replies" at the
+    /// `drain_mailbox` seam (the process-level version is the integration
+    /// test against a real `--agent-cmd`).
+    #[test]
+    fn drain_mailbox_batches_up_to_agent_batch_max_in_one_call() {
+        let root = TempRoot::new("batch-max-3");
+        let inbox = root.path.join("inbox");
+        let outbox = root.path.join("outbox");
+
+        let mailbox = Mailbox::open(&inbox).expect("open mailbox");
+        mailbox.deliver(&request_with_id("m-1", "one")).expect("deliver 1");
+        mailbox.deliver(&request_with_id("m-2", "two")).expect("deliver 2");
+        mailbox.deliver(&request_with_id("m-3", "three")).expect("deliver 3");
+
+        let participant = BatchSizeRecordingParticipant::new();
+        let mut sink = NoopSink;
+
+        let drained = drain_mailbox(
+            &mailbox,
+            &outbox,
+            &participant,
+            &mut sink,
+            &test_meta(),
+            None,
+            None,
+            &inbox,
+            None,
+            3,
+        )
+        .expect("drain");
+
+        assert!(matches!(drained, Drain::Drained(3)), "3 members processed");
+        assert_eq!(
+            *participant.seen_batch_sizes.borrow(),
+            vec![3],
+            "one respond_batch call over all 3 members, not 3 calls"
+        );
+        let mut replies = json_files(&outbox);
+        replies.sort();
+        assert_eq!(
+            replies,
+            vec!["m-1.json".to_string(), "m-2.json".to_string(), "m-3.json".to_string()]
+        );
+        assert_eq!(json_files(&inbox.join("done")).len(), 3);
+        assert!(json_files(&inbox.join("pending")).is_empty());
+    }
+
+    /// `agent_batch_max: 5` with only 2 pending claims exactly those 2 and
+    /// answers them in one call, without waiting for a 3rd to arrive — the
+    /// "bounded by whatever's already claimable" half of the AC.
+    #[test]
+    fn drain_mailbox_batch_bounded_by_available_pending_not_max() {
+        let root = TempRoot::new("batch-max-5-only-2");
+        let inbox = root.path.join("inbox");
+        let outbox = root.path.join("outbox");
+
+        let mailbox = Mailbox::open(&inbox).expect("open mailbox");
+        mailbox.deliver(&request_with_id("m-1", "one")).expect("deliver 1");
+        mailbox.deliver(&request_with_id("m-2", "two")).expect("deliver 2");
+
+        let participant = BatchSizeRecordingParticipant::new();
+        let mut sink = NoopSink;
+
+        let drained = drain_mailbox(
+            &mailbox,
+            &outbox,
+            &participant,
+            &mut sink,
+            &test_meta(),
+            None,
+            None,
+            &inbox,
+            None,
+            5,
+        )
+        .expect("drain");
+
+        assert!(matches!(drained, Drain::Drained(2)));
+        assert_eq!(
+            *participant.seen_batch_sizes.borrow(),
+            vec![2],
+            "claims only what's available, doesn't block for a 3rd"
+        );
+    }
+
+    /// With `agent_batch_max: 2` and 4 pending, the pass forms two 2-member
+    /// batches (two `respond_batch` calls) before `pending/` is empty —
+    /// `processed` on the returned `Drain` counts all 4 members, not the 2
+    /// batches.
+    #[test]
+    fn drain_mailbox_batch_processed_counts_members_not_batches() {
+        let root = TempRoot::new("batch-max-2-of-4");
+        let inbox = root.path.join("inbox");
+        let outbox = root.path.join("outbox");
+
+        let mailbox = Mailbox::open(&inbox).expect("open mailbox");
+        for (id, body) in [("m-1", "one"), ("m-2", "two"), ("m-3", "three"), ("m-4", "four")] {
+            mailbox.deliver(&request_with_id(id, body)).expect("deliver");
+        }
+
+        let participant = BatchSizeRecordingParticipant::new();
+        let mut sink = NoopSink;
+
+        let drained = drain_mailbox(
+            &mailbox,
+            &outbox,
+            &participant,
+            &mut sink,
+            &test_meta(),
+            None,
+            None,
+            &inbox,
+            None,
+            2,
+        )
+        .expect("drain");
+
+        assert!(matches!(drained, Drain::Drained(4)));
+        assert_eq!(
+            *participant.seen_batch_sizes.borrow(),
+            vec![2, 2],
+            "two 2-member batches, not four 1-member calls"
+        );
+        assert_eq!(json_files(&inbox.join("done")).len(), 4);
+    }
+
+    /// AC6 (a claimed reply answers nothing) still applies per-member inside a
+    /// batch: a `response`-kind member alongside a normal `request` member
+    /// gets no outbox file of its own, while the request member's reply still
+    /// lands — the batch call runs over both, but only the request member's
+    /// output is persisted.
+    #[test]
+    fn drain_mailbox_batch_drops_response_kind_member_without_answering() {
+        let root = TempRoot::new("batch-drop-response-kind");
+        let inbox = root.path.join("inbox");
+        let outbox = root.path.join("outbox");
+
+        let mailbox = Mailbox::open(&inbox).expect("open mailbox");
+        let mut already_answered = request_with_id("m-1", "one");
+        already_answered.kind = MessageKind::Response;
+        mailbox.deliver(&already_answered).expect("deliver 1");
+        mailbox
+            .deliver(&request_with_id("m-2", "two"))
+            .expect("deliver 2");
+
+        let participant = BatchSizeRecordingParticipant::new();
+        let mut sink = NoopSink;
+
+        let drained = drain_mailbox(
+            &mailbox,
+            &outbox,
+            &participant,
+            &mut sink,
+            &test_meta(),
+            None,
+            None,
+            &inbox,
+            None,
+            2,
+        )
+        .expect("drain");
+
+        assert!(matches!(drained, Drain::Drained(2)), "both members complete");
+        assert_eq!(
+            *participant.seen_batch_sizes.borrow(),
+            vec![2],
+            "the batch call still ran over both members"
+        );
+        assert_eq!(json_files(&outbox), vec!["m-2.json".to_string()]);
+        assert_eq!(json_files(&inbox.join("done")).len(), 2);
     }
 
     /// A reclaimed in-flight message re-drains to the *same* outbox filename —
@@ -7660,6 +8232,7 @@ mod tests {
             None,
             &inbox,
             None,
+            1,
         )
         .expect("drain");
         assert_eq!(json_files(&outbox).len(), 1);
@@ -7679,6 +8252,7 @@ mod tests {
             None,
             &inbox,
             None,
+            1,
         )
         .expect("re-drain");
         assert_eq!(
@@ -7748,6 +8322,7 @@ mod tests {
             Some(&registry),
             &inbox,
             Some("alice"),
+            1,
         )
         .expect("drain");
         assert!(matches!(drained, Drain::Drained(1)));
@@ -7801,6 +8376,7 @@ mod tests {
             Some(&registry),
             &inbox,
             Some("alice"),
+            1,
         )
         .expect("drain");
         assert!(json_files(&outbox).is_empty());
@@ -7839,6 +8415,7 @@ mod tests {
                 Some(&registry),
                 &inbox,
                 Some("alice"),
+                1,
             )
             .expect("drain");
             assert_eq!(json_files(&outbox), vec!["m-req-1.json".to_string()]);
@@ -7863,6 +8440,7 @@ mod tests {
                 None,
                 &inbox,
                 Some("alice"),
+                1,
             )
             .expect("drain");
             assert_eq!(json_files(&outbox), vec!["m-req-1.json".to_string()]);
@@ -7888,6 +8466,7 @@ mod tests {
                 Some(&registry),
                 &inbox,
                 Some("alice"),
+                1,
             )
             .expect("drain");
             assert_eq!(json_files(&outbox), vec!["m-req-1.json".to_string()]);
@@ -7912,6 +8491,7 @@ mod tests {
                 Some(&registry),
                 &inbox,
                 Some("alice"),
+                1,
             )
             .expect("drain");
             assert_eq!(json_files(&outbox), vec!["m-req-1.json".to_string()]);
@@ -7946,6 +8526,7 @@ mod tests {
             None,
             &control_inbox,
             None,
+            1,
         )
         .expect("control drain");
         let golden = std::fs::read_to_string(control_outbox.join("m-req-1.json"))
@@ -7975,6 +8556,7 @@ mod tests {
             Some(&registry),
             &inbox,
             Some("alice"),
+            1,
         )
         .expect("drain");
 
@@ -8015,6 +8597,7 @@ mod tests {
             Some(&registry),
             &inbox,
             Some("a/b"),
+            1,
         )
         .expect("drain");
         assert_eq!(json_files(&outbox), vec!["m-req-1.json".to_string()]);
@@ -8048,6 +8631,7 @@ mod tests {
             Some(&registry),
             &inbox,
             Some("alice"),
+            1,
         )
         .expect("drain");
         assert_eq!(json_files(&peer_inbox.join("pending")).len(), 1);
@@ -8066,6 +8650,7 @@ mod tests {
             Some(&registry),
             &inbox,
             Some("alice"),
+            1,
         )
         .expect("re-drain");
         assert_eq!(
@@ -8104,6 +8689,7 @@ mod tests {
                 Some(&registry),
                 &inbox,
                 Some(role),
+                1,
             )
             .expect("drain");
         }
@@ -8147,6 +8733,7 @@ mod tests {
             Some(&registry),
             &inbox,
             Some("alice"),
+            1,
         )
         .expect("drain");
         assert!(matches!(drained, Drain::Drained(1)));
