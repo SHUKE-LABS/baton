@@ -4840,6 +4840,25 @@ printf 'x' >> "$BATON_TEST_COUNT"
 printf 'batched reply'"#,
     );
 
+    // Seed all three pending envelopes before the session is admitted: a
+    // live daemon may poll at any moment, so delivering after `service start`
+    // could let it claim a partial batch and legitimately split the
+    // invocation count.
+    let members = ["member-a", "member-b", "member-c"];
+    for (index, from) in members.iter().enumerate() {
+        let request = MessageEnvelope::new(
+            format!("svc-batch-{index}"),
+            "svc-batch-conv",
+            *from,
+            "worker",
+            MessageKind::Request,
+            format!("body from {from}"),
+            1_700_000_000_000 + index as u64,
+        );
+        mailbox::deliver_to(&inbox, &request).expect("seed pending request");
+        thread::sleep(Duration::from_millis(5));
+    }
+
     let mut run = Command::new(env!("CARGO_BIN_EXE_baton"));
     run.args(["service", "run", "--control", control.to_str().unwrap()]);
     run.stdout(Stdio::null());
@@ -4892,21 +4911,6 @@ printf 'batched reply'"#,
         "service start should accept the batching options; stderr: {}",
         String::from_utf8_lossy(&start.stderr)
     );
-
-    let members = ["member-a", "member-b", "member-c"];
-    for (index, from) in members.iter().enumerate() {
-        let request = MessageEnvelope::new(
-            format!("svc-batch-{index}"),
-            "svc-batch-conv",
-            *from,
-            "worker",
-            MessageKind::Request,
-            format!("body from {from}"),
-            1_700_000_000_000 + index as u64,
-        );
-        mailbox::deliver_to(&inbox, &request).expect("seed pending request");
-        thread::sleep(Duration::from_millis(5));
-    }
 
     let mut replies = None;
     for _ in 0..200 {
