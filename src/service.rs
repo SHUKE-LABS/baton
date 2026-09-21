@@ -116,6 +116,16 @@ pub struct SessionSpec {
     /// field existed still decodes.
     #[serde(default)]
     pub registry: Option<String>,
+    /// `baton serve --agent-batch-max`; `None` ⇒ one invocation per message.
+    /// `#[serde(default)]` so a spec persisted before this field existed
+    /// still decodes.
+    #[serde(default)]
+    pub agent_batch_max: Option<u64>,
+    /// `baton serve --agent-input`; `None` ⇒ `body`, the raw request body on
+    /// stdin. `#[serde(default)]` so a spec persisted before this field
+    /// existed still decodes.
+    #[serde(default)]
+    pub agent_input: Option<String>,
 }
 
 /// A parsed `baton service` invocation.
@@ -1837,6 +1847,8 @@ mod imp {
                 outbox: outbox.to_string(),
                 poll_ms: None,
                 retention_ms: None,
+                agent_batch_max: None,
+                agent_input: None,
                 agent_cmd: None,
                 agent_args: Vec::new(),
                 agent_cwd: None,
@@ -3074,6 +3086,72 @@ mod imp {
                     "0",
                 ]
             );
+        }
+
+        /// Issue #380: `serve_argv` forwards the batching options so a
+        /// `service start` spec reconstructs the same batched-daemon argv a
+        /// direct `baton serve --agent-batch-max 3 --agent-input batch-json`
+        /// would run. Both sit inside the `agent_cmd` block: without
+        /// `--agent-cmd` the parser rejects them, and their omission (a
+        /// legacy or default spec) leaves the argv byte-identical to the
+        /// pre-batching reconstruction.
+        #[test]
+        fn serve_argv_forwards_batching_options() {
+            let mut spec = spec("/tmp/in", "/tmp/out");
+            spec.agent_cmd = Some("claude".to_string());
+            spec.agent_batch_max = Some(3);
+            spec.agent_input = Some("batch-json".to_string());
+            assert_eq!(
+                serve_argv(&spec),
+                vec![
+                    "serve",
+                    "--inbox",
+                    "/tmp/in",
+                    "--outbox",
+                    "/tmp/out",
+                    "--agent-cmd",
+                    "claude",
+                    "--agent-batch-max",
+                    "3",
+                    "--agent-input",
+                    "batch-json",
+                ]
+            );
+        }
+
+        /// A session record persisted before the batching fields (#380)
+        /// existed has neither key on its nested `spec`; it still decodes,
+        /// with both defaulting to `None` rather than failing to parse.
+        #[test]
+        fn legacy_session_record_defaults_batching_fields_to_none() {
+            let dir = TempDir::new("legacy-batching");
+            let record = SessionRecord {
+                id: "svc-legacy-batching".to_string(),
+                spec: spec("/tmp/in", "/tmp/out"),
+                pid: 4242,
+                started_at: Some("123456".to_string()),
+                start_epoch_secs: Some(123456),
+                stderr_path: "/tmp/stderr.log".to_string(),
+            };
+            let mut json = serde_json::to_value(record).expect("serialize record");
+            let spec_obj = json
+                .get_mut("spec")
+                .and_then(|spec| spec.as_object_mut())
+                .expect("spec object");
+            spec_obj.remove("agent_batch_max");
+            spec_obj.remove("agent_input");
+            fs::create_dir_all(sessions_dir(&dir.path)).expect("create sessions dir");
+            fs::write(
+                session_record_path(&dir.path, "svc-legacy-batching").expect("record path"),
+                serde_json::to_vec(&json).expect("serialize legacy record"),
+            )
+            .expect("write legacy record");
+
+            let read = read_session_record(&dir.path, "svc-legacy-batching")
+                .expect("read legacy record")
+                .expect("legacy record exists");
+            assert_eq!(read.spec.agent_batch_max, None);
+            assert_eq!(read.spec.agent_input, None);
         }
 
         /// `execute_status` on a control root with no `Run` and no sessions

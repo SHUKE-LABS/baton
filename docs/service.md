@@ -95,7 +95,8 @@ or isolated control planes. The selected control directory holds:
 baton service run [--control <dir>] [--task-retention <duration>]
 baton service start [--control <dir>] --inbox <dir> --outbox <dir> [--poll-ms <n>]
                     [--agent-cmd <program> [--agent-arg <arg>]... [--agent-cwd <dir>]
-                     [--agent-timeout-ms <n>] [--agent-output raw|json [--agent-result-key <key>]]]
+                     [--agent-timeout-ms <n>] [--agent-output raw|json [--agent-result-key <key>]]
+                     [--agent-batch-max <n>] [--agent-input body|batch-json]]
                     [--role <name>] [--registry <path>]
 baton service status [--control <dir>] [--session <id>]
 baton service stop [--control <dir>] --session <id> [--force]
@@ -123,7 +124,20 @@ baton service teardown [--control <dir>] [--force]
   an equivalent `baton serve` argv by `run` — including
   `--agent-timeout-ms 0`, the explicit no-deadline external-agent mode (the
   turn runs until the agent finishes; `service stop` / `service teardown`
-  still terminate the in-flight turn's whole process tree). `--registry`
+  still terminate the in-flight turn's whole process tree).
+  **`--agent-batch-max <n>`** and **`--agent-input body|batch-json`** are
+  forwarded the same way, so a service-managed session gets direct-serve
+  batching (see [Batching in the external-agent
+  role](external-agent.md#batching---agent-batch-max--agent-input)):
+  `--agent-batch-max <n>` claims up to `n` pending
+  messages into one `--agent-cmd` invocation and fans its single reply back
+  to every claimed member; `--agent-input` selects the child's stdin shape —
+  `body` (the default) is the raw message body, `batch-json` is
+  `{"batch": [<envelope>, ...]}` — and any batch size above `1` requires
+  `batch-json`, since a raw body has nowhere to put the extra members. Both
+  options require `--agent-cmd` and are validated at submission time, before
+  the session is admitted.
+  `--registry`
   (see [Mailbox § Routing a reply into the sender's
   inbox](mailbox.md#routing-a-reply-into-the-senders-inbox-send---reply-to--serve---registry))
   requires `--role`, exactly as for direct `baton serve`. Direct

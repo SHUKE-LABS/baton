@@ -4813,6 +4813,165 @@ fn service_session_survives_submitting_client_and_is_owned_by_run() {
     assert!(run_status.success(), "service run exits 0 on teardown");
 }
 
+/// Issue #380: `service start --agent-batch-max 3 --agent-input batch-json`
+/// persists both options into the session spec and reconstructs them in the
+/// supervised child's argv, so a service-managed session batches exactly like
+/// a direct `baton serve` — three seeded pending requests produce one agent
+/// invocation whose stdin is a three-element ordered batch-json payload, three
+/// correlated replies, and empty `pending/` + `claimed/` at the end.
+#[cfg(unix)]
+#[test]
+fn service_start_forwards_batching_options() {
+    use baton::mailbox;
+    use baton::message::{MessageEnvelope, MessageKind};
+
+    let root = TempMailbox::new("service-batching");
+    let control = root.path.join("control");
+    let inbox = root.path.join("inbox");
+    let outbox = root.path.join("outbox");
+    let stub = root.path.join("agent-stub");
+    let invocation_count = root.path.join("invocation-count.txt");
+    let captured_stdin = root.path.join("agent-stdin.txt");
+
+    write_stub(
+        &stub,
+        r#"cat > "$BATON_TEST_STDIN"
+printf 'x' >> "$BATON_TEST_COUNT"
+printf 'batched reply'"#,
+    );
+
+    let mut run = Command::new(env!("CARGO_BIN_EXE_baton"));
+    run.args(["service", "run", "--control", control.to_str().unwrap()]);
+    run.stdout(Stdio::null());
+    run.stderr(Stdio::null());
+    // The supervised serve child inherits `run`'s environment, so the stub's
+    // capture variables ride on the supervisor, not the start client.
+    run.env("BATON_TEST_STDIN", &captured_stdin);
+    run.env("BATON_TEST_COUNT", &invocation_count);
+    let mut run_child = run.spawn().expect("spawn baton service run");
+
+    let control_str = control.to_str().unwrap();
+    let mut live = false;
+    for _ in 0..100 {
+        if let Ok(out) = Command::new(env!("CARGO_BIN_EXE_baton"))
+            .args(["service", "status", "--control", control_str])
+            .output()
+            && out.status.success()
+            && String::from_utf8_lossy(&out.stdout).contains("\"service_running\":true")
+        {
+            live = true;
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(live, "baton service run did not report live in time");
+
+    let start = Command::new(env!("CARGO_BIN_EXE_baton"))
+        .args([
+            "service",
+            "start",
+            "--control",
+            control_str,
+            "--inbox",
+            inbox.to_str().unwrap(),
+            "--outbox",
+            outbox.to_str().unwrap(),
+            "--poll-ms",
+            "20",
+            "--agent-cmd",
+            stub.to_str().unwrap(),
+            "--agent-batch-max",
+            "3",
+            "--agent-input",
+            "batch-json",
+        ])
+        .output()
+        .expect("run baton service start");
+    assert!(
+        start.status.success(),
+        "service start should accept the batching options; stderr: {}",
+        String::from_utf8_lossy(&start.stderr)
+    );
+
+    let members = ["member-a", "member-b", "member-c"];
+    for (index, from) in members.iter().enumerate() {
+        let request = MessageEnvelope::new(
+            format!("svc-batch-{index}"),
+            "svc-batch-conv",
+            *from,
+            "worker",
+            MessageKind::Request,
+            format!("body from {from}"),
+            1_700_000_000_000 + index as u64,
+        );
+        mailbox::deliver_to(&inbox, &request).expect("seed pending request");
+        thread::sleep(Duration::from_millis(5));
+    }
+
+    let mut replies = None;
+    for _ in 0..200 {
+        // The outbox directory only appears with the first reply.
+        if !outbox.is_dir() {
+            thread::sleep(Duration::from_millis(50));
+            continue;
+        }
+        let found = read_outbox_by_in_reply_to(&outbox);
+        if found.len() == members.len() {
+            replies = Some(found);
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    let replies =
+        replies.expect("the service-managed session answers every batched member");
+
+    assert_eq!(
+        std::fs::read_to_string(&invocation_count).expect("read invocation count"),
+        "x",
+        "3 pending under --agent-batch-max 3 must claim into exactly one invocation"
+    );
+
+    let stdin_raw = std::fs::read_to_string(&captured_stdin).expect("read captured stdin");
+    let stdin_json: serde_json::Value =
+        serde_json::from_str(&stdin_raw).expect("batch-json stdin parses as JSON");
+    let batch = stdin_json["batch"].as_array().expect("stdin has a batch array");
+    assert_eq!(batch.len(), 3, "batch carries every claimed member");
+    let seen_ids: Vec<&str> = batch
+        .iter()
+        .map(|entry| entry["message_id"].as_str().expect("member has message_id"))
+        .collect();
+    assert_eq!(
+        seen_ids,
+        vec!["svc-batch-0", "svc-batch-1", "svc-batch-2"],
+        "batch-json stdin preserves claim order (oldest first)"
+    );
+
+    for (index, from) in members.iter().enumerate() {
+        let reply = replies
+            .get(&format!("svc-batch-{index}"))
+            .unwrap_or_else(|| panic!("missing reply correlated to svc-batch-{index}"));
+        assert_eq!(reply["kind"], "response");
+        assert_eq!(reply["body"], "batched reply");
+        assert_eq!(reply["to"], *from, "reply routes back to its own originator");
+    }
+
+    assert_eq!(count_dir(&inbox.join("pending")), 0);
+    assert_eq!(count_dir(&inbox.join("claimed")), 0);
+    assert_eq!(count_dir(&inbox.join("done")), 3);
+
+    let teardown = Command::new(env!("CARGO_BIN_EXE_baton"))
+        .args(["service", "teardown", "--control", control_str])
+        .output()
+        .expect("run baton service teardown");
+    assert!(
+        teardown.status.success(),
+        "teardown should exit 0; stderr: {}",
+        String::from_utf8_lossy(&teardown.stderr)
+    );
+    let run_status = run_child.wait().expect("baton service run exits");
+    assert!(run_status.success(), "service run exits 0 on teardown");
+}
+
 /// Issue #196 regression: a service-owned session keeps a durable stderr log
 /// and exposes its path through `service status`, so warnings from malformed
 /// mailbox messages remain inspectable after the message is moved to `done/`.

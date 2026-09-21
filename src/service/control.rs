@@ -1008,6 +1008,14 @@ pub(super) fn serve_argv(spec: &SessionSpec) -> Vec<String> {
                 argv.push(key.clone());
             }
         }
+        if let Some(batch_max) = spec.agent_batch_max {
+            argv.push("--agent-batch-max".to_string());
+            argv.push(batch_max.to_string());
+        }
+        if let Some(input) = &spec.agent_input {
+            argv.push("--agent-input".to_string());
+            argv.push(input.clone());
+        }
     }
     if let Some(role) = &spec.role {
         argv.push("--role".to_string());
