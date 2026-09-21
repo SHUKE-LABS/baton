@@ -10,6 +10,11 @@ versioning.
 
 _Generated from release tags with `bash scripts/release.sh generate-changelog`._
 
+## v0.16.0 (2026-09-21)
+
+### Features
+- feat(service): forward --agent-batch-max/--agent-input through service start (#380) (#381)
+
 ## v0.15.0 … v0.14.1 (2026-09-19)
 
 ### Features
