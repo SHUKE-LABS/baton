@@ -4922,8 +4922,7 @@ printf 'batched reply'"#,
         }
         thread::sleep(Duration::from_millis(50));
     }
-    let replies =
-        replies.expect("the service-managed session answers every batched member");
+    let replies = replies.expect("the service-managed session answers every batched member");
 
     assert_eq!(
         std::fs::read_to_string(&invocation_count).expect("read invocation count"),
@@ -4934,7 +4933,9 @@ printf 'batched reply'"#,
     let stdin_raw = std::fs::read_to_string(&captured_stdin).expect("read captured stdin");
     let stdin_json: serde_json::Value =
         serde_json::from_str(&stdin_raw).expect("batch-json stdin parses as JSON");
-    let batch = stdin_json["batch"].as_array().expect("stdin has a batch array");
+    let batch = stdin_json["batch"]
+        .as_array()
+        .expect("stdin has a batch array");
     assert_eq!(batch.len(), 3, "batch carries every claimed member");
     let seen_ids: Vec<&str> = batch
         .iter()
@@ -4952,7 +4953,10 @@ printf 'batched reply'"#,
             .unwrap_or_else(|| panic!("missing reply correlated to svc-batch-{index}"));
         assert_eq!(reply["kind"], "response");
         assert_eq!(reply["body"], "batched reply");
-        assert_eq!(reply["to"], *from, "reply routes back to its own originator");
+        assert_eq!(
+            reply["to"], *from,
+            "reply routes back to its own originator"
+        );
     }
 
     assert_eq!(count_dir(&inbox.join("pending")), 0);

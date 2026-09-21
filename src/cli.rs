@@ -3320,7 +3320,8 @@ impl SessionSpecFlags {
 
         // `--agent-batch-max`/`--agent-input` qualify `--agent-cmd` the same
         // way; reject them rather than silently ignore.
-        if self.agent_cmd.is_none() && (self.agent_batch_max.is_some() || self.agent_input.is_some())
+        if self.agent_cmd.is_none()
+            && (self.agent_batch_max.is_some() || self.agent_input.is_some())
         {
             return Err(usage("--agent-batch-max/--agent-input require --agent-cmd"));
         }
@@ -7513,19 +7514,24 @@ mod tests {
     #[test]
     fn parse_service_start_batch_max_above_one_requires_batch_json() {
         // Omitted `--agent-input` (default `body`) can't carry more than one
-        // request's raw body, mirroring the direct-serve rule.
-        assert!(matches!(
-            parse_args(&argv(&[
+        // request's raw body, mirroring the direct-serve rule. The same holds
+        // for an explicit `--agent-input body`, which selects the same
+        // single-body stdin shape.
+        for input_flag in [None, Some("--agent-input=body")] {
+            let mut args = vec![
                 "service",
                 "start",
                 "--inbox=/tmp/in",
                 "--outbox=/tmp/out",
                 "--agent-cmd=claude",
                 "--agent-batch-max=2",
-            ]))
-            .unwrap_err(),
-            BatonError::Usage(_)
-        ));
+            ];
+            args.extend(input_flag.iter().copied());
+            assert!(
+                matches!(parse_args(&argv(&args)).unwrap_err(), BatonError::Usage(_)),
+                "batch > 1 with {input_flag:?} should be a usage error"
+            );
+        }
     }
 
     #[test]
