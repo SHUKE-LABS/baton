@@ -119,8 +119,9 @@ pub const USAGE: &str = concat!(
     "\n",
     "baton service run [--control <dir>] [--task-retention <duration>]\n",
     "    Run the service control-plane loop.\n",
-    "baton service start [--control <dir>] --inbox <dir> --outbox <dir> [--poll-ms <n>] [--agent-cmd <program> [--agent-arg <arg>]... [--agent-cwd <dir>] [--agent-timeout-ms <n>] [--agent-output raw|json [--agent-result-key <key>]]] [--role <name>] [--registry <path>]\n",
+    "baton service start [--control <dir>] --inbox <dir> --outbox <dir> [--poll-ms <n>] [--agent-cmd <program> [--agent-arg <arg>]... [--agent-cwd <dir>] [--agent-timeout-ms <n>] [--agent-output raw|json [--agent-result-key <key>]] [--agent-batch-max <n>] [--agent-input body|batch-json]] [--role <name>] [--registry <path>]\n",
     "    Start a supervised service session. `--agent-timeout-ms 0` waits indefinitely for the agent (no read deadline); a positive value is a bounded read timeout; omitting it keeps the 600000 ms default.\n",
+    "    `--agent-batch-max <n>` and `--agent-input body|batch-json` are forwarded to the underlying `baton serve`, same as direct-serve batching; `--agent-batch-max` above `1` requires `--agent-input batch-json`.\n",
     "    `--registry <path>` (requires `--role`) is forwarded to the underlying `baton serve`, same as direct-serve reply routing.\n",
     "baton service status [--control <dir>] [--session <id>]\n",
     "    Report a service session's status.\n",
@@ -3128,6 +3129,11 @@ struct SessionSpecFlags {
     agent_timeout_ms: Option<u64>,
     agent_output: Option<String>,
     agent_result_key: Option<String>,
+    /// `--agent-batch-max <n>`: the most pending messages one `--agent-cmd`
+    /// invocation claims; `None` ⇒ one invocation per message.
+    agent_batch_max: Option<u64>,
+    /// `--agent-input body|batch-json`: the child's stdin shape.
+    agent_input: Option<String>,
     role: Option<String>,
     /// `--registry` routing table path; requires `role` to be set (a routed
     /// reply's derived id names the role).
@@ -3238,6 +3244,28 @@ impl SessionSpecFlags {
                 self.agent_result_key = Some(other["--agent-result-key=".len()..].to_string());
                 Ok(true)
             }
+            "--agent-batch-max" => {
+                self.agent_batch_max = Some(parse_positive_ms(
+                    &take("--agent-batch-max")?,
+                    "--agent-batch-max",
+                )?);
+                Ok(true)
+            }
+            other if other.starts_with("--agent-batch-max=") => {
+                self.agent_batch_max = Some(parse_positive_ms(
+                    &other["--agent-batch-max=".len()..],
+                    "--agent-batch-max",
+                )?);
+                Ok(true)
+            }
+            "--agent-input" => {
+                self.agent_input = Some(take("--agent-input")?);
+                Ok(true)
+            }
+            other if other.starts_with("--agent-input=") => {
+                self.agent_input = Some(other["--agent-input=".len()..].to_string());
+                Ok(true)
+            }
             "--role" => {
                 self.role = Some(take("--role")?);
                 Ok(true)
@@ -3290,6 +3318,26 @@ impl SessionSpecFlags {
             ));
         }
 
+        // `--agent-batch-max`/`--agent-input` qualify `--agent-cmd` the same
+        // way; reject them rather than silently ignore.
+        if self.agent_cmd.is_none()
+            && (self.agent_batch_max.is_some() || self.agent_input.is_some())
+        {
+            return Err(usage("--agent-batch-max/--agent-input require --agent-cmd"));
+        }
+
+        // A `body`-mode child receives exactly one request's raw bytes on
+        // stdin, so a batch of more than one has nowhere to put the extra
+        // members. Rather than silently drop them, require the caller to opt
+        // into the shape that actually carries them all.
+        if self.agent_batch_max.is_some_and(|n| n > 1)
+            && self.agent_input.as_deref() != Some("batch-json")
+        {
+            return Err(usage(
+                "--agent-batch-max > 1 requires --agent-input batch-json",
+            ));
+        }
+
         // `--agent-result-key` names a field the `json` adapter reads; under
         // `raw` (the default) it has no effect, so reject it rather than
         // silently ignore.
@@ -3326,35 +3374,11 @@ fn parse_serve<'a>(mut iter: impl Iterator<Item = &'a String>) -> Result<Command
     let mut flags = SessionSpecFlags::default();
     let mut once = false;
     let mut stop = false;
-    // `--agent-batch-max`/`--agent-input` are `serve`-only (not shared with
-    // `service start`/`SessionSpec`, which reconstructs its argv from a fixed
-    // field set — see `SessionSpec`'s doc comment), so they are parsed here
-    // directly rather than through `SessionSpecFlags`.
-    let mut agent_batch_max: Option<u64> = None;
-    let mut agent_input: Option<String> = None;
 
     while let Some(arg) = iter.next() {
         match arg.as_str() {
             "--once" => once = true,
             "--stop" => stop = true,
-            "--agent-batch-max" => {
-                agent_batch_max = Some(parse_positive_ms(
-                    &take_value(&mut iter, "--agent-batch-max")?,
-                    "--agent-batch-max",
-                )?);
-            }
-            other if other.starts_with("--agent-batch-max=") => {
-                agent_batch_max = Some(parse_positive_ms(
-                    &other["--agent-batch-max=".len()..],
-                    "--agent-batch-max",
-                )?);
-            }
-            "--agent-input" => {
-                agent_input = Some(take_value(&mut iter, "--agent-input")?);
-            }
-            other if other.starts_with("--agent-input=") => {
-                agent_input = Some(other["--agent-input=".len()..].to_string());
-            }
             other => {
                 if !flags.parse_flag(other, &mut iter)? {
                     return Err(usage(&format!("unexpected argument {other:?}")));
@@ -3372,8 +3396,8 @@ fn parse_serve<'a>(mut iter: impl Iterator<Item = &'a String>) -> Result<Command
             || flags.retention_ms.is_some()
             || flags.agent_cmd.is_some()
             || flags.has_agent_run_flags()
-            || agent_batch_max.is_some()
-            || agent_input.is_some()
+            || flags.agent_batch_max.is_some()
+            || flags.agent_input.is_some()
             || flags.role.is_some()
             || flags.registry.is_some()
         {
@@ -3386,22 +3410,6 @@ fn parse_serve<'a>(mut iter: impl Iterator<Item = &'a String>) -> Result<Command
     }
 
     flags.validate()?;
-    // The agent-batching flags only qualify `--agent-cmd`; without it they
-    // would be silently ignored, so reject them rather than mislead (mirrors
-    // `SessionSpecFlags::validate`'s identical rule for the other agent-run
-    // flags).
-    if flags.agent_cmd.is_none() && (agent_batch_max.is_some() || agent_input.is_some()) {
-        return Err(usage("--agent-batch-max/--agent-input require --agent-cmd"));
-    }
-    // A `body`-mode child receives exactly one request's raw bytes on stdin,
-    // so a batch of more than one has nowhere to put the extra members.
-    // Rather than silently drop them, require the caller to opt into the
-    // shape that actually carries them all.
-    if agent_batch_max.is_some_and(|n| n > 1) && agent_input.as_deref() != Some("batch-json") {
-        return Err(usage(
-            "--agent-batch-max > 1 requires --agent-input batch-json",
-        ));
-    }
     let SessionSpecFlags {
         inbox,
         outbox,
@@ -3413,6 +3421,8 @@ fn parse_serve<'a>(mut iter: impl Iterator<Item = &'a String>) -> Result<Command
         agent_timeout_ms,
         agent_output,
         agent_result_key,
+        agent_batch_max,
+        agent_input,
         role,
         registry,
     } = flags;
@@ -3497,13 +3507,16 @@ fn parse_service_run<'a>(mut iter: impl Iterator<Item = &'a String>) -> Result<C
 /// Parses `baton service start [--control <dir>] --inbox <dir> --outbox <dir>
 /// [--poll-ms <n>] [--agent-cmd <program> [--agent-arg <arg>]...
 /// [--agent-cwd <dir>] [--agent-timeout-ms <n>] [--agent-output raw|json
-/// [--agent-result-key <key>]]] [--role <name>]`.
+/// [--agent-result-key <key>]] [--agent-batch-max <n>]
+/// [--agent-input body|batch-json]] [--role <name>]`.
 ///
 /// The session-spec flags mirror `baton serve`'s exactly (see
-/// [`parse_serve`]) — same names, same "agent-run flags require --agent-cmd"
-/// and "--agent-result-key requires --agent-output json" rules — since `Run`
-/// reconstructs an equivalent `baton serve` argv from the submitted spec
-/// rather than translating through a second flag surface.
+/// [`parse_serve`]) — same names, same "agent-run flags require --agent-cmd",
+/// "--agent-result-key requires --agent-output json", and batching rules —
+/// since `Run` reconstructs an equivalent `baton serve` argv from the
+/// submitted spec rather than translating through a second flag surface.
+/// Unlike `serve`, the `--agent-input` selector is validated here (before
+/// admission) rather than by the child's own `build_input_mode`.
 fn parse_service_start<'a>(mut iter: impl Iterator<Item = &'a String>) -> Result<Command> {
     let mut control: Option<String> = None;
     let mut flags = SessionSpecFlags::default();
@@ -3528,6 +3541,18 @@ fn parse_service_start<'a>(mut iter: impl Iterator<Item = &'a String>) -> Result
     }
 
     flags.validate()?;
+    // An unknown selector would only surface as the supervised child's own
+    // usage error after admission, so reject it here instead — same set
+    // `build_input_mode` accepts (see `parse_serve_rejects_unknown_agent_input`
+    // for why `serve` itself defers this check).
+    if let Some(input) = &flags.agent_input
+        && input != "body"
+        && input != "batch-json"
+    {
+        return Err(usage(&format!(
+            "unknown --agent-input selector {input:?} (expected body|batch-json)"
+        )));
+    }
     let SessionSpecFlags {
         inbox,
         outbox,
@@ -3539,6 +3564,8 @@ fn parse_service_start<'a>(mut iter: impl Iterator<Item = &'a String>) -> Result
         agent_timeout_ms,
         agent_output,
         agent_result_key,
+        agent_batch_max,
+        agent_input,
         role,
         registry,
     } = flags;
@@ -3569,6 +3596,8 @@ fn parse_service_start<'a>(mut iter: impl Iterator<Item = &'a String>) -> Result
         agent_timeout_ms,
         agent_output,
         agent_result_key,
+        agent_batch_max,
+        agent_input,
         role,
         registry,
     };
@@ -4223,14 +4252,6 @@ fn parse_agent_timeout_ms(raw: &str, flag: &str) -> Result<u64> {
             "{flag} must be a non-negative integer, got {raw:?}"
         ))
     })
-}
-
-/// Takes the next token as `flag`'s value, or a usage error naming `flag` when
-/// the argument list ends first.
-fn take_value<'a>(iter: &mut impl Iterator<Item = &'a String>, flag: &str) -> Result<String> {
-    iter.next()
-        .cloned()
-        .ok_or_else(|| usage(&format!("{flag} requires a value")))
 }
 
 /// Requires a non-blank directory value for `flag`.
@@ -7397,6 +7418,120 @@ mod tests {
             .unwrap_err(),
             BatonError::Usage(_)
         ));
+    }
+
+    /// Issue #380: the batching options parse into the spec in both the
+    /// separate-value and equals forms, so the supervised child reconstructs
+    /// a batched `serve` argv.
+    #[test]
+    fn parse_service_start_accepts_agent_batch_max_and_input() {
+        for flags in [
+            vec!["--agent-batch-max", "3", "--agent-input", "batch-json"],
+            vec!["--agent-batch-max=3", "--agent-input=batch-json"],
+        ] {
+            let mut args = vec![
+                "service",
+                "start",
+                "--inbox=/tmp/in",
+                "--outbox=/tmp/out",
+                "--agent-cmd=claude",
+            ];
+            args.extend(flags.iter().copied());
+            assert!(
+                matches!(
+                    parse_args(&argv(&args))
+                        .expect("batching flags should parse"),
+                    Command::Service(service::ServiceCommand::Start { ref spec, .. })
+                        if spec.agent_batch_max == Some(3)
+                            && spec.agent_input.as_deref() == Some("batch-json")
+                ),
+                "{flags:?} should land in the spec"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_service_start_batching_flags_require_agent_cmd() {
+        for flag in ["--agent-batch-max=3", "--agent-input=batch-json"] {
+            assert!(
+                matches!(
+                    parse_args(&argv(&[
+                        "service",
+                        "start",
+                        "--inbox=/tmp/in",
+                        "--outbox=/tmp/out",
+                        flag
+                    ]))
+                    .unwrap_err(),
+                    BatonError::Usage(_)
+                ),
+                "{flag} without --agent-cmd should be a usage error"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_service_start_batch_max_non_numeric_or_zero_is_usage_error() {
+        for value in ["0", "not-a-number", "-1"] {
+            assert!(
+                matches!(
+                    parse_args(&argv(&[
+                        "service",
+                        "start",
+                        "--inbox=/tmp/in",
+                        "--outbox=/tmp/out",
+                        "--agent-cmd=claude",
+                        &format!("--agent-batch-max={value}"),
+                    ]))
+                    .unwrap_err(),
+                    BatonError::Usage(_)
+                ),
+                "--agent-batch-max={value} should be a usage error"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_service_start_rejects_unknown_agent_input() {
+        // Unlike `serve` (which defers the selector check to the child's own
+        // `build_input_mode`), `service start` rejects an unknown mode before
+        // admission — otherwise it only surfaces as the supervised child's
+        // usage error after the session is already registered.
+        assert!(matches!(
+            parse_args(&argv(&[
+                "service",
+                "start",
+                "--inbox=/tmp/in",
+                "--outbox=/tmp/out",
+                "--agent-cmd=claude",
+                "--agent-input=xml",
+            ]))
+            .unwrap_err(),
+            BatonError::Usage(_)
+        ));
+    }
+
+    #[test]
+    fn parse_service_start_batch_max_above_one_requires_batch_json() {
+        // Omitted `--agent-input` (default `body`) can't carry more than one
+        // request's raw body, mirroring the direct-serve rule. The same holds
+        // for an explicit `--agent-input body`, which selects the same
+        // single-body stdin shape.
+        for input_flag in [None, Some("--agent-input=body")] {
+            let mut args = vec![
+                "service",
+                "start",
+                "--inbox=/tmp/in",
+                "--outbox=/tmp/out",
+                "--agent-cmd=claude",
+                "--agent-batch-max=2",
+            ];
+            args.extend(input_flag.iter().copied());
+            assert!(
+                matches!(parse_args(&argv(&args)).unwrap_err(), BatonError::Usage(_)),
+                "batch > 1 with {input_flag:?} should be a usage error"
+            );
+        }
     }
 
     #[test]
