@@ -10,6 +10,11 @@ versioning.
 
 _Generated from release tags with `bash scripts/release.sh generate-changelog`._
 
+## v0.17.0 (2026-10-10)
+
+### Features
+- feat(send): native send by session manifest with liveness and structured origin (#383) (#385)
+
 ## v0.16.0 (2026-09-21)
 
 ### Features
