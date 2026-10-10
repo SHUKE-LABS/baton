@@ -87,6 +87,7 @@ of the same name:
 | `BATON_INBOX` | the serving mailbox root (`--inbox`) |
 | `BATON_OUTBOX` | `--outbox` |
 | `BATON_ROLE` | `--role` name — absent (and stripped from any inherited value) without `--role` |
+| `BATON_ORIGIN` | the envelope's opaque `origin` (`send --origin`) — absent (and stripped from any inherited value) when the envelope has none |
 
 A headless agent can use these to know who is talking to it, whether the turn
 is a `request`/`response`/`error`/`notify`, and correlate it with an earlier

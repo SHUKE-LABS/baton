@@ -596,20 +596,13 @@ impl ExternalAgentParticipant {
     fn try_respond(&self, request: &MessageEnvelope) -> Result<String> {
         let mut envs = self.envs.clone();
         envs.extend(self.turn_envs(request));
-        // `BATON_ROLE` must be *absent* without `--role` (#361), even if the
-        // serving process itself inherited one — so a role-less turn strips
-        // it explicitly rather than merely not setting it.
-        let env_removals: &[&str] = if self.role.is_none() {
-            &["BATON_ROLE"]
-        } else {
-            &[]
-        };
+        let env_removals = self.env_removals(request);
 
         let (stdout, stderr) = capture_child_output(
             &self.program,
             &self.args,
             &envs,
-            env_removals,
+            &env_removals,
             Some(&self.cwd),
             request.body.as_bytes(),
             self.read_timeout,
@@ -642,17 +635,13 @@ impl ExternalAgentParticipant {
         let stdin = self.batch_stdin(requests)?;
         let mut envs = self.envs.clone();
         envs.extend(self.turn_envs_batch(requests));
-        let env_removals: &[&str] = if self.role.is_none() {
-            &["BATON_ROLE"]
-        } else {
-            &[]
-        };
+        let env_removals = self.env_removals(requests.last().expect("non-empty batch"));
 
         let (stdout, stderr) = capture_child_output(
             &self.program,
             &self.args,
             &envs,
-            env_removals,
+            &env_removals,
             Some(&self.cwd),
             &stdin,
             self.read_timeout,
@@ -759,7 +748,25 @@ impl ExternalAgentParticipant {
         if let Some(role) = &self.role {
             envs.push(("BATON_ROLE".to_string(), role.clone()));
         }
+        if let Some(origin) = &request.origin {
+            envs.push(("BATON_ORIGIN".to_string(), origin.clone()));
+        }
         envs
+    }
+
+    /// The optional `BATON_*` variables this turn leaves unset, stripped from
+    /// the child's environment rather than merely not set: `BATON_ROLE` without
+    /// `--role` (#361) and `BATON_ORIGIN` for a request carrying no `origin`,
+    /// so a value the serving process inherited never leaks into the turn.
+    fn env_removals(&self, request: &MessageEnvelope) -> Vec<&'static str> {
+        let mut removals = Vec::new();
+        if self.role.is_none() {
+            removals.push("BATON_ROLE");
+        }
+        if request.origin.is_none() {
+            removals.push("BATON_ORIGIN");
+        }
+        removals
     }
 
     /// Builds the `BATON_*` environment layer for a batch turn: today's
@@ -2230,6 +2237,54 @@ mod tests {
         );
     }
 
+    /// Echoes `BATON_ORIGIN` plus its `${BATON_ORIGIN+x}` presence marker, so
+    /// an absent origin is distinguishable from a set-but-empty one.
+    const ECHO_BATON_ORIGIN_SCRIPT: &str = "cat >/dev/null; \
+        printf 'ORIGIN=[%s]\\n' \"$BATON_ORIGIN\"; \
+        printf 'ORIGIN_SET=[%s]\\n' \"${BATON_ORIGIN+x}\"";
+
+    /// A body-mode turn whose request carries `origin` receives it as
+    /// `BATON_ORIGIN`; the body on stdin is untouched by it.
+    #[test]
+    fn external_agent_stamps_baton_origin_when_request_has_one() {
+        let dir = TempDir::new("ext-baton-origin");
+        let participant =
+            external_agent(ECHO_BATON_ORIGIN_SCRIPT, &dir.path, Duration::from_secs(5));
+        let mut request = request_with_body("m-req-1", "go");
+        request.origin = Some("peer".to_string());
+
+        let response = participant.respond(&request);
+
+        assert_eq!(response.body, "ORIGIN=[peer]\nORIGIN_SET=[x]\n");
+    }
+
+    /// A request without `origin` leaves `BATON_ORIGIN` genuinely absent, even
+    /// when the serving process itself inherited one.
+    #[test]
+    fn external_agent_strips_inherited_baton_origin_when_request_has_none() {
+        let _guard = ENV_MUTATION_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prior = std::env::var("BATON_ORIGIN").ok();
+        // Safety: serialized by `ENV_MUTATION_LOCK`, restored below.
+        unsafe { std::env::set_var("BATON_ORIGIN", "leaked-inherited-origin") };
+
+        let dir = TempDir::new("ext-baton-origin-absent");
+        let participant =
+            external_agent(ECHO_BATON_ORIGIN_SCRIPT, &dir.path, Duration::from_secs(5));
+        let response = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            participant.respond(&request_with_body("m-req-1", "go"))
+        }));
+
+        // Safety: restores the value observed before this test mutated it.
+        unsafe {
+            match prior {
+                Some(v) => std::env::set_var("BATON_ORIGIN", v),
+                None => std::env::remove_var("BATON_ORIGIN"),
+            }
+        }
+        let response = response.unwrap_or_else(|payload| std::panic::resume_unwind(payload));
+        assert_eq!(response.body, "ORIGIN=[]\nORIGIN_SET=[]\n");
+    }
+
     /// An agent that exits non-zero yields a synthesized delivered error naming
     /// the failure.
     #[test]
@@ -2644,9 +2699,11 @@ mod tests {
             Some(Duration::from_secs(5)),
         )
         .with_input_mode(AgentInputMode::BatchJson);
+        let mut with_origin = request_with_body("m-req-2", "second");
+        with_origin.origin = Some("operator".to_string());
         let requests = vec![
             request_with_body("m-req-1", "first"),
-            request_with_body("m-req-2", "second"),
+            with_origin,
             request_with_body("m-req-3", "third"),
         ];
 
@@ -2674,6 +2731,12 @@ mod tests {
             .map(|entry| entry.get("message_id").and_then(|v| v.as_str()).unwrap())
             .collect();
         assert_eq!(ids, vec!["m-req-1", "m-req-2", "m-req-3"]);
+        // `origin` rides on each envelope that carries one, and is omitted
+        // (not null) on those that do not.
+        assert!(batch[0].get("origin").is_none());
+        assert_eq!(batch[1]["origin"], "operator");
+        assert_eq!(batch[1]["body"], "second");
+        assert!(batch[2].get("origin").is_none());
     }
 
     /// `respond_batch`'s `BATON_*` env (and `BATON_BATCH_SIZE`) is sourced from

@@ -245,21 +245,40 @@ single-instance lock, so it posts to an inbox a live `serve` already owns; and i
 runs no provider call, so it needs no credential.
 
 ```
-baton send (--inbox <dir> | --registry <path>) (--body <text> [--to <role>] [--reply-to <name>] | --in <path>) [--from <id>] [--conversation <id>] [--await [--outbox <dir>] [--timeout-ms <n>]]
+baton send (--inbox <dir> | --registry <path> | --session <manifest>) ((--body <text> | --body-file <path>) [--to <role>] [--reply-to <name>] [--origin <value>] | --in <path>) [--from <id>] [--conversation <id>] [--require-live] [--await [--outbox <dir>] [--timeout-ms <n>]]
 ```
 
 - `--inbox <dir>` — the mailbox root; the request is written to its `pending/`.
-  Mutually exclusive with `--registry`.
+  Exactly one of `--inbox` / `--registry` / `--session` is required; any two
+  together fail before anything is written.
 - `--registry <path>` — resolve the destination by **role name** instead of a
   path (same registry format as `converse-ring`). The addressee role — the
   `--body` `--to <role>`, or the `--in` envelope's own `to` — is looked up to its
   `{inbox, outbox}` pair; an unknown role fails fast. The registry supplies the
   `--await` outbox, so `--outbox` is not passed with `--registry`.
+- `--session <manifest>` — resolve the addressee role through a
+  [session manifest](#session-manifest-batonsessionv1) instead: role `<name>`
+  maps to `<mailbox_root>/<name>/inbox` (and `/outbox` for `--await`). Routing,
+  `--to`, and `--outbox` rules are the same as `--registry`. A missing or
+  malformed manifest, or a recipient it does not list, fails before enqueue.
 - `--body <text>` — build a request envelope around this body. `--to`/`--from`/
   `--conversation` override its addressing (defaults `agent-b`/`agent-a` and a
   time-derived conversation id); the `message_id` is derived so no external id
   source is needed. With `--registry`, `--to <role>` is required (it is both the
   routing key and the envelope `to`).
+- `--body-file <path>` — like `--body`, with the body read from a file
+  (verbatim, newlines included). Mutually exclusive with `--body` and `--in`; an
+  unreadable or blank file fails before enqueue.
+- `--origin <value>` — with `--body`/`--body-file`, stamp the envelope's opaque
+  [`origin`](protocol.md#a2a-message-envelope-batonmessagev1) field. The body is
+  not modified. A receiving `serve --agent-cmd` passes it to the agent as
+  `BATON_ORIGIN` (body mode) or on each envelope (`--agent-input batch-json`).
+  Empty or whitespace-only values fail before enqueue; rejected with `--in`.
+- `--require-live` — immediately before enqueue, probe the resolved inbox's
+  `serve.lock` (the same one-shot probe as [`baton status`](#mailbox-liveness-baton-status)'s
+  `daemon`). If no `baton serve` holds it, exit non-zero without writing an
+  envelope. Works with every destination form. The probe is point-in-time: a
+  serve that stops right after it is not atomic with the delivery.
 - `--reply-to <name>` — with `--body`, stamp this on the request's `reply_to`
   field (mutually exclusive with `--in`, which carries its own envelope). It
   is intent only: `send` itself still writes to `--inbox`/`--registry`
@@ -276,7 +295,8 @@ baton send (--inbox <dir> | --registry <path>) (--body <text> [--to <role>] [--r
 - `--timeout-ms <n>` — how long `--await` waits before giving up (default
   `30000`).
 
-Without `--await`, `send` prints the sent `message_id` to stdout and exits. With
+Without `--await`, `send` prints the sent `message_id` to stdout — only after
+the atomic enqueue has landed — and exits. With
 `--await`, the `message_id` confirmation goes to stderr and **stdout carries only
 the reply envelope** (one JSON line), so a consumer can pipe it straight into a
 parser.
@@ -513,12 +533,36 @@ directory + a registry entry", not hand-assembling per-process env.
 
 **Non-goals (v1).** The registry is deliberately minimal:
 
-- **No convention-derived paths** (`<root>/<name>/…`) — a possible later
-  zero-config layer over the explicit registry.
+- **No convention-derived paths** (`<root>/<name>/…`) — that layout is the
+  separate [session manifest](#session-manifest-batonsessionv1)'s job.
 - **No dynamic discovery** (register / heartbeat / liveness / join-leave) — the
   roster is fixed for the run.
 - **No `to`-based routing** — the driver picks the next recipient by ring order;
   the registry only resolves names to mailboxes.
+
+### Session manifest (`baton.session/v1`)
+
+When every participant follows one layout, a session manifest names them
+instead of spelling out paths. `baton send --session <manifest> --to <name>`
+resolves `<name>` to `<mailbox_root>/<name>/inbox` (requests) and
+`<mailbox_root>/<name>/outbox` (`--await` replies).
+
+```json
+{
+  "schema": "baton.session/v1",
+  "mailbox_root": "/var/lib/team/mailbox",
+  "participants": ["dev", "reviewer"]
+}
+```
+
+| Field          | Meaning                                                                       |
+|----------------|-------------------------------------------------------------------------------|
+| `schema`       | Required; must be `baton.session/v1`.                                         |
+| `mailbox_root` | Required, non-empty. A relative path resolves against the manifest's directory. |
+| `participants` | Required list of recipient names; each must be a safe mailbox key.            |
+
+Unknown fields are ignored. Like the registry, the manifest is pure lookup —
+liveness is `--require-live`'s job, not the manifest's.
 
 ### Routing a reply into the sender's inbox (`send --reply-to` + `serve --registry`)
 
