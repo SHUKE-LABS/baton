@@ -52,6 +52,7 @@ use crate::participant::{
 use crate::registry::Registry;
 use crate::roles::{Identity, RolesHome};
 use crate::service::{self, SessionSpec};
+use crate::session::SessionManifest;
 use crate::task::{self, TaskCallback, TaskSpec};
 #[cfg(feature = "local")]
 use crate::transport::Transport;
@@ -94,9 +95,11 @@ pub const USAGE: &str = concat!(
     "    `--agent-batch-max <n>` (requires `--agent-cmd`) claims up to `n` pending messages into one `--agent-cmd` invocation, fanning its single reply back to every claimed member; omitting it keeps today's one-invocation-per-message behavior. `--agent-input body|batch-json` (requires `--agent-cmd`) selects the child's stdin shape: `body` (default) is the raw message body, `batch-json` is `{\"batch\": [<envelope>, ...]}`; `--agent-batch-max` above `1` requires `--agent-input batch-json`.\n",
     "    `--registry <path>` (requires `--role`) routes a claimed request's `reply_to` name into that peer's inbox instead of `--outbox`.\n",
     "\n",
-    "baton send (--inbox <dir> | --registry <path>) (--body <text> [--to <role>] [--reply-to <name>] | --in <path>) [--from <id>] [--conversation <id>] [--await [--outbox <dir>] [--timeout-ms <n>]]\n",
-    "    Deliver one message to a mailbox or registry-resolved role, optionally awaiting the reply.\n",
+    "baton send (--inbox <dir> | --registry <path> | --session <manifest>) ((--body <text> | --body-file <path>) [--to <role>] [--reply-to <name>] [--origin <value>] | --in <path>) [--from <id>] [--conversation <id>] [--require-live] [--await [--outbox <dir>] [--timeout-ms <n>]]\n",
+    "    Deliver one message to a mailbox or a registry/session-resolved role, optionally awaiting the reply; prints the message id once enqueued.\n",
+    "    `--session <manifest>` resolves `--to` through a `baton.session/v1` manifest (`<mailbox_root>/<name>/inbox`).\n",
     "    `--reply-to <name>` stamps a routing hint a `serve --registry --role` daemon on the receiving end resolves to push its reply into that peer's inbox.\n",
+    "    `--origin <value>` stamps the envelope's opaque `origin` (an agent turn sees it as `BATON_ORIGIN`); `--require-live` refuses to enqueue unless a `baton serve` holds the inbox's `serve.lock`.\n",
     "\n",
     "baton status (--mailbox <root> | --registry <path> --role <role>) [--max-runtime-ms <n>]\n",
     "    Report a mailbox's claim and health status.\n",
@@ -308,11 +311,14 @@ enum Command {
     /// addressing) or read whole from `--in`. `await_reply` requires `outbox`.
     Send {
         /// Explicit mailbox root; `None` when the destination is resolved from
-        /// `registry` + the addressee role instead.
+        /// `registry`/`session` + the addressee role instead.
         inbox: Option<String>,
         /// Routing registry path; when set, the addressee role (the `--body`
         /// `--to`, or the `--in` envelope's `to`) resolves the inbox/outbox.
         registry: Option<String>,
+        /// `baton.session/v1` manifest path; resolves the addressee role like
+        /// `registry`, by the manifest's mailbox-root convention.
+        session: Option<String>,
         source: SendSource,
         to: Option<String>,
         from: Option<String>,
@@ -324,6 +330,11 @@ enum Command {
         await_reply: bool,
         outbox: Option<String>,
         timeout_ms: u64,
+        /// `--require-live`: refuse unless a `baton serve` holds the resolved
+        /// inbox's `serve.lock` immediately before enqueue.
+        require_live: bool,
+        /// `--origin <value>`: stamped as the envelope's opaque `origin`.
+        origin: Option<String>,
     },
     /// Report a mailbox's liveness — `idle-done` / `busy` / `crashed-stale` plus
     /// queue depth — over an explicit `--mailbox <root>` or a `--registry
@@ -410,6 +421,9 @@ enum SeedSource {
 enum SendSource {
     /// `--body <text>`: construct a request envelope around this body.
     Body(String),
+    /// `--body-file <path>`: like `Body`, with the body read from this path at
+    /// run time.
+    BodyFile(String),
     /// `--in <path>`: read a complete envelope from this path at run time.
     Envelope(String),
 }
@@ -849,6 +863,7 @@ pub fn run() -> Result<()> {
         Command::Send {
             inbox,
             registry,
+            session,
             source,
             to,
             from,
@@ -857,22 +872,36 @@ pub fn run() -> Result<()> {
             await_reply,
             outbox,
             timeout_ms,
+            require_live,
+            origin,
         } => {
             // A producer runs no provider call, so `send` needs no credential —
             // it does not load `BatonConfig`. Only the event sink is wired.
             let mut sink = open_event_sink()?;
-            let envelope = build_send_envelope(&source, to, from, conversation, reply_to)?;
+            let mut envelope = build_send_envelope(&source, to, from, conversation, reply_to)?;
+            // `parse_send` admits `--origin` only for a built envelope; an `--in`
+            // envelope keeps its own.
+            if origin.is_some() {
+                envelope.origin = origin;
+            }
             // Resolve the delivery inbox and await outbox: either explicit paths,
             // or the addressee role (the envelope's `to`) looked up in the
-            // registry. An unknown role fails fast via `Registry::resolve`.
-            let (inbox_path, outbox_path) = match &registry {
-                Some(registry_path) => {
+            // registry or session manifest. An unknown role fails fast.
+            let (inbox_path, outbox_path) = match (&registry, &session) {
+                (Some(registry_path), _) => {
                     let registry = Registry::from_path(Path::new(registry_path))?;
                     let mailbox_ref = registry.resolve(&envelope.to)?;
                     (mailbox_ref.inbox.clone(), Some(mailbox_ref.outbox.clone()))
                 }
-                None => (
-                    PathBuf::from(inbox.expect("parse_send guarantees --inbox without --registry")),
+                (None, Some(session_path)) => {
+                    let manifest = SessionManifest::from_path(Path::new(session_path))?;
+                    let mailbox_ref = manifest.resolve(&envelope.to)?;
+                    (mailbox_ref.inbox, Some(mailbox_ref.outbox))
+                }
+                (None, None) => (
+                    PathBuf::from(
+                        inbox.expect("parse_send guarantees --inbox without --registry/--session"),
+                    ),
                     outbox.map(PathBuf::from),
                 ),
             };
@@ -881,6 +910,7 @@ pub fn run() -> Result<()> {
                 &inbox_path,
                 outbox_path.as_deref(),
                 &envelope,
+                require_live,
                 await_reply,
                 Duration::from_millis(timeout_ms),
                 Duration::from_millis(SEND_POLL_INTERVAL_MS),
@@ -1604,7 +1634,9 @@ fn announce_serve_ready(mut out: impl Write) -> Result<()> {
 /// the send, and — when `await_reply` — consumes the correlated reply from
 /// `outbox` and writes it to `out`.
 ///
-/// The delivery goes through [`mailbox::deliver_to`], which does **not** take the
+/// The delivery goes through [`mailbox::send_to`] — which rejects a blank
+/// `origin` and, with `require_live`, refuses unless a serve holds the inbox's
+/// lock — and so [`mailbox::deliver_to`], which does **not** take the
 /// single-instance lock, so it posts to a mailbox a live `baton serve` owns.
 /// Without `--await`, the sent `message_id` is written to `out` (the command's
 /// result) and the function returns. With `--await`, `out` instead carries the
@@ -1626,6 +1658,7 @@ fn execute_send(
     inbox: &Path,
     outbox: Option<&Path>,
     envelope: &MessageEnvelope,
+    require_live: bool,
     await_reply: bool,
     timeout: Duration,
     poll_interval: Duration,
@@ -1633,7 +1666,7 @@ fn execute_send(
     pretty: bool,
     mut out: impl Write,
 ) -> Result<()> {
-    mailbox::deliver_to(inbox, envelope)?;
+    mailbox::send_to(inbox, envelope, require_live)?;
     emit(sink, &ExchangeEvent::message_sent(now_ms(), envelope));
 
     let Some(outbox) = outbox.filter(|_| await_reply) else {
@@ -1789,8 +1822,9 @@ fn await_response(
 }
 
 /// Resolves the `send` message to deliver: builds a request envelope from
-/// `--body` (with optional addressing overrides and `--reply-to`), or reads a
-/// complete envelope from `--in`.
+/// `--body` or `--body-file` (with optional addressing overrides and
+/// `--reply-to`), or reads a complete envelope from `--in`. A `--body-file`
+/// that is unreadable or blank fails here, before anything is delivered.
 ///
 /// The `--body` ids are derived from the emission time plus the process id so a
 /// send needs no external id source and two rapid invocations never collide on a
@@ -1803,25 +1837,33 @@ fn build_send_envelope(
     conversation: Option<String>,
     reply_to: Option<String>,
 ) -> Result<MessageEnvelope> {
-    match source {
-        SendSource::Body(body) => {
-            let ts_ms = now_ms();
-            let conversation_id = conversation.unwrap_or_else(|| format!("conv-{ts_ms}"));
-            let message_id = format!("{conversation_id}-{ts_ms}-{}", std::process::id());
-            let mut envelope = MessageEnvelope::new(
-                message_id,
-                conversation_id,
-                from.unwrap_or_else(|| "agent-a".to_string()),
-                to.unwrap_or_else(|| "agent-b".to_string()),
-                MessageKind::Request,
-                body.clone(),
-                ts_ms,
-            );
-            envelope.reply_to = reply_to;
-            Ok(envelope)
+    let body = match source {
+        SendSource::Body(body) => body.clone(),
+        SendSource::BodyFile(path) => {
+            let body = std::fs::read_to_string(path).map_err(|err| {
+                BatonError::Io(format!("failed to read --body-file {path:?}: {err}"))
+            })?;
+            if body.trim().is_empty() {
+                return Err(usage(&format!("--body-file {path:?} must not be empty")));
+            }
+            body
         }
-        SendSource::Envelope(path) => read_request_envelope(open_input(Some(path))?),
-    }
+        SendSource::Envelope(path) => return read_request_envelope(open_input(Some(path))?),
+    };
+    let ts_ms = now_ms();
+    let conversation_id = conversation.unwrap_or_else(|| format!("conv-{ts_ms}"));
+    let message_id = format!("{conversation_id}-{ts_ms}-{}", std::process::id());
+    let mut envelope = MessageEnvelope::new(
+        message_id,
+        conversation_id,
+        from.unwrap_or_else(|| "agent-a".to_string()),
+        to.unwrap_or_else(|| "agent-b".to_string()),
+        MessageKind::Request,
+        body,
+        ts_ms,
+    );
+    envelope.reply_to = reply_to;
+    Ok(envelope)
 }
 
 /// Opens the exchange request source: `--in <path>` when given, else stdin.
@@ -3907,25 +3949,32 @@ fn parse_task_cancel<'a>(mut iter: impl Iterator<Item = &'a String>) -> Result<C
 
 /// Parses the arguments following the `send` subcommand.
 ///
-/// Requires `--inbox <dir>` and exactly one message source (`--body <text>` xor
-/// `--in <path>`). `--to`/`--from`/`--conversation`/`--reply-to` describe a
-/// `--body`-built message and are rejected alongside `--in` (a full envelope
-/// carries its own). `--reply-to <name>` stamps `reply_to` on the envelope so a
-/// receiving `serve --registry --role` daemon routes its reply into that name's
-/// inbox instead of its own outbox. `--await` requires `--outbox <dir>`;
-/// `--outbox` and `--timeout-ms` are valid only with `--await`. Every valued
-/// flag also accepts the `--flag=value` form. A blank body, a missing/blank
-/// required dir, a non-positive `--timeout-ms`, or any other token is a usage
-/// error.
+/// Requires exactly one destination (`--inbox <dir>`, `--registry <path>`, or
+/// `--session <manifest>`) and exactly one message source (`--body <text>`,
+/// `--body-file <path>`, or `--in <path>`).
+/// `--to`/`--from`/`--conversation`/`--reply-to`/`--origin` describe a built
+/// message and are rejected alongside `--in` (a full envelope carries its own).
+/// `--reply-to <name>` stamps `reply_to` on the envelope so a receiving `serve
+/// --registry --role` daemon routes its reply into that name's inbox instead of
+/// its own outbox. `--origin` must not be blank. `--require-live` refuses the
+/// send unless a serve holds the resolved inbox's lock. `--await` requires
+/// `--outbox <dir>` (or a registry/session lookup); `--outbox` and
+/// `--timeout-ms` are valid only with `--await`. Every valued flag also accepts
+/// the `--flag=value` form. A blank body, a missing/blank required dir, a
+/// non-positive `--timeout-ms`, or any other token is a usage error.
 fn parse_send<'a>(mut iter: impl Iterator<Item = &'a String>) -> Result<Command> {
     let mut inbox: Option<String> = None;
     let mut registry: Option<String> = None;
+    let mut session: Option<String> = None;
     let mut body: Option<String> = None;
+    let mut body_file: Option<String> = None;
     let mut in_path: Option<String> = None;
     let mut to: Option<String> = None;
     let mut from: Option<String> = None;
     let mut conversation: Option<String> = None;
     let mut reply_to: Option<String> = None;
+    let mut origin: Option<String> = None;
+    let mut require_live = false;
     let mut await_reply = false;
     let mut outbox: Option<String> = None;
     let mut timeout_ms: Option<u64> = None;
@@ -3945,10 +3994,23 @@ fn parse_send<'a>(mut iter: impl Iterator<Item = &'a String>) -> Result<Command>
             other if other.starts_with("--registry=") => {
                 registry = Some(other["--registry=".len()..].to_string());
             }
+            "--session" => session = Some(take("--session")?),
+            other if other.starts_with("--session=") => {
+                session = Some(other["--session=".len()..].to_string());
+            }
             "--body" => body = Some(take("--body")?),
             other if other.starts_with("--body=") => {
                 body = Some(other["--body=".len()..].to_string());
             }
+            "--body-file" => body_file = Some(take("--body-file")?),
+            other if other.starts_with("--body-file=") => {
+                body_file = Some(other["--body-file=".len()..].to_string());
+            }
+            "--origin" => origin = Some(take("--origin")?),
+            other if other.starts_with("--origin=") => {
+                origin = Some(other["--origin=".len()..].to_string());
+            }
+            "--require-live" => require_live = true,
             "--in" => in_path = Some(take("--in")?),
             other if other.starts_with("--in=") => {
                 in_path = Some(other["--in=".len()..].to_string());
@@ -3982,33 +4044,62 @@ fn parse_send<'a>(mut iter: impl Iterator<Item = &'a String>) -> Result<Command>
         }
     }
 
-    let source = match (body, in_path) {
-        (Some(_), Some(_)) => return Err(usage("--body and --in are mutually exclusive")),
-        (Some(body), None) => {
+    let source = match (body, body_file, in_path) {
+        (Some(body), None, None) => {
             if body.trim().is_empty() {
                 return Err(usage("--body must not be empty"));
             }
             SendSource::Body(body)
         }
-        (None, Some(path)) => {
-            if to.is_some() || from.is_some() || conversation.is_some() || reply_to.is_some() {
+        (None, Some(path), None) => {
+            if path.trim().is_empty() {
+                return Err(usage("--body-file <path> must not be empty"));
+            }
+            SendSource::BodyFile(path)
+        }
+        (None, None, Some(path)) => {
+            if to.is_some()
+                || from.is_some()
+                || conversation.is_some()
+                || reply_to.is_some()
+                || origin.is_some()
+            {
                 return Err(usage(
-                    "--to/--from/--conversation/--reply-to apply to --body; --in supplies a complete envelope",
+                    "--to/--from/--conversation/--reply-to/--origin apply to --body/--body-file; --in supplies a complete envelope",
                 ));
             }
             SendSource::Envelope(path)
         }
-        (None, None) => {
-            return Err(usage("missing message: pass --body <text> or --in <path>"));
+        (None, None, None) => {
+            return Err(usage(
+                "missing message: pass --body <text>, --body-file <path>, or --in <path>",
+            ));
+        }
+        _ => {
+            return Err(usage(
+                "--body, --body-file, and --in are mutually exclusive",
+            ));
         }
     };
+    if origin.as_deref().is_some_and(|o| o.trim().is_empty()) {
+        return Err(usage("--origin must not be empty or whitespace"));
+    }
 
-    // Destination: exactly one of --inbox (a path) / --registry (role lookup).
-    let inbox = match (inbox, &registry) {
-        (Some(_), Some(_)) => return Err(usage("--inbox and --registry are mutually exclusive")),
-        (Some(inbox), None) => Some(require_dir(Some(inbox), "--inbox")?),
-        (None, Some(_)) => None,
-        (None, None) => return Err(usage("--inbox <dir> or --registry <path> is required")),
+    // Destination: exactly one of --inbox (a path) / --registry / --session
+    // (role lookups).
+    let inbox = match (inbox, &registry, &session) {
+        (Some(inbox), None, None) => Some(require_dir(Some(inbox), "--inbox")?),
+        (None, Some(_), None) | (None, None, Some(_)) => None,
+        (None, None, None) => {
+            return Err(usage(
+                "--inbox <dir>, --registry <path>, or --session <manifest> is required",
+            ));
+        }
+        _ => {
+            return Err(usage(
+                "--inbox, --registry, and --session are mutually exclusive",
+            ));
+        }
     };
     let registry = match registry {
         Some(path) if path.trim().is_empty() => {
@@ -4016,20 +4107,31 @@ fn parse_send<'a>(mut iter: impl Iterator<Item = &'a String>) -> Result<Command>
         }
         other => other,
     };
-    // A --body send routes by --to (the addressee role); an --in send routes by
+    let session = match session {
+        Some(path) if path.trim().is_empty() => {
+            return Err(usage("--session <manifest> must not be empty"));
+        }
+        other => other,
+    };
+    let lookup = registry.is_some() || session.is_some();
+    // A built send routes by --to (the addressee role); an --in send routes by
     // the envelope's own `to`, so --to is not required (and is rejected above).
-    if registry.is_some() && matches!(source, SendSource::Body(_)) && to.is_none() {
-        return Err(usage("--registry with --body requires --to <role>"));
+    if lookup && !matches!(source, SendSource::Envelope(_)) && to.is_none() {
+        return Err(usage(
+            "--registry/--session with --body/--body-file requires --to <role>",
+        ));
     }
 
-    // With --registry the outbox is resolved from the role, so --outbox is
-    // rejected; --await then needs no explicit outbox.
-    if registry.is_some() && outbox.is_some() {
-        return Err(usage("--outbox is supplied by --registry; do not pass it"));
-    }
-    if await_reply && outbox.is_none() && registry.is_none() {
+    // With --registry/--session the outbox is resolved from the role, so
+    // --outbox is rejected; --await then needs no explicit outbox.
+    if lookup && outbox.is_some() {
         return Err(usage(
-            "--await requires --outbox <dir> (or --registry to resolve it)",
+            "--outbox is supplied by --registry/--session; do not pass it",
+        ));
+    }
+    if await_reply && outbox.is_none() && !lookup {
+        return Err(usage(
+            "--await requires --outbox <dir> (or --registry/--session to resolve it)",
         ));
     }
     if !await_reply && outbox.is_some() {
@@ -4048,6 +4150,7 @@ fn parse_send<'a>(mut iter: impl Iterator<Item = &'a String>) -> Result<Command>
     Ok(Command::Send {
         inbox,
         registry,
+        session,
         source,
         to,
         from,
@@ -4056,6 +4159,8 @@ fn parse_send<'a>(mut iter: impl Iterator<Item = &'a String>) -> Result<Command>
         await_reply,
         outbox,
         timeout_ms: timeout_ms.unwrap_or(DEFAULT_SEND_TIMEOUT_MS),
+        require_live,
+        origin,
     })
 }
 
@@ -8954,6 +9059,7 @@ mod tests {
             Command::Send {
                 inbox: Some("/tmp/mb".to_string()),
                 registry: None,
+                session: None,
                 source: SendSource::Body("hi".to_string()),
                 to: None,
                 from: None,
@@ -8962,6 +9068,8 @@ mod tests {
                 await_reply: false,
                 outbox: None,
                 timeout_ms: DEFAULT_SEND_TIMEOUT_MS,
+                require_live: false,
+                origin: None,
             }
         );
     }
@@ -8982,6 +9090,7 @@ mod tests {
             Command::Send {
                 inbox: Some("/tmp/mb".to_string()),
                 registry: None,
+                session: None,
                 source: SendSource::Body("hi".to_string()),
                 to: None,
                 from: None,
@@ -8990,6 +9099,8 @@ mod tests {
                 await_reply: false,
                 outbox: None,
                 timeout_ms: DEFAULT_SEND_TIMEOUT_MS,
+                require_live: false,
+                origin: None,
             }
         );
     }
@@ -9009,6 +9120,7 @@ mod tests {
             Command::Send {
                 inbox: Some("/tmp/mb".to_string()),
                 registry: None,
+                session: None,
                 source: SendSource::Envelope("/tmp/env.json".to_string()),
                 to: None,
                 from: None,
@@ -9017,6 +9129,8 @@ mod tests {
                 await_reply: true,
                 outbox: Some("/tmp/ob".to_string()),
                 timeout_ms: 1500,
+                require_live: false,
+                origin: None,
             }
         );
     }
@@ -9088,6 +9202,7 @@ mod tests {
             Command::Send {
                 inbox: None,
                 registry: Some("/tmp/reg.json".to_string()),
+                session: None,
                 source: SendSource::Body("hi".to_string()),
                 to: Some("reviewer".to_string()),
                 from: None,
@@ -9096,6 +9211,8 @@ mod tests {
                 await_reply: false,
                 outbox: None,
                 timeout_ms: DEFAULT_SEND_TIMEOUT_MS,
+                require_live: false,
+                origin: None,
             }
         );
     }
@@ -9115,6 +9232,7 @@ mod tests {
             Command::Send {
                 inbox: None,
                 registry: Some("/tmp/reg.json".to_string()),
+                session: None,
                 source: SendSource::Body("hi".to_string()),
                 to: Some("reviewer".to_string()),
                 from: None,
@@ -9123,6 +9241,8 @@ mod tests {
                 await_reply: true,
                 outbox: None,
                 timeout_ms: DEFAULT_SEND_TIMEOUT_MS,
+                require_live: false,
+                origin: None,
             }
         );
     }
@@ -9159,6 +9279,105 @@ mod tests {
             ],
             // blank --registry.
             &["send", "--registry", "  ", "--to", "r", "--body", "hi"],
+        ];
+        for case in cases {
+            assert!(
+                matches!(parse_args(&argv(case)).unwrap_err(), BatonError::Usage(_)),
+                "expected usage error for {case:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn parses_send_session_body_file_origin_and_require_live() {
+        assert_eq!(
+            parse_args(&argv(&[
+                "send",
+                "--session=/tmp/s.json",
+                "--to",
+                "reviewer",
+                "--body-file",
+                "/tmp/b.md",
+                "--origin=peer",
+                "--require-live",
+                "--await",
+            ]))
+            .expect("parses"),
+            Command::Send {
+                inbox: None,
+                registry: None,
+                session: Some("/tmp/s.json".to_string()),
+                source: SendSource::BodyFile("/tmp/b.md".to_string()),
+                to: Some("reviewer".to_string()),
+                from: None,
+                conversation: None,
+                reply_to: None,
+                await_reply: true,
+                outbox: None,
+                timeout_ms: DEFAULT_SEND_TIMEOUT_MS,
+                require_live: true,
+                origin: Some("peer".to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn send_session_and_origin_rules_are_usage_errors() {
+        let cases: &[&[&str]] = &[
+            // --session with --inbox / --registry.
+            &[
+                "send",
+                "--session",
+                "/s",
+                "--inbox",
+                "/mb",
+                "--to",
+                "r",
+                "--body",
+                "hi",
+            ],
+            &[
+                "send",
+                "--session",
+                "/s",
+                "--registry",
+                "/reg",
+                "--to",
+                "r",
+                "--body",
+                "hi",
+            ],
+            // --session with a built body needs --to; blank --session.
+            &["send", "--session", "/s", "--body", "hi"],
+            &["send", "--session", " ", "--to", "r", "--body", "hi"],
+            // --outbox is supplied by --session.
+            &[
+                "send",
+                "--session",
+                "/s",
+                "--to",
+                "r",
+                "--body",
+                "hi",
+                "--await",
+                "--outbox",
+                "/ob",
+            ],
+            // Body sources are mutually exclusive.
+            &[
+                "send",
+                "--inbox",
+                "/mb",
+                "--body",
+                "hi",
+                "--body-file",
+                "/b",
+            ],
+            &["send", "--inbox", "/mb", "--body-file", "/b", "--in", "/e"],
+            // Blank --origin, and --origin with --in.
+            &["send", "--inbox", "/mb", "--body", "hi", "--origin", ""],
+            &["send", "--inbox", "/mb", "--body", "hi", "--origin", " \t"],
+            &["send", "--inbox", "/mb", "--in", "/e", "--origin", "peer"],
         ];
         for case in cases {
             assert!(
@@ -9527,6 +9746,7 @@ mod tests {
             None,
             &env,
             false,
+            false,
             Duration::from_millis(0),
             Duration::from_millis(1),
             &mut sink,
@@ -9558,6 +9778,7 @@ mod tests {
             &root.path,
             Some(&outbox),
             &env,
+            false,
             true,
             Duration::from_millis(500),
             Duration::from_millis(1),
@@ -9597,6 +9818,7 @@ mod tests {
             &root.path,
             Some(&outbox),
             &env,
+            false,
             true,
             Duration::from_millis(500),
             Duration::from_millis(1),
@@ -9630,6 +9852,7 @@ mod tests {
             &root.path,
             Some(&outbox),
             &env,
+            false,
             true,
             Duration::from_millis(10),
             Duration::from_millis(2),

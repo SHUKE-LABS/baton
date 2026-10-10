@@ -51,13 +51,17 @@ page for what you are doing.
   `converse-ring`.
 - [docs/mailbox.md](docs/mailbox.md) — read this when agents talk asynchronously:
   the inbox-in/outbox-terminal delivery model, `serve`, `send`, `status`,
-  `mailbox prune`, the at-least-once contract, and the routing registry.
+  `mailbox prune`, the at-least-once contract, the routing registry, and the
+  session manifest.
 - [docs/external-agent.md](docs/external-agent.md) — read this when a mailbox seat
   should be a full-tooled agent CLI rather than one provider call
   (`serve --agent-cmd`).
 - [docs/service.md](docs/service.md) — read this when a `serve` session must
   outlive the process that launched it: `baton service` ownership, control
   surface, lifecycle, and systemd/launchd setup.
+- [docs/mat-adapter.md](docs/mat-adapter.md) — read this when integrating mat:
+  the optional `mat` feature's `baton mat send` contract over the generic
+  `send --session`/`--require-live`/`--origin` primitives.
 
 **Project**
 

@@ -132,6 +132,14 @@ pub struct MessageEnvelope {
     /// before this field existed still parses.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reply_to: Option<String>,
+    /// Opaque origin label the sender stamps (`send --origin <value>`), e.g.
+    /// whether a message came from a peer, an operator, or the system. Baton
+    /// never interprets it: a `serve --agent-cmd` turn receives it as
+    /// `BATON_ORIGIN` (body mode) or on each envelope (batch-json). Omitted
+    /// from serialized JSON when `None`, and `#[serde(default)]` so an older
+    /// envelope without the key still parses.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<String>,
 }
 
 impl MessageEnvelope {
@@ -159,6 +167,7 @@ impl MessageEnvelope {
             ts_ms,
             exchange: None,
             reply_to: None,
+            origin: None,
         }
     }
 }
@@ -271,6 +280,33 @@ mod tests {
         }"#;
         let parsed: MessageEnvelope = serde_json::from_str(legacy).expect("parses");
         assert_eq!(parsed.reply_to, None);
+    }
+
+    /// `origin` mirrors `reply_to`'s compatibility contract: omitted when
+    /// absent, round-trips when set, and an envelope written before the field
+    /// existed parses to `None`.
+    #[test]
+    fn origin_is_omitted_when_absent_and_round_trips_when_present() {
+        let none = base();
+        let json = serde_json::to_string(&none).expect("serializes");
+        let value: Value = serde_json::from_str(&json).expect("json");
+        assert!(
+            value.get("origin").is_none(),
+            "origin omitted when None: {json}"
+        );
+
+        let mut some = base();
+        some.origin = Some("peer".to_string());
+        let json = serde_json::to_string(&some).expect("serializes");
+        let value: Value = serde_json::from_str(&json).expect("json");
+        assert_eq!(value["origin"], "peer");
+        assert_eq!(value["body"], "hello", "origin never touches the body");
+        let back: MessageEnvelope = serde_json::from_str(&json).expect("parses");
+        assert_eq!(some, back);
+
+        let legacy = r#"{"schema":"baton.message/v1","message_id":"m-1","conversation_id":"c-1","from":"agent-a","to":"agent-b","in_reply_to":null,"kind":"request","body":"hello","ts_ms":1700000000000}"#;
+        let parsed: MessageEnvelope = serde_json::from_str(legacy).expect("parses");
+        assert_eq!(parsed.origin, None);
     }
 
     /// Every `kind` variant round-trips and carries its snake_case wire value.

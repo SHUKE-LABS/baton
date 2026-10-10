@@ -89,6 +89,32 @@ jobs:
       - name: Test
         run: cargo test --verbose --features local
 
+  # Verifies the opt-in `mat` adapter feature builds and tests cleanly; the
+  # default matrix never enables it. Windows is included because the adapter
+  # exists to replace mat's slow Git Bash send path there.
+  mat-feature:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache cargo registry & target
+        uses: Swatinem/rust-cache@v2
+
+      - name: Clippy
+        run: cargo clippy --all-targets --no-default-features --features mat -- -D warnings
+
+      - name: Test
+        run: cargo test --verbose --no-default-features --features mat
+
   # Verifies the harness-only default build still cross-compiles for a
   # constrained ARM target now that the provider HTTP client is gated behind
   # `local` — a regression here would mean the slim build no longer serves

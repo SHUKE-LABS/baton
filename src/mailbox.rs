@@ -454,6 +454,48 @@ pub fn deliver_to(root: impl AsRef<Path>, envelope: &MessageEnvelope) -> Result<
     deliver_into_pending(&root.as_ref().join("pending"), envelope)
 }
 
+/// The core `baton send` delivery: validates `envelope`, optionally requires a
+/// live `baton serve` on `root`, then [`deliver_to`]s it, returning the
+/// `message_id` only once the atomic enqueue has landed. Prints nothing — each
+/// caller reports the id its own way.
+///
+/// A present-but-blank `origin` is a [`BatonError::Config`]. With
+/// `require_live`, a one-shot [`serve_live`] probe runs immediately before the
+/// write; no live serve is a [`BatonError::Io`]. Either failure leaves
+/// `pending/` untouched. The probe is point-in-time: a serve stopping right
+/// after it is not atomic with the delivery.
+pub fn send_to(
+    root: impl AsRef<Path>,
+    envelope: &MessageEnvelope,
+    require_live: bool,
+) -> Result<String> {
+    let root = root.as_ref();
+    if envelope
+        .origin
+        .as_deref()
+        .is_some_and(|o| o.trim().is_empty())
+    {
+        return Err(BatonError::Config(
+            "message origin must not be empty or whitespace".to_string(),
+        ));
+    }
+    if require_live && !serve_live(root)? {
+        return Err(BatonError::Io(format!(
+            "no live baton serve holds {}; message not sent",
+            root.join(LOCK_FILE).display()
+        )));
+    }
+    deliver_to(root, envelope)?;
+    Ok(envelope.message_id.clone())
+}
+
+/// Whether a live `baton serve` holds the single-instance lock at `root` right
+/// now — the one-shot probe behind `status`'s `daemon` and `send
+/// --require-live`. Never blocks; per-host like the lock itself.
+pub fn serve_live(root: impl AsRef<Path>) -> Result<bool> {
+    daemon_live(root.as_ref())
+}
+
 /// Reports the mailbox at `root`'s liveness **without taking a lasting hold** on
 /// the single-instance lock, so it can probe a mailbox a live `baton serve` owns.
 ///
@@ -1329,6 +1371,30 @@ mod tests {
         let dir = TempDir::new("unsafe");
         let mailbox = Mailbox::open(&dir.path).expect("open");
         assert!(mailbox.deliver(&request("../escape")).is_err());
+    }
+
+    /// `send_to` with `require_live` delivers while a serve holds the lock and
+    /// returns the delivered id; with the lock free it refuses and writes
+    /// nothing. A blank `origin` refuses before any probe or write.
+    #[test]
+    fn send_to_requires_live_serve_and_rejects_blank_origin() {
+        let dir = TempDir::new("send-to");
+        let pending = dir.path.join("pending");
+
+        let err = send_to(&dir.path, &request("m-dead"), true).unwrap_err();
+        assert!(matches!(err, BatonError::Io(_)), "got {err:?}");
+        assert_eq!(count_files(&pending), 0, "no live serve ⇒ nothing written");
+
+        let mut blank = request("m-blank");
+        blank.origin = Some("  ".to_string());
+        let err = send_to(&dir.path, &blank, false).unwrap_err();
+        assert!(matches!(err, BatonError::Config(_)), "got {err:?}");
+        assert_eq!(count_files(&pending), 0, "blank origin ⇒ nothing written");
+
+        let _held = Mailbox::open(&dir.path).expect("serve holds the lock");
+        let id = send_to(&dir.path, &request("m-live"), true).expect("live serve ⇒ sent");
+        assert_eq!(id, "m-live");
+        assert!(pending.join("m-live.json").is_file());
     }
 
     /// The lock-free producer seeds `pending/` even while a consumer holds the

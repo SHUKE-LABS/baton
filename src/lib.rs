@@ -11,9 +11,12 @@
 //! - [`events`] — structured JSONL recording of each exchange.
 //! - [`log`] — reading and rendering the recorded exchange trail.
 //! - [`mailbox`] — the crash-safe file-mailbox backing `baton serve`.
+//! - `mat` (feature `mat`) — the isolated mat adapter behind `baton mat send`;
+//!   core modules never import it.
 //! - [`message`] — the `baton.message/v1` A2A peer-message envelope.
 //! - [`participant`] — the envelope-in / envelope-out participant seam.
 //! - [`roles`] — per-role home directories and layered identity resolution.
+//! - [`session`] — the generic `baton.session/v1` manifest behind `send --session`.
 //! - [`service`] — the host-owned supervisor for `baton serve` sessions.
 //! - [`task`] — the service-owned asynchronous job contract.
 //! - [`error`] — shared error and result types.
@@ -26,12 +29,15 @@ pub mod error;
 pub mod events;
 pub mod log;
 pub mod mailbox;
+#[cfg(feature = "mat")]
+pub mod mat;
 pub mod message;
 pub mod model;
 pub mod participant;
 pub mod registry;
 pub mod roles;
 pub mod service;
+pub mod session;
 pub mod task;
 #[cfg(test)]
 mod test_support;
