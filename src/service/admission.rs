@@ -295,9 +295,7 @@ pub(super) fn abort_task_admission<P: ServicePlatform>(
     record: &TaskRecord,
 ) -> Result<bool> {
     if record.state == TaskState::Running {
-        let mut record = record.clone();
-        P::upgrade_legacy_task_record(control, &mut record)?;
-        let liveness = P::escalate_task_to_death(&record, KILL_GRACE_MS);
+        let liveness = P::escalate_task_to_death(record, KILL_GRACE_MS);
         if liveness != Liveness::Dead {
             return Ok(false);
         }

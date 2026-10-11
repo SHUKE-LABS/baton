@@ -4104,11 +4104,11 @@ fn service_start_recovers_after_bare_invocation_binary_replacement() {
 /// Issue #154 regression: v0.2.1-shaped macOS records remain live across a
 /// supervisor restart even when their time-zone-rendered `started_at` keys no
 /// longer match the canonical probe. Session liveness uses argv, task
-/// liveness uses its persisted spawn instant, and lock-holding cleanup can
-/// then stop and remove both records.
+/// liveness uses its persisted spawn instant, and ordinary cleanup can then
+/// stop and remove both records without rewriting them.
 #[cfg(target_os = "macos")]
 #[test]
-fn service_upgrades_legacy_macos_start_epoch_records() {
+fn service_stops_legacy_macos_start_epoch_records() {
     let root = TempMailbox::new("service-macos-legacy-start-epoch");
     let control = root.path.join("control");
     let session_inbox = root.path.join("session-inbox");
@@ -4444,7 +4444,9 @@ fn service_upgrades_legacy_macos_start_epoch_records() {
 /// absent must not be finalized as failed merely because bash has
 /// exec-replaced its argv. The fixture asserts the actual `/proc` command line,
 /// survives a supervisor restart, preserves the unresolved record through
-/// ordinary teardown, and removes it only through the explicit force path.
+/// ordinary teardown, and removes it only through the explicit force path —
+/// which, with no start key to prove the process, drops the record without
+/// signalling it (#382).
 #[cfg(target_os = "linux")]
 #[test]
 fn service_rehydrated_exec_replaced_task_without_start_key_is_unresolved() {
@@ -4658,23 +4660,27 @@ fn service_rehydrated_exec_replaced_task_without_start_key_is_unresolved() {
         ])
         .output()
         .expect("run forced service teardown");
+    let forced_stderr = String::from_utf8_lossy(&forced.stderr);
     assert!(
         forced.status.success(),
-        "forced teardown removes unresolved residue; stderr: {}",
-        String::from_utf8_lossy(&forced.stderr)
+        "forced teardown removes unresolved residue; stderr: {forced_stderr}"
     );
     assert!(
         !task_record_path.is_file(),
         "forced teardown removes the unresolved task record"
     );
-    let deadline = integration_test_deadline();
-    while process_is_live(task_pid) && std::time::Instant::now() < deadline {
-        thread::sleep(Duration::from_millis(50));
-    }
     assert!(
-        !process_is_live(task_pid),
-        "forced teardown kills the task process"
+        forced_stderr.contains(&format!("pid={task_pid}"))
+            && forced_stderr.contains("not signalled; record dropped"),
+        "forced teardown reports the unsignalled drop; stderr: {forced_stderr}"
     );
+    assert!(
+        process_is_live(task_pid),
+        "forced teardown never signals a task whose identity is unresolved"
+    );
+    let _ = Command::new("kill")
+        .args(["-KILL", &task_pid.to_string()])
+        .status();
 }
 
 /// Issue #109 AC #5 (orphan-survival regression): a session started through
