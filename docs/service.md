@@ -414,6 +414,18 @@ baton task cancel [--control <dir>] --task <id>
   directory; an absolute path is preserved unchanged. The resolved path is
   persisted in the task record before the service spawns the command. If the
   flag is omitted, the command inherits the service's working directory.
+- **`--env KEY=VALUE`** overrides one variable in the task's environment;
+  every other variable is inherited from `service run`. A credential-named
+  pair with a non-empty value is never forwarded or persisted: the client
+  drops it before writing the request and names it on stderr, and the task
+  inherits that variable from the service environment instead. A name is a
+  credential when any `_`-delimited segment, case-insensitively, is `TOKEN`,
+  `KEY`, `SECRET`, `PASSWORD`, `PASSWD`, `PASS`, `APIKEY`, `ACCESSKEY`,
+  `SECRETKEY`, `CREDENTIAL`, or `CREDENTIALS` (so `GH_TOKEN_2` and
+  `SEQ_API_KEY_READONLY` match, `KEYBOARD_LAYOUT` does not). An empty value
+  (`--env GH_TOKEN=`) is kept, so a caller can still keep the service's value
+  out of the task. `service run` scrubs the same pairs again at admission, for
+  requests written by an older client.
 - **`--milestone-ms <n>` is opaque to baton except for ordering validation.**
   Supplied durations (elapsed ms since spawn) must be strictly ascending; zero
   or more values are allowed, but duplicates and decreases are rejected as a
@@ -457,7 +469,15 @@ baton task cancel [--control <dir>] --task <id>
 
 ### Supervisor restart reconciliation
 
-`service run` scans durable task records before it accepts new requests. A
+`service run` scans durable task records before it accepts new requests.
+Startup first drops credential env values (see `--env` above) from every task
+record and pending task request written before that rule existed, so nothing
+on disk carries them and a re-claimed request inherits them from the current
+service environment. A restart re-attaches to live sessions and tasks rather
+than respawning them, and a live process keeps the environment it started
+with: rotating or revoking a credential for those takes stopping and
+relaunching the session from a clean environment (`mat baton restart
+<session>` in my-ai-team). A
 record that fails to parse as JSON — e.g. truncated by a crash mid-write — is
 skipped with a stderr warning naming the file rather than aborting startup; the
 remaining tasks are rehydrated and supervised normally. Each

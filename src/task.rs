@@ -65,7 +65,10 @@ pub struct TaskSpec {
     pub args: Vec<String>,
     /// Working directory for the command; `None` inherits the service's own.
     pub cwd: Option<String>,
-    /// Additional environment variables for the command.
+    /// Additional environment variables for the command. A credential-named
+    /// pair with a non-empty value (see [`is_credential_env_name`]) is never
+    /// persisted: [`TaskSpec::scrub_credential_env`] drops it, so the task
+    /// inherits that variable from the live service environment instead.
     #[serde(default)]
     pub env: Vec<(String, String)>,
     /// Durations (ms elapsed since spawn) at which a milestone event fires.
@@ -78,6 +81,52 @@ pub struct TaskSpec {
     pub max_duration_ms: u64,
     /// Delivery target for this task's lifecycle events.
     pub callback: TaskCallback,
+}
+
+impl TaskSpec {
+    /// Drops every credential-named `env` pair with a non-empty value and
+    /// returns the dropped names in order. An empty value is kept: callers
+    /// pass `NAME=` to keep the service's own value out of the task, and an
+    /// empty value carries no secret.
+    pub fn scrub_credential_env(&mut self) -> Vec<String> {
+        let mut dropped = Vec::new();
+        self.env.retain(|(name, value)| {
+            let credential = !value.is_empty() && is_credential_env_name(name);
+            if credential {
+                dropped.push(name.clone());
+            }
+            !credential
+        });
+        dropped
+    }
+}
+
+/// `_`-delimited name segments that mark an environment variable as a
+/// credential, matched case-insensitively against whole segments so mid-name
+/// forms such as `GH_TOKEN_2` or `SEQ_API_KEY_READONLY` match while
+/// `KEYBOARD_LAYOUT` does not.
+const CREDENTIAL_ENV_SEGMENTS: &[&str] = &[
+    "TOKEN",
+    "KEY",
+    "SECRET",
+    "PASSWORD",
+    "PASSWD",
+    "PASS",
+    "APIKEY",
+    "ACCESSKEY",
+    "SECRETKEY",
+    "CREDENTIAL",
+    "CREDENTIALS",
+];
+
+/// Whether `name` names a credential that must never be persisted in a task
+/// spec.
+pub fn is_credential_env_name(name: &str) -> bool {
+    name.split('_').any(|segment| {
+        CREDENTIAL_ENV_SEGMENTS
+            .iter()
+            .any(|credential| segment.eq_ignore_ascii_case(credential))
+    })
 }
 
 /// A parsed `baton task` invocation.
@@ -392,6 +441,73 @@ mod tests {
         let json = serde_json::to_string(&original).expect("serializes");
         let back: TaskSpec = serde_json::from_str(&json).expect("parses");
         assert_eq!(original, back);
+    }
+
+    #[test]
+    fn credential_env_names_match_whole_segments() {
+        for name in [
+            "GH_TOKEN",
+            "GH_TOKEN_2",
+            "GITHUB_TOKEN",
+            "CLAUDE_CODE_OAUTH_TOKEN_A",
+            "CODEX_ACCESS_TOKEN_B",
+            "TG_CHAT_TOKEN_host",
+            "FOO_API_KEY",
+            "SEQ_API_KEY_READONLY",
+            "OPENROUTER_PROVISIONING_KEY",
+            "VOLC_ACCESSKEY",
+            "VOLC_SECRETKEY",
+            "APP_SECRET",
+            "DB_PASS",
+            "DB_PASSWORD",
+            "aws_credentials",
+            "token",
+        ] {
+            assert!(is_credential_env_name(name), "{name} is a credential");
+        }
+        for name in [
+            "PATH",
+            "HOME",
+            "MAT_SESSION_NAME",
+            "RUST_LOG",
+            "KEYBOARD_LAYOUT",
+            "PASSAGE",
+            "TOKENIZER",
+            "",
+        ] {
+            assert!(!is_credential_env_name(name), "{name} is not a credential");
+        }
+    }
+
+    #[test]
+    fn scrub_credential_env_drops_valued_credentials_only() {
+        let mut task = spec(vec![], 1_000);
+        task.env = [
+            ("PLAIN", "1"),
+            ("GH_TOKEN", ""),
+            ("BATON_TEST_TOKEN", "fake-value"),
+            ("RUST_LOG", "debug"),
+            ("FOO_API_KEY", "fake-key"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+        assert_eq!(
+            task.scrub_credential_env(),
+            vec!["BATON_TEST_TOKEN".to_string(), "FOO_API_KEY".to_string()]
+        );
+        assert_eq!(
+            task.env,
+            vec![
+                ("PLAIN".to_string(), "1".to_string()),
+                ("GH_TOKEN".to_string(), String::new()),
+                ("RUST_LOG".to_string(), "debug".to_string()),
+            ]
+        );
+        assert!(
+            task.scrub_credential_env().is_empty(),
+            "scrub is idempotent"
+        );
     }
 
     #[test]

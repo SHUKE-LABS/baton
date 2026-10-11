@@ -2954,6 +2954,115 @@ mod tests {
         let _ = fs::remove_dir_all(control);
     }
 
+    /// #386 restart regression, driven through the same startup steps
+    /// `run_service` takes. A request a crash left in `task-processing/`
+    /// and a record written before the restart both carry a credential
+    /// value the service env no longer has: startup scrubs both from disk,
+    /// and the re-claimed task inherits the variable from the service
+    /// (unset here) instead of resurrecting the persisted value. Empty and
+    /// non-credential pairs survive. Mirrors the Unix-side
+    /// `restart_takes_credentials_from_the_service_env_not_from_disk`.
+    #[test]
+    fn restart_takes_credentials_from_the_service_env_not_from_disk() {
+        const NAME: &str = "BATON_ISSUE_386_TEST_TOKEN";
+        const FAKE: &str = "fake-credential-386";
+        assert!(
+            std::env::var_os(NAME).is_none(),
+            "the test service env must not carry {NAME}"
+        );
+        let _guard = serialize_forks_and_locks();
+        let control = temp_control("credential-restart");
+        let (mut owner, owner_job, owner_job_name) = spawn_live_task_child(&control, "owner");
+        write_session_record(
+            &control,
+            &SessionRecord {
+                id: "svc-owner".to_string(),
+                spec: session_spec(),
+                pid: owner.id(),
+                started_at: recorded_start_identity(owner.id()).0,
+                start_epoch_secs: None,
+                job: Some(owner_job_name),
+            },
+        )
+        .expect("write live owner session");
+        let env = vec![
+            ("PLAIN".to_string(), "kept".to_string()),
+            ("GH_TOKEN".to_string(), String::new()),
+            (NAME.to_string(), FAKE.to_string()),
+        ];
+
+        let mut stale = task_record("svc-owner", u32::MAX - 1, None, None);
+        stale.spec.env = env.clone();
+        write_task_record(&control, &stale).expect("write pre-restart record");
+
+        let mut request = task_spec("svc-owner");
+        request.args = vec![
+            "/D".to_string(),
+            "/C".to_string(),
+            format!("if defined {NAME} (echo set) else (echo unset)"),
+        ];
+        request.env = env;
+        let processing = control.join("task-processing");
+        fs::create_dir_all(&processing).expect("create task-processing");
+        fs::write(
+            processing.join(crate::mailbox::file_name("req-386")),
+            serde_json::to_string(&request).expect("serialize request"),
+        )
+        .expect("write in-flight request");
+
+        let admission = acquire_admission_lock(&control).expect("admission lock");
+        admission::reconcile_task_admissions::<WindowsServicePlatform>(&control)
+            .expect("reconcile");
+        admission::reclaim_stale_task_requests(&control).expect("reclaim");
+        drop(admission);
+        assert_tree_lacks(&control, FAKE);
+        let scrubbed = read_task_record(&control, &stale.id)
+            .expect("read")
+            .expect("record kept");
+        assert_eq!(
+            scrubbed.spec.env,
+            vec![
+                ("PLAIN".to_string(), "kept".to_string()),
+                ("GH_TOKEN".to_string(), String::new()),
+            ]
+        );
+
+        let (task_id, _running) =
+            admission::process_one_task_request::<WindowsServicePlatform>(&control, &SystemClock)
+                .expect("admit re-claimed request")
+                .expect("re-claimed request spawns a task");
+        let stdout = task_logs_dir(&control, &task_id).join("stdout.log");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let output = loop {
+            let output = fs::read_to_string(&stdout).unwrap_or_default();
+            if !output.trim().is_empty() || std::time::Instant::now() >= deadline {
+                break output;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        };
+        assert_eq!(output.trim(), "unset", "task inherits the service env");
+        assert_tree_lacks(&control, FAKE);
+
+        let _ = terminate_job(&owner_job);
+        let _ = owner.wait();
+        drop(owner_job);
+        let _ = fs::remove_dir_all(control);
+    }
+
+    fn assert_tree_lacks(root: &Path, needle: &str) {
+        for entry in fs::read_dir(root).expect("read control dir") {
+            let path = entry.expect("dir entry").path();
+            if path.is_dir() {
+                assert_tree_lacks(&path, needle);
+            } else if let Ok(data) = fs::read_to_string(&path) {
+                assert!(
+                    !data.contains(needle),
+                    "{path:?} persists a credential value"
+                );
+            }
+        }
+    }
+
     /// The stop marker is released when the stop finishes, and a marker
     /// orphaned by a killed `service stop` cannot wedge admission: a
     /// reader whose recorded identity no longer resolves discards it.

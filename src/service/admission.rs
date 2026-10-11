@@ -18,10 +18,11 @@ use super::records::{
     list_task_start_response_claims, list_task_start_rollbacks, read_session_record,
     remove_task_logs_dir, remove_task_record, remove_task_start_ack,
     remove_task_start_response_files, remove_task_start_rollback,
-    restore_task_start_response_claim, task_channel, task_logs_dir, task_start_ack_exists,
-    task_start_response_claim_path, task_start_response_path, task_start_rollback_exists,
-    wait_for_test_task_admission_barrier, wait_for_test_task_response_phase_barrier,
-    wait_for_test_task_rollback_cleanup_barrier, write_task_record, write_task_start_response,
+    restore_task_start_response_claim, task_channel, task_logs_dir, task_requests_dir,
+    task_start_ack_exists, task_start_response_claim_path, task_start_response_path,
+    task_start_rollback_exists, wait_for_test_task_admission_barrier,
+    wait_for_test_task_response_phase_barrier, wait_for_test_task_rollback_cleanup_barrier,
+    write_task_record, write_task_start_response,
 };
 use super::task_tick::{Liveness, RunningTask, ServicePlatform};
 use super::{BatonError, Result};
@@ -129,7 +130,8 @@ pub(super) fn reconcile_task_admissions<P: ServicePlatform>(
     let rollback_ids = list_task_start_rollbacks(control)?;
     let ack_ids = list_task_start_acks(control)?;
     let claim_ids = list_task_start_response_claims(control)?;
-    let records = list_task_records(control)?;
+    let mut records = list_task_records(control)?;
+    scrub_task_record_credentials(control, &mut records);
     let mut mutated = false;
     let mut seen_rollbacks = std::collections::HashSet::new();
     let mut retained_rollbacks = std::collections::HashSet::new();
@@ -308,10 +310,69 @@ pub(super) fn abort_task_admission<P: ServicePlatform>(
     Ok(true)
 }
 
+/// Drops credential values a record written before #386 still holds, on
+/// disk and in `records`, so a rehydrated task's later record rewrites
+/// cannot restore them. A failed rewrite is reported and leaves the disk
+/// copy for the next startup.
+fn scrub_task_record_credentials(control: &Path, records: &mut [TaskRecord]) {
+    for record in records {
+        if record.spec.scrub_credential_env().is_empty() {
+            continue;
+        }
+        if let Err(err) = write_task_record(control, record) {
+            eprintln!(
+                "warning: task {} record still holds credential env values: {err}",
+                record.id
+            );
+        }
+    }
+}
+
 /// Returns any `task-processing/` entry a crash left mid-request to
-/// `task-requests/` through the shared request channel.
+/// `task-requests/` through the shared request channel, then scrubs
+/// credential values from every pending request an older client wrote.
 pub(super) fn reclaim_stale_task_requests(control: &Path) -> Result<()> {
-    task_channel(control).reclaim_stale()
+    task_channel(control).reclaim_stale()?;
+    scrub_pending_task_request_credentials(control)
+}
+
+fn scrub_pending_task_request_credentials(control: &Path) -> Result<()> {
+    let requests = task_requests_dir(control);
+    let entries = match fs::read_dir(&requests) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => {
+            return Err(BatonError::Io(format!(
+                "could not read {requests:?}: {err}"
+            )));
+        }
+    };
+    for entry in entries {
+        let path = mailbox::dir_entry(entry, &requests)?.path();
+        let Some(key) = mailbox::json_key(&path) else {
+            continue;
+        };
+        // An unreadable or malformed request is left for admission to
+        // reject with its real reason.
+        let Ok(data) = fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(mut spec) = serde_json::from_str::<TaskSpec>(&data) else {
+            continue;
+        };
+        if spec.scrub_credential_env().is_empty() {
+            continue;
+        }
+        // Admission scrubs the claimed spec again, so a failed rewrite
+        // costs only the on-disk copy and must not block startup.
+        let written = serde_json::to_string(&spec)
+            .map_err(|err| BatonError::Io(format!("could not serialize task spec: {err}")))
+            .and_then(|json| mailbox::atomic_write(&requests, &mailbox::file_name(&key), &json));
+        if let Err(err) = written {
+            eprintln!("warning: task request {key} still holds credential env values: {err}");
+        }
+    }
+    Ok(())
 }
 
 /// Claims the next task-start request through the shared request channel,
@@ -383,8 +444,11 @@ pub(super) fn handle_task_start_request<P: ServicePlatform>(
 ) -> Result<Option<SpawnedTask<P>>> {
     let data = fs::read_to_string(spec_path)
         .map_err(|err| BatonError::Io(format!("could not read {spec_path:?}: {err}")))?;
-    let spec: TaskSpec = serde_json::from_str(&data)
+    let mut spec: TaskSpec = serde_json::from_str(&data)
         .map_err(|err| BatonError::Decode(format!("malformed task spec {spec_path:?}: {err}")))?;
+    // A request from an older client may still carry credential values;
+    // the spawned task and its record take them from the service instead.
+    spec.scrub_credential_env();
     if let Some((previous, current)) = first_non_ascending_milestone(&spec.milestones_ms) {
         return reject_task_start_request::<P>(
             control,
