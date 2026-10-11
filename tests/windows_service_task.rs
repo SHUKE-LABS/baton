@@ -230,6 +230,89 @@ fn wait_for_terminal_task(control: &str, task_id: &str) -> (String, Option<i64>,
     panic!("task {task_id} did not reach a terminal state in time");
 }
 
+/// #386: `task start --env` never persists a credential value. The client
+/// drops it before writing the request and names it on stderr; the task
+/// inherits the variable from the service env (unset here), while empty and
+/// non-credential pairs pass through to the record.
+#[test]
+fn windows_task_start_does_not_persist_credential_env_values() {
+    const NAME: &str = "BATON_ISSUE_386_TEST_TOKEN";
+    const FAKE: &str = "fake-credential-386";
+    assert!(
+        std::env::var_os(NAME).is_none(),
+        "test env must not carry {NAME}"
+    );
+    let guard = start_service();
+    let session = start_session(&guard);
+    let control = guard.control.to_string_lossy().into_owned();
+    let callback = guard.root.join("callback");
+    let credential = format!("{NAME}={FAKE}");
+    let probe = format!("if defined {NAME} (echo set) else (echo unset)");
+    let start = baton(&[
+        "task",
+        "start",
+        "--control",
+        &control,
+        "--session",
+        &session,
+        "--command",
+        "cmd.exe",
+        "--arg",
+        "/D",
+        "--arg",
+        "/C",
+        "--arg",
+        &probe,
+        "--env",
+        "PLAIN=kept",
+        "--env",
+        "GH_TOKEN=",
+        "--env",
+        &credential,
+        "--max-duration-ms",
+        "60000",
+        "--callback-inbox",
+        callback.to_str().unwrap(),
+    ]);
+    let stderr = String::from_utf8_lossy(&start.stderr);
+    assert!(start.status.success(), "task start failed: {stderr}");
+    assert!(
+        stderr.contains(NAME) && !stderr.contains(FAKE),
+        "stderr names the dropped credential, never its value: {stderr}"
+    );
+    let task_id = String::from_utf8_lossy(&start.stdout).trim().to_string();
+    let (state, _, _) = wait_for_terminal_task(&control, &task_id);
+    assert_eq!(state, "completed");
+
+    let record: serde_json::Value = serde_json::from_slice(
+        &fs::read(guard.control.join("tasks").join(format!("{task_id}.json")))
+            .expect("read task record"),
+    )
+    .expect("task record is JSON");
+    assert_eq!(
+        record["spec"]["env"],
+        serde_json::json!([["PLAIN", "kept"], ["GH_TOKEN", ""]])
+    );
+    let stdout = fs::read_to_string(record["stdout_path"].as_str().expect("stdout path"))
+        .expect("read task stdout");
+    assert_eq!(stdout.trim(), "unset", "task inherits the service env");
+    assert_tree_lacks(&guard.control, FAKE);
+}
+
+fn assert_tree_lacks(root: &Path, needle: &str) {
+    for entry in fs::read_dir(root).expect("read control dir") {
+        let path = entry.expect("dir entry").path();
+        if path.is_dir() {
+            assert_tree_lacks(&path, needle);
+        } else if let Ok(data) = fs::read_to_string(&path) {
+            assert!(
+                !data.contains(needle),
+                "{path:?} persists a credential value"
+            );
+        }
+    }
+}
+
 #[test]
 fn windows_task_job_owns_and_terminates_command_tree() {
     let guard = start_service();

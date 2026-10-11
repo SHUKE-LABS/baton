@@ -1065,12 +1065,21 @@ pub(super) fn ensure_spawnable(_spec: &SessionSpec) -> Result<()> {
 
 /// Submits `spec` through the shared request channel and awaits its task
 /// id. The task response claim and rollback transaction remain specific
-/// to this caller.
+/// to this caller. Credential values are scrubbed first, so they never
+/// reach the request file; the task inherits them from the service.
 pub(super) fn submit_task_start_request(control: &Path, spec: &TaskSpec) -> Result<String> {
+    let mut spec = spec.clone();
+    let dropped = spec.scrub_credential_env();
+    if !dropped.is_empty() {
+        eprintln!(
+            "warning: task start does not forward credential env {}; the task inherits them from the service environment",
+            dropped.join(", ")
+        );
+    }
     let request_id = fresh_request_id();
     task_channel(control).submit(
         &request_id,
-        spec,
+        &spec,
         |control| Ok(probe_control(control)? == ControlLiveness::Live),
         |control| {
             format!(

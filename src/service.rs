@@ -2368,6 +2368,135 @@ mod imp {
             );
         }
 
+        /// #386 restart regression, driven through the same startup steps
+        /// `run_service` takes. A request a crash left in `task-processing/`
+        /// and a record written before the restart both carry a credential
+        /// value the service env no longer has: startup scrubs both from
+        /// disk, and the re-claimed task inherits the variable from the
+        /// service (unset here) instead of resurrecting the persisted value.
+        /// Empty and non-credential pairs survive. Mirrors the Windows-side
+        /// `restart_takes_credentials_from_the_service_env_not_from_disk`.
+        #[test]
+        fn restart_takes_credentials_from_the_service_env_not_from_disk() {
+            const NAME: &str = "BATON_ISSUE_386_TEST_TOKEN";
+            const FAKE: &str = "fake-credential-386";
+            assert!(
+                std::env::var_os(NAME).is_none(),
+                "the test service env must not carry {NAME}"
+            );
+            let _guard = serialize_forks_and_locks();
+            let dir = TempDir::new("credential-restart");
+            let pid = std::process::id();
+            let (started_at, start_epoch_secs) = recorded_start_identity(pid);
+            write_session_record(
+                &dir.path,
+                &SessionRecord {
+                    id: "svc-live".to_string(),
+                    spec: spec("/tmp/in", "/tmp/out"),
+                    pid,
+                    started_at,
+                    start_epoch_secs,
+                    stderr_path: String::new(),
+                },
+            )
+            .expect("write live session record");
+            let env = vec![
+                ("PLAIN".to_string(), "kept".to_string()),
+                ("GH_TOKEN".to_string(), String::new()),
+                (NAME.to_string(), FAKE.to_string()),
+            ];
+
+            let mut stale_spec =
+                task_spec("svc-live", "true", vec![], vec![], 1_000, "/tmp/callback");
+            stale_spec.env = env.clone();
+            let stale = TaskRecord {
+                id: "task-pre-restart".to_string(),
+                request_id: None,
+                admission: TaskAdmissionPhase::Responded,
+                spec: stale_spec,
+                pid: 0,
+                started_at: None,
+                start_epoch_secs: None,
+                job: None,
+                started_ms: Some(0),
+                state: TaskState::Completed,
+                exit_code: Some(0),
+                elapsed_ms: Some(10),
+                stdout_path: String::new(),
+                stderr_path: String::new(),
+                delivered_milestones: 0,
+                terminal_delivered_at_ms: None,
+            };
+            write_task_record(&dir.path, &stale).expect("write pre-restart record");
+
+            let mut request = task_spec(
+                "svc-live",
+                "sh",
+                vec![
+                    "-c".to_string(),
+                    format!("if [ -n \"${{{NAME}+x}}\" ]; then echo set; else echo unset; fi"),
+                ],
+                vec![],
+                10_000,
+                "/tmp/callback",
+            );
+            request.env = env;
+            let processing = task_processing_dir(&dir.path);
+            fs::create_dir_all(&processing).expect("create task-processing");
+            fs::write(
+                processing.join(mailbox::file_name("req-386")),
+                serde_json::to_string(&request).expect("serialize request"),
+            )
+            .expect("write in-flight request");
+
+            let admission = acquire_admission_lock(&dir.path).expect("admission lock");
+            admission::reconcile_task_admissions::<UnixServicePlatform>(&dir.path)
+                .expect("reconcile");
+            admission::reclaim_stale_task_requests(&dir.path).expect("reclaim");
+            drop(admission);
+            assert_tree_lacks(&dir.path, FAKE);
+            let scrubbed = read_task_record(&dir.path, &stale.id)
+                .expect("read")
+                .expect("record kept");
+            assert_eq!(
+                scrubbed.spec.env,
+                vec![
+                    ("PLAIN".to_string(), "kept".to_string()),
+                    ("GH_TOKEN".to_string(), String::new()),
+                ]
+            );
+
+            let (task_id, _running) =
+                admission::process_one_task_request::<UnixServicePlatform>(&dir.path, &SystemClock)
+                    .expect("admit re-claimed request")
+                    .expect("re-claimed request spawns a task");
+            let stdout = task_logs_dir(&dir.path, &task_id).join("stdout.log");
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            let output = loop {
+                let output = fs::read_to_string(&stdout).unwrap_or_default();
+                if !output.trim().is_empty() || std::time::Instant::now() >= deadline {
+                    break output;
+                }
+                std::thread::sleep(Duration::from_millis(25));
+            };
+            assert_eq!(output.trim(), "unset", "task inherits the service env");
+            assert_tree_lacks(&dir.path, FAKE);
+        }
+
+        fn assert_tree_lacks(root: &Path, needle: &str) {
+            for entry in fs::read_dir(root).expect("read control dir") {
+                let path = entry.expect("dir entry").path();
+                if path.is_dir() {
+                    assert_tree_lacks(&path, needle);
+                } else if let Ok(data) = fs::read_to_string(&path) {
+                    assert!(
+                        !data.contains(needle),
+                        "{path:?} persists a credential value"
+                    );
+                }
+            }
+        }
+
         /// A session admission failure after the request is claimed is
         /// answered through the start response rather than propagated to the
         /// request loop, where it would strand the client on the await bound.
