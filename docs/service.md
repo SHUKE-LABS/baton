@@ -191,10 +191,14 @@ baton service teardown [--control <dir>] [--force]
   `SIGTERM`/`SIGKILL` process-group signals; Windows escalates with
   `TerminateJobObject`. Without `--force`, an unresolved session or owned task
   remains durable and the command exits non-zero after printing its id, PID,
-  liveness, and recorded argv to stderr. `--force` asserts the operator's
-  identity claim. If a Windows Job Object cannot be resolved, it terminates
-  only the recorded PID, removes the record, and warns that descendants may
-  survive; it never claims tree reach in that case.
+  liveness, and recorded argv to stderr. `--force` removes such records
+  instead, but it is not an identity assertion: it signals a record only on a
+  positive target proof (see [Liveness resolution and safe
+  cleanup](#liveness-resolution-and-safe-cleanup)). A record without one is
+  removed unsignalled and reported with its id, PID, and `not signalled;
+  record dropped`. When a Windows Job Object cannot be resolved, a
+  key-matched recorded PID is terminated alone with a warning that
+  descendants may survive; it never claims tree reach in that case.
   It serializes that cleanup with task admission, so a task is either
   admitted before the stop began and reaped with the session, or rejected —
   once the stop owns the session's cleanup, and thereafter because the
@@ -232,8 +236,9 @@ baton service teardown [--control <dir>] [--force]
   release-during-grace discipline `stop` uses. Without `--force`, it
   keeps unresolved records, prints their identity details to stderr, and exits
   non-zero; an initially unresolved task is retained immediately without a
-  per-task grace delay. `--force` applies the same platform-specific rule and
-  removes them, including task admission files, on the operator's assertion.
+  per-task grace delay. `--force` removes them, including task admission
+  files, under the same positive-proof rule as `stop --force`: a record whose
+  target cannot be proved is dropped unsignalled and reported.
   Idempotent, and safe to call whether or not `run` is currently alive (e.g.
   to reap stale records left by a `run` that already crashed).
 
@@ -295,30 +300,47 @@ The resolution ladder is platform-specific:
   identity. Task Job Object handles are inherited by the task process so the
   named object normally remains available for startup re-adoption while the
   task tree drains. If a name still cannot be opened after a restart, normal
-  cancellation, timeout, stop, and cleanup signal only the corroborated
-  recorded PID and warn that descendants may survive. A PID whose identity
-  cannot be corroborated remains fail-closed and is never signalled.
+  cancellation, timeout, stop, and cleanup terminate only the recorded PID,
+  and only when its creation-time key matches on the termination handle
+  itself, warning that descendants may survive. A PID whose identity cannot
+  be corroborated remains fail-closed and is never signalled.
 
 New macOS records retain `started_at` as the operator-readable UTC string and
 also persist `start_epoch_secs`; the field's presence is the format-version
-marker. A legacy record that is rescued as live by a lock-holding cleanup or
-admission-reconciliation path is rewritten once with the epoch marker. The
-read-only `service status` and the supervisor's lock-free task tick never
-rewrite records, so an unresolved legacy task remains safe to retry until a
-cleanup path can upgrade it.
+marker. A legacy record without the marker is never rewritten: the fallback
+ladder above classifies it on every probe, and no path persists a start key
+sampled after spawn, because such a key would describe whatever process
+holds the PID at that moment rather than the one baton spawned.
 
 `service stop` and `service teardown` always try the identity-free cooperative
 mailbox stop first. They then signal only `live` records. On Windows, a live
 record uses `TerminateJobObject` when its name resolves and otherwise falls
-back to the corroborated recorded PID with a descendants-may-survive warning.
+back to the key-checked recorded PID with a descendants-may-survive warning.
 Dead records are
 removed, terminal task records are removed without probing or signalling their
 recorded PID, and initially unresolved records are retained immediately
 without a per-task grace delay. A retained record's id, PID, liveness, and
-recorded argv are printed to stderr and the command exits non-zero. `--force`
-is the explicit operator assertion of identity: Unix sends process-group
-signals; Windows follows the same Job Object/PID fallback and removes the
-record even when identity remains unresolved.
+recorded argv are printed to stderr and the command exits non-zero.
+
+`--force` removes retained records too, but signals a session or running task
+only on a positive target proof:
+
+- On Unix, a persisted start key that matches the recorded leader, re-checked
+  immediately before `SIGTERM` and again before `SIGKILL`. A matching zombie
+  leader still counts, since it pins the process-group id. A legacy record
+  with no key, a mismatched or unreadable probe, or a leader that is already
+  gone never does — so a task whose leader exited while descendants still
+  run is dropped without signalling its group.
+- On Windows, a resolvable recorded Job Object, or else a recorded PID whose
+  creation-time key matches on the termination handle.
+
+A record without proof is removed unsignalled and reported as
+`baton cleanup dropped <kind>: id=<id> pid=<pid> ... -- not signalled; record
+dropped`; that alone does not fail the command. A Unix record that received
+`SIGTERM` but could not be re-proved before `SIGKILL` is also removed (a retry
+could not prove it either), reported as `baton cleanup incomplete <kind>`, and
+fails the command with `forced cleanup incomplete`, because descendants may
+survive.
 `task cancel` has no force flag; it leaves its cooperative cancel sentinel for
 the supervisor, signals a corroborated live PID even when its Job Object name
 is gone, and never escalates an unresolved identity. If that controlled PID
@@ -495,7 +517,8 @@ marker remain in place while pending request locations are discarded. The
 service does not finalize the task or deliver a terminal callback. A later
 startup removes the record and its admission files after the PID is positively
 dead. `service teardown --force` is the explicit operator path for removing
-residue whose identity remains unresolved.
+that residue; it drops a record whose identity remains unresolved without
+signalling its PID.
 
 Task admission is a durable transaction keyed by the task-start request id.
 After spawning and persisting a `TaskRecord`, `run` records the `prepared`

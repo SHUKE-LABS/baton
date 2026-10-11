@@ -150,10 +150,6 @@ pub(super) trait ServicePlatform {
         term_sent_at_ms: Option<u64>,
     ) -> Result<bool>;
     fn rehydrate_task(record: &TaskRecord) -> Result<Option<Self::TaskHandle>>;
-    /// Upgrades a legacy durable record in place before its admission is
-    /// evaluated (a no-op on every platform but macOS, which backfills a
-    /// missing start epoch from a live process).
-    fn upgrade_legacy_task_record(control: &Path, record: &mut TaskRecord) -> Result<()>;
     /// Escalates a running task toward termination and returns the settled
     /// [`Liveness`] once dead, still live after both signals, or unresolved
     /// (an unresolved probe short-circuits before any signal is sent). Each

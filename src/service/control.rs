@@ -30,14 +30,13 @@ use super::imp::{
     create_job, force_terminate_record_job, fresh_job_name, is_task_alive, open_job,
     record_job_available, recorded_start_identity, resume_initial_thread, session_liveness,
     spawn_serve_child, spawn_start_key_ok, terminate_job, terminate_record_job_or_pid,
-    upgrade_legacy_session_record, upgrade_legacy_task_record, wait_while_alive,
-    wait_while_task_alive,
+    wait_while_alive, wait_while_task_alive,
 };
 #[cfg(unix)]
 use super::imp::{
-    recorded_start_identity, session_liveness, signal_group, spawn_serve_child, spawn_start_key_ok,
-    task_execution_liveness, task_execution_liveness_after_retry, upgrade_legacy_session_record,
-    upgrade_legacy_task_record, wait_while_alive, wait_while_task_alive,
+    process_group_may_exist, recorded_group_signal_proved, recorded_start_identity,
+    session_liveness, signal_group, spawn_serve_child, spawn_start_key_ok, task_execution_liveness,
+    task_execution_liveness_after_retry, wait_while_alive, wait_while_task_alive,
 };
 
 use std::collections::HashMap;
@@ -497,10 +496,9 @@ impl<'a> AdmissionGuard<'a> {
     /// a plain in-memory read — freshness for anything admitted since is
     /// already maintained by `unlocked_wait`, not by this accessor. An id
     /// already cached is never re-parsed here: a task's
-    /// `spec`/`spec.session` never changes after creation
-    /// (`upgrade_legacy_task_record` only ever touches
-    /// `start_epoch_secs`), so the classification this returns is always
-    /// correct. The lifecycle fields (`state`/`exit_code`/...) a cached
+    /// `spec`/`spec.session` never changes after creation (cleanup never
+    /// rewrites a task record), so the classification this returns is
+    /// always correct. The lifecycle fields (`state`/`exit_code`/...) a cached
     /// entry carries can go stale if the daemon's own supervisor tick
     /// (`task_tick::finalize_task`) terminalizes it later — callers must
     /// treat [`AdmissionGuard::cached_task`] accordingly (see its doc
@@ -1151,6 +1149,124 @@ pub(super) struct CleanupResidue {
     pid: u32,
     pub(super) liveness: Liveness,
     argv: String,
+    pub(super) disposition: CleanupDisposition,
+}
+
+/// What cleanup did with a record it could not simply finish.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum CleanupDisposition {
+    /// Still live or unresolved: the record stays on disk and the command
+    /// fails, so a later stop can retry.
+    Kept,
+    /// `--force` with no proved target: the record was removed without
+    /// signalling anything.
+    DroppedUnsignalled,
+    /// `--force` sent SIGTERM, then could not re-prove the target before
+    /// SIGKILL. The record was removed (a retry could not prove it either)
+    /// and the command fails, since descendants may survive.
+    #[cfg_attr(windows, allow(dead_code))]
+    DroppedAfterTerm,
+}
+
+/// Outcome of one forced Unix process-group signal sequence.
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ForceSignal {
+    /// Identity was not proved before SIGTERM; nothing was sent.
+    NotSignalled,
+    /// SIGTERM and SIGKILL were both sent, or SIGTERM was sent and the
+    /// group was then gone.
+    Signalled,
+    /// SIGTERM was sent, but SIGKILL was skipped because identity could not
+    /// be re-proved while the group may still have members.
+    TermOnly,
+}
+
+#[cfg(unix)]
+impl ForceSignal {
+    /// The residue disposition this outcome leaves behind, if any.
+    fn dropped(self) -> Option<CleanupDisposition> {
+        match self {
+            ForceSignal::NotSignalled => Some(CleanupDisposition::DroppedUnsignalled),
+            ForceSignal::Signalled => None,
+            ForceSignal::TermOnly => Some(CleanupDisposition::DroppedAfterTerm),
+        }
+    }
+}
+
+/// The forced SIGTERM/SIGKILL sequence with its probes injected: `prove`
+/// is re-checked immediately before each signal, and `group_exists` (an
+/// existence probe that sends nothing) decides whether a skipped SIGKILL
+/// could have left anything behind.
+#[cfg(unix)]
+pub(super) fn force_signal_group_with(
+    mut prove: impl FnMut() -> bool,
+    group_exists: impl FnOnce() -> bool,
+    mut signal: impl FnMut(libc::c_int),
+) -> ForceSignal {
+    if !prove() {
+        return ForceSignal::NotSignalled;
+    }
+    signal(libc::SIGTERM);
+    if prove() {
+        signal(libc::SIGKILL);
+        ForceSignal::Signalled
+    } else if group_exists() {
+        ForceSignal::TermOnly
+    } else {
+        ForceSignal::Signalled
+    }
+}
+
+/// `--force` for one Unix record: signals its process group only while the
+/// persisted start key proves the recorded leader (see
+/// [`recorded_group_signal_proved`]).
+#[cfg(unix)]
+fn force_signal_group(
+    pid: u32,
+    started_at: Option<&str>,
+    start_epoch_secs: Option<i64>,
+) -> Option<CleanupDisposition> {
+    force_signal_group_with(
+        || recorded_group_signal_proved(pid, started_at, start_epoch_secs),
+        || process_group_may_exist(pid),
+        |sig| {
+            let _ = signal_group(pid, sig);
+        },
+    )
+    .dropped()
+}
+
+/// `--force` for one Windows record: terminates its resolvable Job Object,
+/// else its recorded PID only when the creation-time key matches on the
+/// termination handle. Returns `DroppedUnsignalled` when nothing was
+/// terminated.
+#[cfg(windows)]
+fn force_terminate_record(
+    kind: &str,
+    id: &str,
+    job: Option<&str>,
+    pid: u32,
+    started_at: Option<&str>,
+) -> Option<CleanupDisposition> {
+    let job_available = record_job_available(job);
+    let term = matches!(
+        force_terminate_record_job(job, pid, started_at, "-TERM"),
+        Ok(true)
+    );
+    let kill = matches!(
+        force_terminate_record_job(job, pid, started_at, "-KILL"),
+        Ok(true)
+    );
+    if !(term || kill) {
+        return Some(CleanupDisposition::DroppedUnsignalled);
+    }
+    if !job_available {
+        eprintln!(
+            "warning: forced Windows cleanup of {kind} {id} reached only recorded pid {pid}; descendants may survive"
+        );
+    }
+    None
 }
 
 fn task_recorded_argv(record: &TaskRecord) -> String {
@@ -1164,17 +1280,34 @@ fn session_recorded_argv(record: &SessionRecord) -> String {
     serve_argv(&record.spec).join(" ")
 }
 
-/// Removes a task record that cleanup is done with, together with every
-/// admission artifact that refers to it. Shared by the reaper's two
-/// removal branches (terminal state, and corroborated-dead process) and
-/// by [`rescan_owned_tasks`], so the three cannot drift apart.
-fn task_residue(record: &TaskRecord, liveness: Liveness) -> CleanupResidue {
+/// A report entry for a task record cleanup could not simply finish.
+fn task_residue(
+    record: &TaskRecord,
+    liveness: Liveness,
+    disposition: CleanupDisposition,
+) -> CleanupResidue {
     CleanupResidue {
         kind: "task",
         id: record.id.clone(),
         pid: record.pid,
         liveness,
         argv: task_recorded_argv(record),
+        disposition,
+    }
+}
+
+fn session_residue(
+    record: &SessionRecord,
+    liveness: Liveness,
+    disposition: CleanupDisposition,
+) -> CleanupResidue {
+    CleanupResidue {
+        kind: "session",
+        id: record.id.clone(),
+        pid: record.pid,
+        liveness,
+        argv: session_recorded_argv(record),
+        disposition,
     }
 }
 
@@ -1222,18 +1355,22 @@ pub(super) fn reap_session_tasks_with_wait(
             remove_reaped_task_record(control, &record)?;
             continue;
         }
-        upgrade_legacy_task_record(control, &mut record)?;
         let mut liveness = task_execution_liveness(&record);
         if force {
-            if liveness != Liveness::Dead {
-                let _ = signal_group(record.pid, libc::SIGTERM);
-                let _ = signal_group(record.pid, libc::SIGKILL);
+            if liveness != Liveness::Dead
+                && let Some(disposition) = force_signal_group(
+                    record.pid,
+                    record.started_at.as_deref(),
+                    record.start_epoch_secs,
+                )
+            {
+                residue.push(task_residue(&record, liveness, disposition));
             }
             remove_reaped_task_record(control, &record)?;
             continue;
         }
         if liveness == Liveness::Unresolved {
-            residue.push(task_residue(&record, liveness));
+            residue.push(task_residue(&record, liveness, CleanupDisposition::Kept));
             continue;
         }
         let mut term_sent = false;
@@ -1269,7 +1406,7 @@ pub(super) fn reap_session_tasks_with_wait(
         if liveness == Liveness::Dead {
             remove_reaped_task_record(control, &record)?;
         } else {
-            residue.push(task_residue(&record, liveness));
+            residue.push(task_residue(&record, liveness, CleanupDisposition::Kept));
         }
     }
     Ok((residue, handled))
@@ -1319,29 +1456,34 @@ pub(super) fn reap_session_tasks_with_wait(
             remove_reaped_task_record(control, &record)?;
             continue;
         }
-        upgrade_legacy_task_record(control, &mut record)?;
         let mut liveness = is_task_alive(&record);
         if force {
-            if liveness != Liveness::Dead {
-                if !record_job_available(record.job.as_deref()) {
-                    eprintln!(
-                        "warning: forced Windows cleanup of task {} reaches only recorded pid {}; descendants may survive",
-                        record.id, record.pid
-                    );
-                }
-                let _ = force_terminate_record_job(record.job.as_deref(), record.pid, "-TERM");
-                let _ = force_terminate_record_job(record.job.as_deref(), record.pid, "-KILL");
+            if liveness != Liveness::Dead
+                && let Some(disposition) = force_terminate_record(
+                    "task",
+                    &record.id,
+                    record.job.as_deref(),
+                    record.pid,
+                    record.started_at.as_deref(),
+                )
+            {
+                residue.push(task_residue(&record, liveness, disposition));
             }
             remove_reaped_task_record(control, &record)?;
             continue;
         }
         if liveness == Liveness::Unresolved {
-            residue.push(task_residue(&record, liveness));
+            residue.push(task_residue(&record, liveness, CleanupDisposition::Kept));
             continue;
         }
         let mut term_sent = false;
         if liveness == Liveness::Live {
-            let _ = terminate_record_job_or_pid(record.job.as_deref(), record.pid, "-TERM");
+            let _ = terminate_record_job_or_pid(
+                record.job.as_deref(),
+                record.pid,
+                record.started_at.as_deref(),
+                "-TERM",
+            );
             term_sent = true;
         }
         if liveness != Liveness::Dead
@@ -1352,7 +1494,12 @@ pub(super) fn reap_session_tasks_with_wait(
             continue;
         }
         if liveness == Liveness::Live && !term_sent {
-            let _ = terminate_record_job_or_pid(record.job.as_deref(), record.pid, "-TERM");
+            let _ = terminate_record_job_or_pid(
+                record.job.as_deref(),
+                record.pid,
+                record.started_at.as_deref(),
+                "-TERM",
+            );
             if let Some(terminal) =
                 wait_then_recheck_terminal(admission, &record, &mut liveness, KILL_GRACE_MS, &wait)?
             {
@@ -1361,7 +1508,12 @@ pub(super) fn reap_session_tasks_with_wait(
             }
         }
         if liveness == Liveness::Live {
-            let _ = terminate_record_job_or_pid(record.job.as_deref(), record.pid, "-KILL");
+            let _ = terminate_record_job_or_pid(
+                record.job.as_deref(),
+                record.pid,
+                record.started_at.as_deref(),
+                "-KILL",
+            );
             if let Some(terminal) =
                 wait_then_recheck_terminal(admission, &record, &mut liveness, KILL_GRACE_MS, &wait)?
             {
@@ -1372,7 +1524,7 @@ pub(super) fn reap_session_tasks_with_wait(
         if liveness == Liveness::Dead {
             remove_reaped_task_record(control, &record)?;
         } else {
-            residue.push(task_residue(&record, liveness));
+            residue.push(task_residue(&record, liveness, CleanupDisposition::Kept));
         }
     }
     Ok((residue, handled))
@@ -1455,7 +1607,7 @@ fn wait_then_recheck_terminal(
 /// fails (see [`AdmissionGuard`]), so the stop exits non-zero, the session
 /// record is retained, and the next stop applies the full ladder. Under
 /// `force` it mirrors the reaper's force branch instead, so `--force`
-/// still leaves nothing behind.
+/// still leaves no record behind.
 #[cfg(unix)]
 pub(super) fn rescan_owned_tasks(
     admission: &mut AdmissionGuard,
@@ -1477,7 +1629,7 @@ pub(super) fn rescan_owned_tasks(
         // reaper; a cached Running entry was never handled by reap's own
         // pass, so it still needs one direct confirmation before this
         // pass decides anything from it.
-        let mut record = if cached.state != TaskState::Running {
+        let record = if cached.state != TaskState::Running {
             cached
         } else {
             match read_task_record(control, &id)? {
@@ -1489,15 +1641,19 @@ pub(super) fn rescan_owned_tasks(
             remove_reaped_task_record(control, &record)?;
             continue;
         }
-        upgrade_legacy_task_record(control, &mut record)?;
         // The same probe the reaper's first pass uses, so a record that
         // only this pass sees is judged identically. The non-retrying
         // form: this pass must never sleep.
         let liveness = task_execution_liveness(&record);
         if force {
-            if liveness != Liveness::Dead {
-                let _ = signal_group(record.pid, libc::SIGTERM);
-                let _ = signal_group(record.pid, libc::SIGKILL);
+            if liveness != Liveness::Dead
+                && let Some(disposition) = force_signal_group(
+                    record.pid,
+                    record.started_at.as_deref(),
+                    record.start_epoch_secs,
+                )
+            {
+                residue.push(task_residue(&record, liveness, disposition));
             }
             remove_reaped_task_record(control, &record)?;
             continue;
@@ -1505,7 +1661,7 @@ pub(super) fn rescan_owned_tasks(
         if liveness == Liveness::Dead {
             remove_reaped_task_record(control, &record)?;
         } else {
-            residue.push(task_residue(&record, liveness));
+            residue.push(task_residue(&record, liveness, CleanupDisposition::Kept));
         }
     }
     Ok(())
@@ -1529,7 +1685,7 @@ pub(super) fn rescan_owned_tasks(
 /// fails (see [`AdmissionGuard`]), so the stop exits non-zero, the session
 /// record is retained, and the next stop applies the full ladder. Under
 /// `force` it mirrors the reaper's force branch instead, so `--force`
-/// still leaves nothing behind.
+/// still leaves no record behind.
 #[cfg(windows)]
 pub(super) fn rescan_owned_tasks(
     admission: &mut AdmissionGuard,
@@ -1551,7 +1707,7 @@ pub(super) fn rescan_owned_tasks(
         // reaper; a cached Running entry was never handled by reap's own
         // pass, so it still needs one direct confirmation before this pass
         // decides anything from it.
-        let mut record = if cached.state != TaskState::Running {
+        let record = if cached.state != TaskState::Running {
             cached
         } else {
             match read_task_record(control, &id)? {
@@ -1563,21 +1719,21 @@ pub(super) fn rescan_owned_tasks(
             remove_reaped_task_record(control, &record)?;
             continue;
         }
-        upgrade_legacy_task_record(control, &mut record)?;
         // The same probe the reaper's first pass uses, so a record that
         // only this pass sees is judged identically. The non-retrying
         // form: this pass must never sleep.
         let liveness = is_task_alive(&record);
         if force {
-            if liveness != Liveness::Dead {
-                if !record_job_available(record.job.as_deref()) {
-                    eprintln!(
-                        "warning: forced Windows cleanup of task {} reaches only recorded pid {}; descendants may survive",
-                        record.id, record.pid
-                    );
-                }
-                let _ = force_terminate_record_job(record.job.as_deref(), record.pid, "-TERM");
-                let _ = force_terminate_record_job(record.job.as_deref(), record.pid, "-KILL");
+            if liveness != Liveness::Dead
+                && let Some(disposition) = force_terminate_record(
+                    "task",
+                    &record.id,
+                    record.job.as_deref(),
+                    record.pid,
+                    record.started_at.as_deref(),
+                )
+            {
+                residue.push(task_residue(&record, liveness, disposition));
             }
             remove_reaped_task_record(control, &record)?;
             continue;
@@ -1585,7 +1741,7 @@ pub(super) fn rescan_owned_tasks(
         if liveness == Liveness::Dead {
             remove_reaped_task_record(control, &record)?;
         } else {
-            residue.push(task_residue(&record, liveness));
+            residue.push(task_residue(&record, liveness, CleanupDisposition::Kept));
         }
     }
     Ok(())
@@ -1706,18 +1862,57 @@ pub(super) fn execute_status(
     writeln!(out, "{json}").map_err(io_err)
 }
 
-fn report_cleanup_residue(residue: &[CleanupResidue]) {
-    for item in residue {
-        let liveness = match item.liveness {
-            Liveness::Live => "live",
-            Liveness::Dead => "dead",
-            Liveness::Unresolved => "unresolved",
-        };
-        eprintln!(
+/// The operator-facing report line for one residue item.
+pub(super) fn cleanup_residue_line(item: &CleanupResidue) -> String {
+    let liveness = match item.liveness {
+        Liveness::Live => "live",
+        Liveness::Dead => "dead",
+        Liveness::Unresolved => "unresolved",
+    };
+    match item.disposition {
+        CleanupDisposition::Kept => format!(
             "baton cleanup kept {}: id={} pid={} liveness={} recorded_argv={:?}",
             item.kind, item.id, item.pid, liveness, item.argv
-        );
+        ),
+        CleanupDisposition::DroppedUnsignalled => format!(
+            "baton cleanup dropped {}: id={} pid={} liveness={} recorded_argv={:?} -- not signalled; record dropped",
+            item.kind, item.id, item.pid, liveness, item.argv
+        ),
+        CleanupDisposition::DroppedAfterTerm => format!(
+            "baton cleanup incomplete {}: id={} pid={} -- SIGTERM sent; SIGKILL skipped because identity could not be re-proved; descendants may survive; record dropped",
+            item.kind, item.id, item.pid
+        ),
     }
+}
+
+/// Reports every residue item, then turns the set into the command result:
+/// any kept record fails with `kept_error(count)`; otherwise any forced
+/// cleanup that stopped after SIGTERM fails as incomplete. Records dropped
+/// without a signal are reported but do not fail the command.
+pub(super) fn finish_cleanup(
+    residue: &[CleanupResidue],
+    kept_error: impl FnOnce(usize) -> String,
+) -> Result<()> {
+    for item in residue {
+        eprintln!("{}", cleanup_residue_line(item));
+    }
+    let count = |disposition| {
+        residue
+            .iter()
+            .filter(|item| item.disposition == disposition)
+            .count()
+    };
+    let kept = count(CleanupDisposition::Kept);
+    if kept > 0 {
+        return Err(BatonError::Io(kept_error(kept)));
+    }
+    let incomplete = count(CleanupDisposition::DroppedAfterTerm);
+    if incomplete > 0 {
+        return Err(BatonError::Io(format!(
+            "forced cleanup incomplete: {incomplete} record(s) received SIGTERM but not SIGKILL; descendants may survive"
+        )));
+    }
+    Ok(())
 }
 
 pub(super) fn execute_stop(
@@ -1730,12 +1925,11 @@ pub(super) fn execute_stop(
     match read_session_record(control, session)? {
         Some(record) => {
             let residue = stop_session_record(&mut admission, &record, force)?;
-            if !residue.is_empty() {
-                report_cleanup_residue(&residue);
-                return Err(BatonError::Io(format!(
-                    "session {session} remains live or unresolved; use --force to assert its identity"
-                )));
-            }
+            finish_cleanup(&residue, |_| {
+                format!(
+                    "session {session} remains live or unresolved; --force drops records whose identity cannot be proved without signalling them"
+                )
+            })?;
             writeln!(out, "stopped session {session}").map_err(io_err)
         }
         None => writeln!(
@@ -1847,10 +2041,20 @@ fn cancel_task_record(control: &Path, record: &TaskRecord) -> Result<()> {
     }
     request_task_cancel_sentinel(control, &record.id)?;
     if is_task_alive(record) == Liveness::Live {
-        let _ = terminate_record_job_or_pid(record.job.as_deref(), record.pid, "-TERM");
+        let _ = terminate_record_job_or_pid(
+            record.job.as_deref(),
+            record.pid,
+            record.started_at.as_deref(),
+            "-TERM",
+        );
         wait_while_task_alive(record, KILL_GRACE_MS);
         if is_task_alive(record) == Liveness::Live {
-            let _ = terminate_record_job_or_pid(record.job.as_deref(), record.pid, "-KILL");
+            let _ = terminate_record_job_or_pid(
+                record.job.as_deref(),
+                record.pid,
+                record.started_at.as_deref(),
+                "-KILL",
+            );
             wait_while_task_alive(record, KILL_GRACE_MS);
         }
     }
@@ -1877,8 +2081,9 @@ pub(super) fn execute_task_cancel(control: &Path, task: &str, mut out: impl Writ
 /// every task this session owns ([`reap_session_tasks_with_wait`]) and
 /// removes the session's own durable record. Idempotent — a session
 /// already gone just gets its (possibly already-absent) record, and its
-/// tasks', cleaned up. Returns any records retained because their
-/// identity remained unresolved.
+/// tasks', cleaned up. Returns every record cleanup could not simply
+/// finish: those retained as live or unresolved, and under `force` those
+/// dropped without a signal or after `SIGTERM` alone.
 fn stop_session_record(
     admission: &mut AdmissionGuard,
     record: &SessionRecord,
@@ -1905,17 +2110,21 @@ pub(super) fn stop_session_record_with_wait(
     task_wait: impl Fn(&TaskRecord, u64),
 ) -> Result<Vec<CleanupResidue>> {
     let control = admission.control();
-    let mut record = record.clone();
-    upgrade_legacy_session_record(control, &mut record)?;
+    let record = record.clone();
     // Claimed before the first `unlocked_wait`, so admission can tell a
     // still-live owner that is nonetheless committed to stopping.
     let _stopping = SessionStopGuard::claim(control, &record.id)?;
     let _ = mailbox::request_stop(&record.spec.inbox);
     let mut liveness = is_session_alive(&record);
+    let mut forced = None;
     if force {
         if liveness != Liveness::Dead {
-            let _ = signal_group(record.pid, libc::SIGTERM);
-            let _ = signal_group(record.pid, libc::SIGKILL);
+            forced = force_signal_group(
+                record.pid,
+                record.started_at.as_deref(),
+                record.start_epoch_secs,
+            )
+            .map(|disposition| session_residue(&record, liveness, disposition));
         }
         liveness = Liveness::Dead;
     } else {
@@ -1938,21 +2147,19 @@ pub(super) fn stop_session_record_with_wait(
     // without interruption, so nothing can be admitted between the rescan
     // and `remove_session_record`.
     rescan_owned_tasks(admission, &record.id, force, &handled, &mut residue)?;
-    if liveness == Liveness::Dead && residue.is_empty() {
+    let blocked = residue
+        .iter()
+        .any(|item| item.disposition == CleanupDisposition::Kept);
+    if liveness == Liveness::Dead && !blocked {
         remove_session_record(control, &record.id)?;
         // The record was the only pointer to this session's captured
         // stderr, so the log tree is reclaimed with it. A session left as
         // residue keeps both, so the operator can still read why.
         let _ = fs::remove_dir_all(session_logs_dir(control, &record.id));
     } else if liveness != Liveness::Dead {
-        residue.push(CleanupResidue {
-            kind: "session",
-            id: record.id.clone(),
-            pid: record.pid,
-            liveness,
-            argv: session_recorded_argv(&record),
-        });
+        residue.push(session_residue(&record, liveness, CleanupDisposition::Kept));
     }
+    residue.extend(forced);
     Ok(residue)
 }
 
@@ -1968,36 +2175,46 @@ pub(super) fn stop_session_record_with_wait(
     task_wait: impl Fn(&TaskRecord, u64),
 ) -> Result<Vec<CleanupResidue>> {
     let control = admission.control();
-    let mut record = record.clone();
-    upgrade_legacy_session_record(control, &mut record)?;
+    let record = record.clone();
     // Claimed before the first `unlocked_wait`, so admission can tell a
     // still-live owner that is nonetheless committed to stopping.
     let _stopping = SessionStopGuard::claim(control, &record.id)?;
     let _ = mailbox::request_stop(&record.spec.inbox);
     let mut liveness = is_session_alive(&record);
+    let mut forced = None;
     if force {
         if liveness != Liveness::Dead {
-            if !record_job_available(record.job.as_deref()) {
-                eprintln!(
-                    "warning: forced Windows cleanup of session {} reaches only recorded pid {}; descendants may survive",
-                    record.id, record.pid
-                );
-            }
-            let _ = force_terminate_record_job(record.job.as_deref(), record.pid, "-TERM");
-            let _ = force_terminate_record_job(record.job.as_deref(), record.pid, "-KILL");
+            forced = force_terminate_record(
+                "session",
+                &record.id,
+                record.job.as_deref(),
+                record.pid,
+                record.started_at.as_deref(),
+            )
+            .map(|disposition| session_residue(&record, liveness, disposition));
         }
         liveness = Liveness::Dead;
     } else {
         admission.unlocked_wait(|| session_wait(&record, STOP_GRACE_MS))?;
         liveness = is_session_alive(&record);
         if liveness == Liveness::Live {
-            let _ = terminate_record_job_or_pid(record.job.as_deref(), record.pid, "-TERM");
+            let _ = terminate_record_job_or_pid(
+                record.job.as_deref(),
+                record.pid,
+                record.started_at.as_deref(),
+                "-TERM",
+            );
             liveness = admission.unlocked_wait(|| {
                 session_wait(&record, KILL_GRACE_MS);
                 cleanup_liveness_after_pid_signal(is_session_alive(&record), record.pid)
             })?;
             if liveness == Liveness::Live {
-                let _ = terminate_record_job_or_pid(record.job.as_deref(), record.pid, "-KILL");
+                let _ = terminate_record_job_or_pid(
+                    record.job.as_deref(),
+                    record.pid,
+                    record.started_at.as_deref(),
+                    "-KILL",
+                );
                 liveness = admission.unlocked_wait(|| {
                     session_wait(&record, KILL_GRACE_MS);
                     cleanup_liveness_after_pid_signal(is_session_alive(&record), record.pid)
@@ -2011,17 +2228,15 @@ pub(super) fn stop_session_record_with_wait(
     // without interruption, so nothing can be admitted between the rescan
     // and `remove_session_record`.
     rescan_owned_tasks(admission, &record.id, force, &handled, &mut residue)?;
-    if liveness == Liveness::Dead && residue.is_empty() {
+    let blocked = residue
+        .iter()
+        .any(|item| item.disposition == CleanupDisposition::Kept);
+    if liveness == Liveness::Dead && !blocked {
         remove_session_record(control, &record.id)?;
     } else if liveness != Liveness::Dead {
-        residue.push(CleanupResidue {
-            kind: "session",
-            id: record.id.clone(),
-            pid: record.pid,
-            liveness,
-            argv: session_recorded_argv(&record),
-        });
+        residue.push(session_residue(&record, liveness, CleanupDisposition::Kept));
     }
+    residue.extend(forced);
     Ok(residue)
 }
 
@@ -2065,13 +2280,11 @@ pub(super) fn execute_teardown_with_timeout(
         ),
     }
     .map_err(io_err);
-    if !residue.is_empty() {
-        report_cleanup_residue(&residue);
-        return Err(BatonError::Io(format!(
-            "{} managed record(s) remain live or unresolved; use --force to assert their identities",
-            residue.len()
-        )));
-    }
+    finish_cleanup(&residue, |kept| {
+        format!(
+            "{kept} managed record(s) remain live or unresolved; --force drops records whose identity cannot be proved without signalling them"
+        )
+    })?;
     result
 }
 
@@ -2101,5 +2314,142 @@ pub(super) fn wait_for_control_release_with_timeout(
             return Ok(());
         }
         std::thread::sleep(Duration::from_millis(POLL_INTERVAL_MS).min(remaining));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn residue(disposition: CleanupDisposition) -> CleanupResidue {
+        CleanupResidue {
+            kind: "task",
+            id: "task-7".to_string(),
+            pid: 4242,
+            liveness: Liveness::Unresolved,
+            argv: "sleep 60".to_string(),
+            disposition,
+        }
+    }
+
+    fn kept_error(count: usize) -> String {
+        format!("{count} kept")
+    }
+
+    #[test]
+    fn dropped_unsignalled_line_names_the_record_and_the_skip() {
+        let line = cleanup_residue_line(&residue(CleanupDisposition::DroppedUnsignalled));
+        assert!(line.contains("id=task-7"), "{line}");
+        assert!(line.contains("pid=4242"), "{line}");
+        assert!(line.ends_with("not signalled; record dropped"), "{line}");
+    }
+
+    #[test]
+    fn dropped_unsignalled_alone_succeeds() {
+        finish_cleanup(
+            &[residue(CleanupDisposition::DroppedUnsignalled)],
+            kept_error,
+        )
+        .expect("records dropped without a signal do not fail the command");
+    }
+
+    #[test]
+    fn dropped_after_term_fails_as_incomplete_and_is_never_reported_unsignalled() {
+        let item = residue(CleanupDisposition::DroppedAfterTerm);
+        let line = cleanup_residue_line(&item);
+        assert!(line.contains("id=task-7"), "{line}");
+        assert!(line.contains("pid=4242"), "{line}");
+        assert!(line.contains("SIGKILL skipped"), "{line}");
+        assert!(!line.contains("not signalled"), "{line}");
+        let err = finish_cleanup(
+            &[residue(CleanupDisposition::DroppedUnsignalled), item],
+            kept_error,
+        )
+        .expect_err("a partial forced cleanup fails the command");
+        assert!(
+            err.to_string()
+                .contains("forced cleanup incomplete: 1 record(s)"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn kept_records_fail_with_the_callers_error_first() {
+        let err = finish_cleanup(
+            &[
+                residue(CleanupDisposition::DroppedAfterTerm),
+                residue(CleanupDisposition::Kept),
+            ],
+            kept_error,
+        )
+        .expect_err("kept records fail the command");
+        assert!(err.to_string().contains("1 kept"), "{err}");
+    }
+
+    /// Runs the forced signal sequence against scripted proof results and a
+    /// group that still has members, returning the outcome and the signals
+    /// actually sent.
+    #[cfg(unix)]
+    fn scripted_force(proofs: &[bool]) -> (ForceSignal, Vec<libc::c_int>) {
+        let mut proofs = proofs.iter().copied();
+        let mut sent = Vec::new();
+        let outcome = force_signal_group_with(
+            || proofs.next().expect("no unscripted proof check"),
+            || true,
+            |sig| sent.push(sig),
+        );
+        (outcome, sent)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn force_signal_skips_sigkill_when_identity_is_lost_after_sigterm() {
+        assert_eq!(
+            scripted_force(&[true, false]),
+            (ForceSignal::TermOnly, vec![libc::SIGTERM])
+        );
+        assert_eq!(
+            ForceSignal::TermOnly.dropped(),
+            Some(CleanupDisposition::DroppedAfterTerm)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn force_signal_sends_nothing_without_proof() {
+        assert_eq!(
+            scripted_force(&[false]),
+            (ForceSignal::NotSignalled, vec![])
+        );
+        assert_eq!(
+            ForceSignal::NotSignalled.dropped(),
+            Some(CleanupDisposition::DroppedUnsignalled)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn force_signal_sends_both_signals_while_identity_holds() {
+        assert_eq!(
+            scripted_force(&[true, true]),
+            (ForceSignal::Signalled, vec![libc::SIGTERM, libc::SIGKILL])
+        );
+        assert_eq!(ForceSignal::Signalled.dropped(), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn force_signal_is_complete_when_the_group_is_gone_after_sigterm() {
+        let mut proofs = [true, false].into_iter();
+        let mut sent = Vec::new();
+        let outcome = force_signal_group_with(
+            || proofs.next().expect("no unscripted proof check"),
+            || false,
+            |sig| sent.push(sig),
+        );
+        assert_eq!(
+            (outcome, sent),
+            (ForceSignal::Signalled, vec![libc::SIGTERM])
+        );
     }
 }

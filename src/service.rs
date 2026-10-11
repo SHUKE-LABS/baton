@@ -240,16 +240,15 @@ mod imp {
     #[cfg(all(test, target_os = "linux"))]
     use super::control::{
         ADMISSION_LOCK_FILE, STOP_GRACE_MS, TASK_NEW_ID_PARSES, request_task_cancel_sentinel,
-        rescan_owned_tasks,
     };
     #[cfg(test)]
     use super::control::{
-        AdmissionGuard, CONTROL_INFO_FILE, CONTROL_STOP_FILE, ControlLiveness, KILL_GRACE_MS,
-        SessionStopGuard, SessionStopMarker, TASK_CONFIRM_READS, TASK_FULL_LISTINGS,
+        AdmissionGuard, CONTROL_INFO_FILE, CONTROL_STOP_FILE, CleanupDisposition, ControlLiveness,
+        KILL_GRACE_MS, SessionStopGuard, SessionStopMarker, TASK_CONFIRM_READS, TASK_FULL_LISTINGS,
         acquire_control_lock, await_start_response, execute_teardown_with_timeout,
         handle_start_request, probe_control, reap_session_tasks_with_wait, request_control_stop,
-        session_logs_dir, stop_session_record_with_wait, take_task_start_response,
-        wait_for_control_release_with_timeout,
+        rescan_owned_tasks, session_logs_dir, stop_session_record_with_wait,
+        take_task_start_response, wait_for_control_release_with_timeout,
     };
     use super::control::{
         POLL_INTERVAL_MS, acquire_admission_lock, current_baton_exe, execute_status, execute_stop,
@@ -264,7 +263,7 @@ mod imp {
     use super::records::task_start_response_boundary_exists;
     #[cfg(all(test, target_os = "linux"))]
     use super::records::task_start_rollback_exists;
-    #[cfg(any(test, target_os = "macos"))]
+    #[cfg(test)]
     use super::records::write_session_record;
     use super::records::{SessionRecord, read_task_record, write_task_record};
     #[cfg(test)]
@@ -540,10 +539,6 @@ mod imp {
 
         fn rehydrate_task(_record: &TaskRecord) -> Result<Option<Self::TaskHandle>> {
             Ok(None)
-        }
-
-        fn upgrade_legacy_task_record(control: &Path, record: &mut TaskRecord) -> Result<()> {
-            upgrade_legacy_task_record(control, record)
         }
 
         fn escalate_task_to_death(record: &TaskRecord, grace_ms: u64) -> Liveness {
@@ -1570,62 +1565,58 @@ mod imp {
         }
     }
 
-    /// Persists the canonical epoch after a legacy macOS record is rescued by
-    /// the fallback ladder. Callers must hold the admission lock; status and
-    /// supervisor tick paths intentionally remain read-only.
-    #[cfg(target_os = "macos")]
-    pub(super) fn upgrade_legacy_session_record(
-        control: &Path,
-        record: &mut SessionRecord,
-    ) -> Result<()> {
-        if record.start_epoch_secs.is_some() {
-            return Ok(());
-        }
-        let (liveness, start_epoch_secs) = session_liveness(record);
-        if liveness == Liveness::Live
-            && let Some(start_epoch_secs) = start_epoch_secs
-        {
-            record.start_epoch_secs = Some(start_epoch_secs);
-            write_session_record(control, record)?;
-        }
-        Ok(())
+    /// Whether `--force` may signal the process group led by `pid`: only a
+    /// persisted start key that matches the recorded leader right now proves
+    /// the target. A matching zombie leader still counts, because the zombie
+    /// pins the PID and therefore the PGID. A gone leader, a legacy record
+    /// with no key, or an unreadable probe never does — the group could by
+    /// then belong to anything. Callers re-probe before every signal.
+    #[cfg(target_os = "linux")]
+    pub(super) fn recorded_group_signal_proved(
+        pid: u32,
+        started_at: Option<&str>,
+        _start_epoch_secs: Option<i64>,
+    ) -> bool {
+        let Some(recorded) = started_at else {
+            return false;
+        };
+        matches!(process_probe(pid), ProbeResult::Present(probe) if probe.start_key == recorded)
     }
 
-    #[cfg(not(target_os = "macos"))]
-    pub(super) fn upgrade_legacy_session_record(
-        _control: &Path,
-        _record: &mut SessionRecord,
-    ) -> Result<()> {
-        Ok(())
+    /// Whether `--force` may signal the process group led by `pid`: only a
+    /// persisted start key that matches the recorded leader right now proves
+    /// the target. A matching zombie leader still counts, because the zombie
+    /// pins the PID and therefore the PGID. A gone leader, a legacy record
+    /// with no key, or an unreadable probe never does — the group could by
+    /// then belong to anything. Callers re-probe before every signal.
+    #[cfg(not(target_os = "linux"))]
+    pub(super) fn recorded_group_signal_proved(
+        pid: u32,
+        started_at: Option<&str>,
+        start_epoch_secs: Option<i64>,
+    ) -> bool {
+        if started_at.is_none() && start_epoch_secs.is_none() {
+            return false;
+        }
+        let ProbeResult::Present(probe) = process_probe(pid) else {
+            return false;
+        };
+        match (start_epoch_secs, started_at) {
+            (Some(recorded), _) => probe.start_epoch_secs == Some(recorded),
+            (None, Some(recorded)) => probe.start_key == recorded,
+            (None, None) => false,
+        }
     }
 
-    /// Persists the canonical epoch after a legacy macOS task record is
-    /// rescued by the fallback ladder. Callers must hold the admission lock;
-    /// the supervisor's rehydration/tick paths deliberately do not rewrite.
-    #[cfg(target_os = "macos")]
-    pub(super) fn upgrade_legacy_task_record(
-        control: &Path,
-        record: &mut TaskRecord,
-    ) -> Result<()> {
-        if record.start_epoch_secs.is_some() {
-            return Ok(());
+    /// Whether the process group led by `pid` may still have members. Only
+    /// `ESRCH` proves the group is gone; every other outcome (including
+    /// `EPERM`) is treated as possibly present. Sends no signal.
+    pub(super) fn process_group_may_exist(pid: u32) -> bool {
+        if pid <= 1 || pid > i32::MAX as u32 {
+            return false;
         }
-        let (liveness, start_epoch_secs) = task_liveness(record);
-        if liveness == Liveness::Live
-            && let Some(start_epoch_secs) = start_epoch_secs
-        {
-            record.start_epoch_secs = Some(start_epoch_secs);
-            write_task_record(control, record)?;
-        }
-        Ok(())
-    }
-
-    #[cfg(not(target_os = "macos"))]
-    pub(super) fn upgrade_legacy_task_record(
-        _control: &Path,
-        _record: &mut TaskRecord,
-    ) -> Result<()> {
-        Ok(())
+        let result = unsafe { libc::kill(-(pid as libc::pid_t), 0) };
+        result == 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
     }
 
     /// Sends `sig` to the process **group** led by `pid`.
@@ -2152,68 +2143,6 @@ mod imp {
                 .expect("read legacy record")
                 .expect("legacy record exists");
             assert_eq!(read.spec.registry, None);
-        }
-
-        /// A legacy macOS task rescued by its spawn instant is upgraded once
-        /// on a lock-holding cleanup path. Session argv rescue is covered by
-        /// the real-binary integration fixture.
-        #[cfg(target_os = "macos")]
-        #[test]
-        fn legacy_macos_task_record_upgrades_after_instant_rescue() {
-            let _guard = serialize_forks_and_locks();
-            let dir = TempDir::new("legacy-macos-upgrade");
-
-            let task_specification = task_spec(
-                "svc-1",
-                "sleep",
-                vec!["30".to_string()],
-                Vec::new(),
-                60_000,
-                &dir.path.join("callback").display().to_string(),
-            );
-            let log_dir = task_logs_dir(&dir.path, "task-legacy");
-            fs::create_dir_all(&log_dir).expect("create task logs");
-            let mut task_child = spawn_task_child(
-                &task_specification,
-                &log_dir.join("stdout.log"),
-                &log_dir.join("stderr.log"),
-            )
-            .expect("spawn task child");
-            let task_record = TaskRecord {
-                id: "task-legacy".to_string(),
-                request_id: None,
-                admission: TaskAdmissionPhase::Responded,
-                spec: task_specification,
-                pid: task_child.id(),
-                started_at: Some("legacy-lstart".to_string()),
-                start_epoch_secs: None,
-                job: None,
-                started_ms: Some(SystemClock.now_ms()),
-                state: TaskState::Running,
-                exit_code: None,
-                elapsed_ms: None,
-                stdout_path: log_dir.join("stdout.log").display().to_string(),
-                stderr_path: log_dir.join("stderr.log").display().to_string(),
-                delivered_milestones: 0,
-                terminal_delivered_at_ms: None,
-            };
-            write_task_record(&dir.path, &task_record).expect("write legacy task");
-            let mut upgraded_task = task_record.clone();
-            upgrade_legacy_task_record(&dir.path, &mut upgraded_task).expect("upgrade legacy task");
-            assert!(
-                upgraded_task.start_epoch_secs.is_some(),
-                "instant rescue populates the canonical task epoch"
-            );
-            assert_eq!(
-                read_task_record(&dir.path, "task-legacy")
-                    .expect("read upgraded task")
-                    .expect("upgraded task exists")
-                    .start_epoch_secs,
-                upgraded_task.start_epoch_secs
-            );
-
-            signal_group(task_child.id(), libc::SIGKILL).expect("kill task child");
-            task_child.wait().expect("wait for task child");
         }
 
         /// A session id absent from `sessions/` reads as `None`, not an error.
@@ -7542,7 +7471,296 @@ mod imp {
                     .expect("read forced response boundary"),
                 "forced teardown removes the response boundary"
             );
+            assert!(
+                child.try_wait().expect("poll forced task").is_none(),
+                "forced teardown never signals a task whose identity is unresolved"
+            );
+            let _ = signal_group(child.id(), libc::SIGKILL);
             let _ = child.wait();
+        }
+
+        /// Spawns an unrelated process, in its own process group, whose argv
+        /// ends with `spec`'s serve argv — exactly what a legacy (no start
+        /// key) session record's argv rescue would accept as the session.
+        /// `; :` keeps `sh` from exec-replacing itself, so its argv stays.
+        fn spawn_session_argv_impostor(spec: &SessionSpec) -> Child {
+            Command::new("sh")
+                .arg("-c")
+                .arg("sleep 60; :")
+                .args(serve_argv(spec))
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .process_group(0)
+                .spawn()
+                .expect("spawn session argv impostor")
+        }
+
+        /// A legacy running task (no start key, no spawn instant) whose
+        /// recorded argv is exactly `sleep 60`, plus the matching live child.
+        fn spawn_legacy_sleep_task(dir: &Path, task_id: &str) -> (Child, TaskRecord) {
+            let specification = task_spec(
+                "svc-1",
+                "sleep",
+                vec!["60".to_string()],
+                Vec::new(),
+                60_000,
+                "/tmp/cb",
+            );
+            let log_dir = task_logs_dir(dir, task_id);
+            fs::create_dir_all(&log_dir).expect("create task log dir");
+            let child = spawn_task_child(
+                &specification,
+                &log_dir.join("stdout.log"),
+                &log_dir.join("stderr.log"),
+            )
+            .expect("spawn legacy task child");
+            let record = TaskRecord {
+                id: task_id.to_string(),
+                request_id: None,
+                admission: TaskAdmissionPhase::Committed,
+                spec: specification,
+                pid: child.id(),
+                started_at: None,
+                start_epoch_secs: None,
+                job: None,
+                started_ms: None,
+                state: TaskState::Running,
+                exit_code: None,
+                elapsed_ms: None,
+                stdout_path: String::new(),
+                stderr_path: String::new(),
+                delivered_milestones: 0,
+                terminal_delivered_at_ms: None,
+            };
+            write_task_record(dir, &record).expect("write legacy task");
+            (child, record)
+        }
+
+        fn wait_for_child_exit(child: &mut Child, grace_ms: u64) -> bool {
+            let deadline = Instant::now() + Duration::from_millis(grace_ms);
+            loop {
+                if child.try_wait().expect("poll child").is_some() {
+                    return true;
+                }
+                if Instant::now() >= deadline {
+                    return false;
+                }
+                std::thread::sleep(Duration::from_millis(POLL_INTERVAL_MS));
+            }
+        }
+
+        /// #382: a legacy session record with no start key whose argv
+        /// rescue matches an unrelated live process is dropped by
+        /// `--force` without signalling that process, and reported.
+        #[test]
+        fn forced_stop_drops_legacy_session_record_without_signalling_argv_match() {
+            let _guard = serialize_forks_and_locks();
+            let dir = TempDir::new("force-legacy-session");
+            let session_spec = spec(
+                &dir.path.join("in").display().to_string(),
+                &dir.path.join("out").display().to_string(),
+            );
+            let mut impostor = spawn_session_argv_impostor(&session_spec);
+            let record = SessionRecord {
+                id: "svc-legacy".to_string(),
+                spec: session_spec,
+                pid: impostor.id(),
+                started_at: None,
+                start_epoch_secs: None,
+                stderr_path: String::new(),
+            };
+            write_session_record(&dir.path, &record).expect("write legacy session");
+            assert_eq!(is_session_alive(&record), Liveness::Live);
+
+            let mut admission = AdmissionGuard::acquire(&dir.path).expect("admission lock");
+            let residue =
+                stop_session_record_with_wait(&mut admission, &record, true, |_, _| {}, |_, _| {})
+                    .expect("forced stop");
+            drop(admission);
+
+            assert_eq!(residue.len(), 1, "{residue:?}");
+            assert_eq!(residue[0].kind, "session");
+            assert_eq!(residue[0].id, "svc-legacy");
+            assert_eq!(
+                residue[0].disposition,
+                CleanupDisposition::DroppedUnsignalled
+            );
+            assert!(
+                read_session_record(&dir.path, "svc-legacy")
+                    .expect("read session")
+                    .is_none(),
+                "forced stop removes the unprovable session record"
+            );
+            assert!(
+                impostor.try_wait().expect("poll impostor").is_none(),
+                "forced stop never signals a process it could not prove"
+            );
+            let _ = signal_group(impostor.id(), libc::SIGKILL);
+            let _ = impostor.wait();
+        }
+
+        /// A session record whose persisted start key matches its live
+        /// process is still terminated by `--force`.
+        #[test]
+        fn forced_stop_terminates_session_with_matching_start_key() {
+            let _guard = serialize_forks_and_locks();
+            let dir = TempDir::new("force-keyed-session");
+            let session_spec = spec(
+                &dir.path.join("in").display().to_string(),
+                &dir.path.join("out").display().to_string(),
+            );
+            let mut session = spawn_session_argv_impostor(&session_spec);
+            let (started_at, start_epoch_secs) = recorded_start_identity(session.id());
+            assert!(started_at.is_some(), "live session has a start key");
+            let record = SessionRecord {
+                id: "svc-keyed".to_string(),
+                spec: session_spec,
+                pid: session.id(),
+                started_at,
+                start_epoch_secs,
+                stderr_path: String::new(),
+            };
+            write_session_record(&dir.path, &record).expect("write keyed session");
+
+            let mut admission = AdmissionGuard::acquire(&dir.path).expect("admission lock");
+            let residue =
+                stop_session_record_with_wait(&mut admission, &record, true, |_, _| {}, |_, _| {})
+                    .expect("forced stop");
+            drop(admission);
+
+            assert!(residue.is_empty(), "{residue:?}");
+            assert!(
+                read_session_record(&dir.path, "svc-keyed")
+                    .expect("read session")
+                    .is_none()
+            );
+            if !wait_for_child_exit(&mut session, KILL_GRACE_MS) {
+                let _ = signal_group(session.id(), libc::SIGKILL);
+                let _ = session.wait();
+                panic!("forced stop did not terminate a session with a matching start key");
+            }
+        }
+
+        /// #382: a legacy running task with no start key whose argv matches
+        /// an unrelated live process is dropped by forced reap and by the
+        /// forced rescan without signalling it, and reported.
+        #[test]
+        fn forced_task_cleanup_drops_legacy_record_without_signalling_argv_match() {
+            let _guard = serialize_forks_and_locks();
+            let dir = TempDir::new("force-legacy-task");
+            let (mut reaped, reaped_record) = spawn_legacy_sleep_task(&dir.path, "task-reaped");
+            assert_eq!(task_execution_liveness(&reaped_record), Liveness::Live);
+
+            let mut admission = AdmissionGuard::acquire(&dir.path).expect("admission lock");
+            let (residue, _) =
+                reap_session_tasks_with_wait(&mut admission, "svc-1", true, |_, _| {})
+                    .expect("forced reap");
+            drop(admission);
+            assert_eq!(residue.len(), 1, "{residue:?}");
+            assert_eq!(residue[0].id, "task-reaped");
+            assert_eq!(
+                residue[0].disposition,
+                CleanupDisposition::DroppedUnsignalled
+            );
+            assert!(
+                read_task_record(&dir.path, "task-reaped")
+                    .expect("read reaped task")
+                    .is_none(),
+                "forced reap removes the unprovable task record"
+            );
+
+            // A fresh guard, so its task listing includes the second record.
+            let (mut rescanned, _) = spawn_legacy_sleep_task(&dir.path, "task-rescanned");
+            let mut admission = AdmissionGuard::acquire(&dir.path).expect("admission lock");
+            let mut residue = Vec::new();
+            let handled = std::collections::HashSet::new();
+            rescan_owned_tasks(&mut admission, "svc-1", true, &handled, &mut residue)
+                .expect("forced rescan");
+            drop(admission);
+            assert_eq!(residue.len(), 1, "{residue:?}");
+            assert_eq!(residue[0].id, "task-rescanned");
+            assert_eq!(
+                residue[0].disposition,
+                CleanupDisposition::DroppedUnsignalled
+            );
+            assert!(
+                read_task_record(&dir.path, "task-rescanned")
+                    .expect("read rescanned task")
+                    .is_none(),
+                "forced rescan removes the unprovable task record"
+            );
+
+            for child in [&mut reaped, &mut rescanned] {
+                assert!(
+                    child.try_wait().expect("poll legacy task").is_none(),
+                    "forced task cleanup never signals a process it could not prove"
+                );
+                let _ = signal_group(child.id(), libc::SIGKILL);
+                let _ = child.wait();
+            }
+        }
+
+        /// #382: once a task's leader has been reaped, its stored start key
+        /// can no longer be matched, so forced cleanup fails closed: the
+        /// group's surviving member is not signalled and the record is
+        /// dropped and reported.
+        #[cfg(target_os = "linux")]
+        #[test]
+        fn forced_reap_does_not_signal_group_after_leader_is_gone() {
+            let _guard = serialize_forks_and_locks();
+            let dir = TempDir::new("force-gone-leader");
+            let mut leader = Command::new("sh")
+                .arg("-c")
+                .arg("sleep 60 & read _")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .process_group(0)
+                .spawn()
+                .expect("spawn group leader");
+            let pid = leader.id();
+            let mut record = live_task_record("svc-1", "task-gone-leader", pid);
+            record.spec = task_spec(
+                "svc-1",
+                "sh",
+                vec!["-c".to_string(), "sleep 60 & read _".to_string()],
+                Vec::new(),
+                60_000,
+                "/tmp/cb",
+            );
+            assert!(record.started_at.is_some(), "leader has a start key");
+            write_task_record(&dir.path, &record).expect("write task");
+            drop(leader.stdin.take());
+            leader.wait().expect("reap group leader");
+            assert_eq!(
+                task_execution_liveness(&record),
+                Liveness::Live,
+                "the group outlives its reaped leader"
+            );
+
+            let mut admission = AdmissionGuard::acquire(&dir.path).expect("admission lock");
+            let (residue, _) =
+                reap_session_tasks_with_wait(&mut admission, "svc-1", true, |_, _| {})
+                    .expect("forced reap");
+            drop(admission);
+
+            assert_eq!(residue.len(), 1, "{residue:?}");
+            assert_eq!(
+                residue[0].disposition,
+                CleanupDisposition::DroppedUnsignalled
+            );
+            assert!(
+                read_task_record(&dir.path, "task-gone-leader")
+                    .expect("read task")
+                    .is_none()
+            );
+            assert_eq!(
+                task_execution_liveness(&record),
+                Liveness::Live,
+                "forced reap leaves the surviving group member alone"
+            );
+            let _ = signal_group(pid, libc::SIGKILL);
         }
 
         // -- Task CLI-facing operations -----------------------------------

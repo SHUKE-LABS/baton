@@ -1,7 +1,7 @@
 #[cfg(test)]
 use super::control::{
-    ADMISSION_LOCK_FILE, AdmissionGuard, ControlLiveness, KILL_GRACE_MS, STOP_GRACE_MS,
-    SessionStopGuard, SessionStopMarker, TASK_CONFIRM_READS, TASK_FULL_LISTINGS,
+    ADMISSION_LOCK_FILE, AdmissionGuard, CleanupDisposition, ControlLiveness, KILL_GRACE_MS,
+    STOP_GRACE_MS, SessionStopGuard, SessionStopMarker, TASK_CONFIRM_READS, TASK_FULL_LISTINGS,
     TASK_NEW_ID_PARSES, acquire_control_lock, execute_teardown_with_timeout, probe_control,
     reap_session_tasks_with_wait, rehydrate_sessions, request_task_cancel_sentinel,
     rescan_owned_tasks, stop_session_record_with_wait, wait_for_control_release_with_timeout,
@@ -420,19 +420,23 @@ impl ServicePlatform for WindowsServicePlatform {
         signal: TerminationSignal,
         force: bool,
     ) -> Result<()> {
-        if force {
-            force_terminate_record_job(record.job.as_deref(), record.pid, signal.phase())
-        } else {
-            terminate_record_job_or_pid(record.job.as_deref(), record.pid, signal.phase())
-        }
+        terminate_record(
+            record.job.as_deref(),
+            record.pid,
+            record.started_at.as_deref(),
+            signal,
+            force,
+        )
     }
 
     fn terminate_task(record: &TaskRecord, signal: TerminationSignal, force: bool) -> Result<()> {
-        if force {
-            force_terminate_record_job(record.job.as_deref(), record.pid, signal.phase())
-        } else {
-            terminate_record_job_or_pid(record.job.as_deref(), record.pid, signal.phase())
-        }
+        terminate_record(
+            record.job.as_deref(),
+            record.pid,
+            record.started_at.as_deref(),
+            signal,
+            force,
+        )
     }
 
     fn terminate_owned_task(
@@ -443,10 +447,7 @@ impl ServicePlatform for WindowsServicePlatform {
     ) -> Result<()> {
         match owner {
             Some(owner) => terminate_job(owner),
-            None if force => {
-                force_terminate_record_job(record.job.as_deref(), record.pid, signal.phase())
-            }
-            None => terminate_record_job_or_pid(record.job.as_deref(), record.pid, signal.phase()),
+            None => Self::terminate_task(record, signal, force),
         }
     }
 
@@ -474,18 +475,21 @@ impl ServicePlatform for WindowsServicePlatform {
             .map(|job| job.flatten())
     }
 
-    fn upgrade_legacy_task_record(control: &Path, record: &mut TaskRecord) -> Result<()> {
-        upgrade_legacy_task_record(control, record)
-    }
-
     fn escalate_task_to_death(record: &TaskRecord, grace_ms: u64) -> Liveness {
         let mut liveness = is_task_alive(record);
         if liveness == Liveness::Live {
-            let _ = terminate_record_job_or_pid(record.job.as_deref(), record.pid, "-TERM");
+            let started_at = record.started_at.as_deref();
+            let _ =
+                terminate_record_job_or_pid(record.job.as_deref(), record.pid, started_at, "-TERM");
             wait_while_task_alive(record, grace_ms);
             liveness = cleanup_liveness_after_pid_signal(is_task_alive(record), record.pid);
             if liveness == Liveness::Live {
-                let _ = terminate_record_job_or_pid(record.job.as_deref(), record.pid, "-KILL");
+                let _ = terminate_record_job_or_pid(
+                    record.job.as_deref(),
+                    record.pid,
+                    started_at,
+                    "-KILL",
+                );
                 wait_while_task_alive(record, grace_ms);
                 liveness = cleanup_liveness_after_pid_signal(is_task_alive(record), record.pid);
             }
@@ -765,6 +769,19 @@ fn process_probe(pid: u32) -> ProbeResult<String> {
         unsafe { CloseHandle(process) };
         return ProbeResult::Unreadable;
     }
+    let key = process_creation_key(process);
+    // SAFETY: `process` is the handle opened above.
+    unsafe { CloseHandle(process) };
+    match key {
+        Some(key) => ProbeResult::Present(key),
+        None => ProbeResult::Unreadable,
+    }
+}
+
+/// Reads the creation-time key of an open process handle (which must carry
+/// `PROCESS_QUERY_LIMITED_INFORMATION`). The key comes from the handle
+/// itself, so it names exactly the process that handle refers to.
+fn process_creation_key(process: HANDLE) -> Option<String> {
     let mut created = FILETIME {
         dwLowDateTime: 0,
         dwHighDateTime: 0,
@@ -783,12 +800,10 @@ fn process_probe(pid: u32) -> ProbeResult<String> {
     };
     // SAFETY: all FILETIME pointers are writable and `process` is valid.
     let ok = unsafe { GetProcessTimes(process, &mut created, &mut exited, &mut kernel, &mut user) };
-    // SAFETY: `process` is the handle opened above.
-    unsafe { CloseHandle(process) };
     if ok == FALSE {
-        return ProbeResult::Unreadable;
+        return None;
     }
-    ProbeResult::Present(format!(
+    Some(format!(
         "{:08x}{:08x}",
         created.dwHighDateTime, created.dwLowDateTime
     ))
@@ -842,44 +857,50 @@ pub(super) fn is_task_alive(record: &TaskRecord) -> Liveness {
     task_liveness(record).0
 }
 
-pub(super) fn upgrade_legacy_session_record(
-    _control: &Path,
-    _record: &mut SessionRecord,
-) -> Result<()> {
-    Ok(())
-}
-
-pub(super) fn upgrade_legacy_task_record(_control: &Path, _record: &mut TaskRecord) -> Result<()> {
-    Ok(())
-}
-
-/// Terminates only the recorded PID after its identity has been corroborated.
-/// This is the fallback when a named Job Object cannot be resolved; it makes
-/// no claim about descendants.
-fn terminate_record_pid(pid: u32, phase: &str) -> Result<()> {
+/// Terminates the recorded PID only when the creation-time key read from the
+/// termination handle itself matches `expected_start`, so a PID reused since
+/// any earlier probe is never hit. Returns whether the process was
+/// terminated: a missing, mismatched, or unreadable key, a process that
+/// cannot be opened, or one that has already exited is `Ok(false)` and
+/// nothing is signalled. This is the fallback when a named Job Object cannot
+/// be resolved; it makes no claim about descendants.
+fn terminate_record_pid(pid: u32, expected_start: Option<&str>, phase: &str) -> Result<bool> {
+    let Some(expected_start) = expected_start else {
+        return Ok(false);
+    };
     if pid <= 1 {
-        return Ok(());
+        return Ok(false);
     }
     // SAFETY: the handle is opened for this recorded PID only, with no
     // tree-walking or inherited-handle behavior.
-    let process = unsafe { OpenProcess(PROCESS_TERMINATE, FALSE, pid) };
+    let process = unsafe {
+        OpenProcess(
+            PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE,
+            FALSE,
+            pid,
+        )
+    };
     if process == 0 {
-        return Ok(());
+        return Ok(false);
     }
     // SAFETY: `process` is the valid handle opened immediately above.
-    let result = unsafe { TerminateProcess(process, 1) };
+    let running = unsafe { WaitForSingleObject(process, 0) } == WAIT_TIMEOUT;
+    let proved = running && process_creation_key(process).as_deref() == Some(expected_start);
+    // SAFETY: `process` is the handle opened above, and its identity was
+    // just confirmed on this same handle.
+    let terminated = proved && unsafe { TerminateProcess(process, 1) } != FALSE;
+    let error = std::io::Error::last_os_error();
     // SAFETY: `process` is owned by this function.
     unsafe { CloseHandle(process) };
-    if result == FALSE {
+    if proved && !terminated {
         return Err(BatonError::Io(format!(
-            "could not terminate recorded Windows pid {pid} during {phase}: {}",
-            std::io::Error::last_os_error()
+            "could not terminate recorded Windows pid {pid} during {phase}: {error}"
         )));
     }
-    Ok(())
+    Ok(terminated)
 }
 
-fn terminate_record_job(job_name: Option<&str>, _pid: u32, _phase: &str) -> Result<bool> {
+fn terminate_record_job(job_name: Option<&str>) -> Result<bool> {
     if let Some(name) = job_name {
         if let Some(job) = open_job(name)? {
             terminate_job(&job)?;
@@ -891,39 +912,60 @@ fn terminate_record_job(job_name: Option<&str>, _pid: u32, _phase: &str) -> Resu
 }
 
 /// Terminates a corroborated record through its Job Object when possible,
-/// otherwise falls back to the recorded PID. The fallback is safe for the
-/// identity-confirmed process but cannot promise descendant termination.
+/// otherwise falls back to the key-checked recorded PID, which cannot
+/// promise descendant termination.
 pub(super) fn terminate_record_job_or_pid(
     job_name: Option<&str>,
     pid: u32,
+    started_at: Option<&str>,
     phase: &str,
 ) -> Result<()> {
-    match terminate_record_job(job_name, pid, phase) {
-        Ok(true) => Ok(()),
-        Ok(false) => {
-            eprintln!(
-                "warning: Windows Job Object unavailable during {phase}; terminating only recorded pid {pid}; descendants may survive"
-            );
-            terminate_record_pid(pid, phase)
-        }
-        Err(err) => {
-            eprintln!(
-                "warning: Windows Job Object termination during {phase} failed ({err}); terminating only recorded pid {pid}; descendants may survive"
-            );
-            terminate_record_pid(pid, phase)
+    let job_error = match terminate_record_job(job_name) {
+        Ok(true) => return Ok(()),
+        Ok(false) => None,
+        Err(err) => Some(err),
+    };
+    if terminate_record_pid(pid, started_at, phase)? {
+        match job_error {
+            None => eprintln!(
+                "warning: Windows Job Object unavailable during {phase}; terminated only recorded pid {pid}; descendants may survive"
+            ),
+            Some(err) => eprintln!(
+                "warning: Windows Job Object termination during {phase} failed ({err}); terminated only recorded pid {pid}; descendants may survive"
+            ),
         }
     }
+    Ok(())
 }
 
+/// Forced termination: the recorded Job Object when it resolves, otherwise
+/// the recorded PID only when its creation-time key matches on the
+/// termination handle. Returns whether anything was terminated.
 pub(super) fn force_terminate_record_job(
     job_name: Option<&str>,
     pid: u32,
+    started_at: Option<&str>,
     phase: &str,
+) -> Result<bool> {
+    match terminate_record_job(job_name) {
+        Ok(true) => Ok(true),
+        Ok(false) | Err(_) => terminate_record_pid(pid, started_at, phase),
+    }
+}
+
+/// The [`ServicePlatform`] termination entry point shared by session and
+/// task records: forced and non-forced paths both key-check any PID fallback.
+fn terminate_record(
+    job_name: Option<&str>,
+    pid: u32,
+    started_at: Option<&str>,
+    signal: TerminationSignal,
+    force: bool,
 ) -> Result<()> {
-    match terminate_record_job(job_name, pid, phase) {
-        Ok(true) => Ok(()),
-        Ok(false) => terminate_record_pid(pid, phase),
-        Err(_) => terminate_record_pid(pid, phase),
+    if force {
+        force_terminate_record_job(job_name, pid, started_at, signal.phase()).map(|_| ())
+    } else {
+        terminate_record_job_or_pid(job_name, pid, started_at, signal.phase())
     }
 }
 
@@ -2015,7 +2057,7 @@ mod tests {
 
         let record = task_record("svc-test", pid, Some(started_at), Some(job_name.clone()));
         assert_eq!(task_liveness(&record).0, Liveness::Live);
-        terminate_record_job_or_pid(Some(&job_name), pid, "-TERM")
+        terminate_record_job_or_pid(Some(&job_name), pid, record.started_at.as_deref(), "-TERM")
             .expect("terminate corroborated pid fallback");
 
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -2420,6 +2462,129 @@ mod tests {
         let _ = fs::remove_dir_all(control);
     }
 
+    fn assert_alive_then_kill(child: &mut Child, job: &JobHandle, what: &str) {
+        assert!(
+            child.try_wait().expect("poll child").is_none(),
+            "{what} never terminates a process whose creation key does not match"
+        );
+        let _ = terminate_job(job);
+        let _ = child.wait();
+    }
+
+    /// #382: a task record whose creation key mismatches its live PID and
+    /// that has no resolvable Job Object is dropped by forced reap and by
+    /// the forced rescan without terminating the process, and reported.
+    #[test]
+    fn forced_task_cleanup_drops_mismatched_pid_without_job() {
+        let _guard = serialize_forks_and_locks();
+        let control = temp_control("force-mismatched-task");
+        let (mut reaped, reaped_job, _) = spawn_live_task_child(&control, "task-reaped");
+        let mut record = live_task_record("svc-test", "task-reaped", reaped.id(), None);
+        record.started_at = Some("mismatched-identity".to_string());
+        write_task_record(&control, &record).expect("write reaped task");
+
+        let mut admission = AdmissionGuard::acquire(&control).expect("admission lock");
+        let (residue, _) =
+            reap_session_tasks_with_wait(&mut admission, "svc-test", true, |_, _| {})
+                .expect("forced reap");
+        drop(admission);
+        assert_eq!(residue.len(), 1, "{residue:?}");
+        assert_eq!(residue[0].id, "task-reaped");
+        assert_eq!(
+            residue[0].disposition,
+            CleanupDisposition::DroppedUnsignalled
+        );
+        assert!(
+            read_task_record(&control, "task-reaped")
+                .expect("read reaped task")
+                .is_none()
+        );
+
+        // A fresh guard, so its task listing includes the second record.
+        let (mut rescanned, rescanned_job, _) = spawn_live_task_child(&control, "task-rescanned");
+        let mut record = live_task_record("svc-test", "task-rescanned", rescanned.id(), None);
+        record.started_at = Some("mismatched-identity".to_string());
+        write_task_record(&control, &record).expect("write rescanned task");
+        let mut admission = AdmissionGuard::acquire(&control).expect("admission lock");
+        let mut residue = Vec::new();
+        let handled = std::collections::HashSet::new();
+        rescan_owned_tasks(&mut admission, "svc-test", true, &handled, &mut residue)
+            .expect("forced rescan");
+        drop(admission);
+        assert_eq!(residue.len(), 1, "{residue:?}");
+        assert_eq!(residue[0].id, "task-rescanned");
+        assert_eq!(
+            residue[0].disposition,
+            CleanupDisposition::DroppedUnsignalled
+        );
+        assert!(
+            read_task_record(&control, "task-rescanned")
+                .expect("read rescanned task")
+                .is_none()
+        );
+
+        assert_alive_then_kill(&mut reaped, &reaped_job, "forced reap");
+        assert_alive_then_kill(&mut rescanned, &rescanned_job, "forced rescan");
+        let _ = fs::remove_dir_all(control);
+    }
+
+    /// #382: the same for a session record.
+    #[test]
+    fn forced_stop_drops_mismatched_session_pid_without_job() {
+        let _guard = serialize_forks_and_locks();
+        let control = temp_control("force-mismatched-session");
+        let (mut child, job, _) = spawn_live_task_child(&control, "session-process");
+        let record = session_record(child.id(), Some("mismatched-identity".to_string()), None);
+        write_session_record(&control, &record).expect("write session");
+
+        let mut admission = AdmissionGuard::acquire(&control).expect("admission lock");
+        let residue =
+            stop_session_record_with_wait(&mut admission, &record, true, |_, _| {}, |_, _| {})
+                .expect("forced stop");
+        drop(admission);
+
+        assert_eq!(residue.len(), 1, "{residue:?}");
+        assert_eq!(residue[0].kind, "session");
+        assert_eq!(
+            residue[0].disposition,
+            CleanupDisposition::DroppedUnsignalled
+        );
+        assert!(
+            read_session_record(&control, "svc-test")
+                .expect("read session")
+                .is_none()
+        );
+        assert_alive_then_kill(&mut child, &job, "forced stop");
+        let _ = fs::remove_dir_all(control);
+    }
+
+    #[test]
+    fn terminate_record_pid_requires_a_matching_creation_key() {
+        let _guard = serialize_forks_and_locks();
+        let control = temp_control("terminate-record-pid");
+        let (mut child, job, _) = spawn_live_task_child(&control, "task-pid");
+        let pid = child.id();
+        assert!(
+            !terminate_record_pid(pid, None, "-TERM").expect("missing key"),
+            "a missing key terminates nothing"
+        );
+        assert!(
+            !terminate_record_pid(pid, Some("mismatched-identity"), "-TERM")
+                .expect("mismatched key"),
+            "a mismatched key terminates nothing"
+        );
+        assert!(child.try_wait().expect("poll child").is_none());
+
+        let started_at = recorded_start_identity(pid).0.expect("creation key");
+        assert!(
+            terminate_record_pid(pid, Some(&started_at), "-TERM").expect("matching key"),
+            "a matching key terminates the process"
+        );
+        child.wait().expect("terminated child exits");
+        drop(job);
+        let _ = fs::remove_dir_all(control);
+    }
+
     fn live_task_spec(session: &str) -> TaskSpec {
         let mut spec = task_spec(session);
         spec.command = "cmd.exe".to_string();
@@ -2651,7 +2816,7 @@ mod tests {
             "the session record is not removed while an owned task is outstanding"
         );
 
-        let _ = force_terminate_record_job(Some(&racer_job_name), child.id(), "-KILL");
+        let _ = force_terminate_record_job(Some(&racer_job_name), child.id(), None, "-KILL");
         let _ = child.wait();
         drop(racer_job);
         let _ = reaped_child.wait();
@@ -3124,7 +3289,7 @@ mod tests {
             "one entry confirmation plus one post-wait recheck — the ladder never reaches a second (-KILL) round"
         );
 
-        let _ = force_terminate_record_job(Some(&job_name), child.id(), "-KILL");
+        let _ = force_terminate_record_job(Some(&job_name), child.id(), None, "-KILL");
         let _ = child.wait();
         drop(job);
         let _ = fs::remove_dir_all(control);
