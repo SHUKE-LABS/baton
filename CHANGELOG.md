@@ -10,10 +10,11 @@ versioning.
 
 _Generated from release tags with `bash scripts/release.sh generate-changelog`._
 
-## v0.17.1 (2026-10-11)
+## v0.17.2 … v0.17.1 (2026-10-11)
 
 ### Fixes
 - fix(service): forced cleanup never signals an unproved PID (#382) (#387)
+- fix(service): task env never persists credential values (#386) (#389)
 
 ## v0.17.0 (2026-10-10)
 
