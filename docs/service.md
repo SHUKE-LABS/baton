@@ -329,8 +329,10 @@ only on a positive target proof:
   immediately before `SIGTERM` and again before `SIGKILL`. A matching zombie
   leader still counts, since it pins the process-group id. A legacy record
   with no key, a mismatched or unreadable probe, or a leader that is already
-  gone never does — so a task whose leader exited while descendants still
-  run is dropped without signalling its group.
+  gone never does — so a session or task whose leader exited while
+  descendants still run is dropped without signalling its group. A session
+  whose leader probes dead still goes through this check while its process
+  group exists, so that case is reported rather than silently removed.
 - On Windows, a resolvable recorded Job Object, or else a recorded PID whose
   creation-time key matches on the termination handle.
 

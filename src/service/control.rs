@@ -2118,7 +2118,10 @@ pub(super) fn stop_session_record_with_wait(
     let mut liveness = is_session_alive(&record);
     let mut forced = None;
     if force {
-        if liveness != Liveness::Dead {
+        // A `Dead` leader (gone or zombie) can still head a process group
+        // with live descendants, so the group decides whether there is
+        // anything to prove, signal, or report.
+        if liveness != Liveness::Dead || process_group_may_exist(record.pid) {
             forced = force_signal_group(
                 record.pid,
                 record.started_at.as_deref(),

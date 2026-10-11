@@ -7642,6 +7642,140 @@ mod imp {
             }
         }
 
+        /// Spawns `sh` as a process-group leader that backgrounds `sleep 60`
+        /// and then blocks on stdin. Returns it with the `sleep`'s pid;
+        /// closing its stdin lets the leader exit while the `sleep` stays a
+        /// member of the leader's group.
+        fn spawn_group_leader_with_member() -> (Child, u32) {
+            use std::io::BufRead;
+            let mut leader = Command::new("sh")
+                .arg("-c")
+                .arg("sleep 60 & echo $!; read _")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .process_group(0)
+                .spawn()
+                .expect("spawn group leader");
+            let mut line = String::new();
+            std::io::BufReader::new(leader.stdout.take().expect("leader stdout"))
+                .read_line(&mut line)
+                .expect("read member pid");
+            let member = line.trim().parse().expect("member pid");
+            (leader, member)
+        }
+
+        fn process_is_running(pid: u32) -> bool {
+            matches!(process_probe(pid), ProbeResult::Present(probe) if !probe.is_zombie())
+        }
+
+        fn session_record_for(id: &str, dir: &Path, pid: u32) -> SessionRecord {
+            let (started_at, start_epoch_secs) = recorded_start_identity(pid);
+            assert!(started_at.is_some(), "live leader has a start key");
+            SessionRecord {
+                id: id.to_string(),
+                spec: spec(
+                    &dir.join("in").display().to_string(),
+                    &dir.join("out").display().to_string(),
+                ),
+                pid,
+                started_at,
+                start_epoch_secs,
+                stderr_path: String::new(),
+            }
+        }
+
+        /// #382: a session whose recorded leader is already gone probes
+        /// `Dead`, yet its process group can still hold a live descendant.
+        /// The stored key cannot be matched against a gone leader, so forced
+        /// stop sends nothing, drops the record, and reports it rather than
+        /// silently succeeding.
+        #[test]
+        fn forced_stop_drops_gone_leader_session_with_surviving_group_member() {
+            let _guard = serialize_forks_and_locks();
+            let dir = TempDir::new("force-gone-session");
+            let (mut leader, member) = spawn_group_leader_with_member();
+            let record = session_record_for("svc-gone", &dir.path, leader.id());
+            write_session_record(&dir.path, &record).expect("write session");
+            drop(leader.stdin.take());
+            leader.wait().expect("reap session leader");
+            assert_eq!(is_session_alive(&record), Liveness::Dead);
+            assert!(
+                process_group_may_exist(record.pid),
+                "the group outlives its leader"
+            );
+
+            let mut admission = AdmissionGuard::acquire(&dir.path).expect("admission lock");
+            let residue =
+                stop_session_record_with_wait(&mut admission, &record, true, |_, _| {}, |_, _| {})
+                    .expect("forced stop");
+            drop(admission);
+
+            assert_eq!(residue.len(), 1, "{residue:?}");
+            assert_eq!(residue[0].kind, "session");
+            assert_eq!(residue[0].id, "svc-gone");
+            assert_eq!(
+                residue[0].disposition,
+                CleanupDisposition::DroppedUnsignalled
+            );
+            assert!(
+                read_session_record(&dir.path, "svc-gone")
+                    .expect("read session")
+                    .is_none(),
+                "forced stop removes the unprovable session record"
+            );
+            assert!(
+                process_is_running(member),
+                "forced stop never signals a group it could not prove"
+            );
+            let _ = signal_group(record.pid, libc::SIGKILL);
+        }
+
+        /// A zombie session leader whose start key still matches pins its
+        /// PID, and therefore its PGID, so forced stop still signals that
+        /// group even though the session itself probes `Dead`.
+        #[cfg(target_os = "linux")]
+        #[test]
+        fn forced_stop_signals_group_of_matching_zombie_session_leader() {
+            let _guard = serialize_forks_and_locks();
+            let dir = TempDir::new("force-zombie-session");
+            let (mut leader, member) = spawn_group_leader_with_member();
+            let record = session_record_for("svc-zombie", &dir.path, leader.id());
+            write_session_record(&dir.path, &record).expect("write session");
+            drop(leader.stdin.take());
+            // Not reaped: the exited leader stays a zombie.
+            let deadline = Instant::now() + Duration::from_millis(KILL_GRACE_MS);
+            while !matches!(process_probe(record.pid), ProbeResult::Present(probe) if probe.is_zombie())
+            {
+                assert!(Instant::now() < deadline, "leader never became a zombie");
+                std::thread::sleep(Duration::from_millis(POLL_INTERVAL_MS));
+            }
+            assert_eq!(is_session_alive(&record), Liveness::Dead);
+
+            let mut admission = AdmissionGuard::acquire(&dir.path).expect("admission lock");
+            let residue =
+                stop_session_record_with_wait(&mut admission, &record, true, |_, _| {}, |_, _| {})
+                    .expect("forced stop");
+            drop(admission);
+
+            assert!(residue.is_empty(), "{residue:?}");
+            assert!(
+                read_session_record(&dir.path, "svc-zombie")
+                    .expect("read session")
+                    .is_none()
+            );
+            let deadline = Instant::now() + Duration::from_millis(KILL_GRACE_MS);
+            while process_is_running(member) && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(POLL_INTERVAL_MS));
+            }
+            let survived = process_is_running(member);
+            if survived {
+                let _ = signal_group(record.pid, libc::SIGKILL);
+            }
+            leader.wait().expect("reap zombie leader");
+            assert!(!survived, "forced stop signals the zombie-pinned group");
+        }
+
         /// #382: a legacy running task with no start key whose argv matches
         /// an unrelated live process is dropped by forced reap and by the
         /// forced rescan without signalling it, and reported.
