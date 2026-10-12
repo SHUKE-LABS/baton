@@ -111,17 +111,20 @@ jobs:
 
       - name: Build locked release binary
         shell: bash
-        run: cargo build --locked --release --target "${TARGET}"
+        run: cargo build --locked --release --features mat --target "${TARGET}"
 
-      - name: Verify binary version
+      - name: Verify binary version and mat adapter
         shell: bash
         run: |
+          set -euo pipefail
           version="${RELEASE_TAG#v}"
           binary="target/${TARGET}/release/baton"
           if [[ "${TARGET}" == *-windows-* ]]; then
             binary="${binary}.exe"
           fi
           test "$("./${binary}" --version)" = "baton ${version}"
+          mat_usage="$("./${binary}" mat --help)"
+          grep -q '^baton mat send ' <<<"${mat_usage}"
 
       - name: Archive Unix binary
         if: ${{ matrix.archive == 'tar.gz' }}
