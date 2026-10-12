@@ -810,4 +810,7 @@ Any failure restores the previous binary. The helper records its outcome and
 recovery steps in `<baton home>/upgrade/helper-<key>.json`, which
 `baton upgrade --check` reports along with any leftover
 `*.baton-upgrade-new`/`*.baton-upgrade-old` files. `--check` never deletes
-them; the next `--adopt` or upgrade does, once no helper is still running.
+them; the next confirmed `--adopt` or upgrade does, once no helper is still
+running. A `.baton-upgrade-old` that may be the only copy of the previous
+binary (the install no longer matches its receipt) blocks both until the
+operator restores or deletes it.

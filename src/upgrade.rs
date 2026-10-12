@@ -862,15 +862,46 @@ fn stale_artifacts(install: &Install) -> Vec<PathBuf> {
     .collect()
 }
 
-/// Removes leftovers of an earlier interrupted run. Called only by mutating
-/// runs holding the lock, and refused while a helper is still pending.
-fn clean_stale(install: &Install) -> Result<()> {
+/// Why leftovers of an earlier run must not be touched yet: a helper is
+/// still finishing, or `.baton-upgrade-old` may be the only copy of the
+/// previous binary after a failed rollback. The copy is obsolete once the
+/// install matches its receipt (the swap completed) or is byte-identical to it.
+fn stale_blocker(install: &Install) -> Result<Option<String>> {
     if let Some(pid) = pending_helper(install) {
-        return Err(BatonError::Io(format!(
+        return Ok(Some(format!(
             "an earlier upgrade helper (pid {pid}) is still finishing {}; wait for it, then see `baton upgrade --check`",
             install.shown()
         )));
     }
+    let old = install.old_path();
+    if !old.exists() {
+        return Ok(None);
+    }
+    let exe_sha256 = sha256_file(&install.exe)?;
+    let receipted = fs::read_to_string(install.receipt_path())
+        .ok()
+        .and_then(|raw| serde_json::from_str::<Receipt>(&raw).ok())
+        .is_some_and(|receipt| {
+            receipt.path == install.path_string()
+                && receipt.version == install.version
+                && receipt.exe_sha256 == exe_sha256
+        });
+    if receipted || sha256_file(&old)? == exe_sha256 {
+        return Ok(None);
+    }
+    Ok(Some(format!(
+        "{} may be the only copy of the previous binary after a failed upgrade; restore it with: mv \"{}\" \"{}\" (or delete it if {} is the binary you want), then rerun",
+        shown(&old),
+        shown(&old),
+        install.shown(),
+        install.shown()
+    )))
+}
+
+/// Removes leftovers of an earlier interrupted run. Called only by mutating
+/// runs holding the lock, after `stale_blocker` passed and the operator
+/// confirmed.
+fn clean_stale(install: &Install) -> Result<()> {
     for path in stale_artifacts(install) {
         match fs::remove_file(&path) {
             Ok(()) => {}
@@ -984,11 +1015,7 @@ fn check(version: Option<String>, control: Option<String>) -> Result<CheckReport
     if cfg!(windows) {
         blockers.extend(windows_service_blocker(&control_dir, &snapshot));
     }
-    if let Some(pid) = pending_helper(&install) {
-        blockers.push(format!(
-            "an earlier upgrade helper (pid {pid}) is still running"
-        ));
-    }
+    blockers.extend(stale_blocker(&install)?);
 
     let helper_outcome = fs::read_to_string(install.outcome_path())
         .ok()
@@ -1048,7 +1075,9 @@ fn adopt(yes: bool, mut out: impl Write) -> Result<()> {
                 .unwrap_or_default(),
         ));
     }
-    clean_stale(&install)?;
+    if let Some(blocker) = stale_blocker(&install)? {
+        return Err(BatonError::Io(blocker));
+    }
     let scratch = Scratch::new()?;
     let fetched = release.fetch(&install.version, &scratch)?;
     let exe_sha256 = sha256_file(&install.exe)?;
@@ -1072,6 +1101,7 @@ fn adopt(yes: bool, mut out: impl Write) -> Result<()> {
     )? {
         return writeln!(out, "adoption cancelled; nothing was changed").map_err(io_err);
     }
+    clean_stale(&install)?;
     write_receipt(
         &install,
         &Receipt {
@@ -1133,7 +1163,9 @@ fn upgrade(
         )
         .map_err(io_err);
     }
-    clean_stale(&install)?;
+    if let Some(blocker) = stale_blocker(&install)? {
+        return Err(BatonError::Io(blocker));
+    }
     if !confirm(
         &format!(
             "Upgrade {} from baton {} to {target}?",
@@ -1144,6 +1176,7 @@ fn upgrade(
     )? {
         return writeln!(out, "upgrade cancelled; nothing was changed").map_err(io_err);
     }
+    clean_stale(&install)?;
 
     let fetched = release.fetch(&target, &scratch)?;
     let reported = binary_version(&fetched.binary)?;

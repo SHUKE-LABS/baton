@@ -488,6 +488,37 @@ fn upgrade_installs_the_verified_release_and_updates_the_receipt() {
     assert!(!Path::new(&format!("{exe}.baton-upgrade-old")).exists());
 }
 
+#[test]
+fn a_recovery_copy_survives_the_next_command_until_it_is_obsolete() {
+    let fixture = Fixture::new("recovery-copy");
+    fixture.publish(NEW, &fixture.new_release_binary());
+    fixture.adopt();
+    let old = format!("{}.baton-upgrade-old", fixture.exe.to_string_lossy());
+    fs::write(&old, "previous binary").unwrap();
+
+    // Matching receipt: the copy is obsolete, yet only a confirmed run
+    // removes it.
+    let before = fixture.tree();
+    failed(&fixture.run(&["upgrade", "--version", NEW]));
+    assert_eq!(fixture.tree(), before, "unconfirmed run keeps the copy");
+
+    // After a failed rollback the receipt describes the previous binary,
+    // so the copy may be the only one left.
+    let receipt = fixture.state_file("receipt-").unwrap();
+    let mut previous = fixture.receipt();
+    previous["version"] = "98.0.0".into();
+    previous["exe_sha256"] = format!("{:x}", Sha256::digest(b"previous binary")).into();
+    fs::write(&receipt, serde_json::to_vec_pretty(&previous).unwrap()).unwrap();
+    let before = fixture.tree();
+
+    let err = failed(&fixture.run(&["upgrade", "--adopt", "--yes"]));
+    assert!(err.contains("only copy of the previous binary"), "{err}");
+    failed(&fixture.run(&["upgrade", "--version", NEW, "--yes"]));
+    let blockers = check(&fixture)["blockers"].to_string();
+    assert!(blockers.contains("only copy"), "{blockers}");
+    assert_eq!(fixture.tree(), before, "the recovery copy is kept");
+}
+
 fn service_status(control: &str) -> serde_json::Value {
     let out = Command::new(env!("CARGO_BIN_EXE_baton"))
         .args(["service", "status", "--control", control])
@@ -504,14 +535,14 @@ fn wait_for_service(control: &str) {
     }
 }
 
-fn start_session(control: &str, root: &Path, name: &str) -> String {
+fn start_session(program: &Path, control: &str, root: &Path, name: &str) -> String {
     let inbox = root.join("mailboxes").join(name).join("inbox");
     let outbox = root.join("mailboxes").join(name).join("outbox");
     #[cfg(windows)]
     let agent = ["cmd.exe", "/D", "/C", "exit 0"];
     #[cfg(unix)]
     let agent = ["sh", "-c", "cat >/dev/null", "agent"];
-    let mut command = Command::new(env!("CARGO_BIN_EXE_baton"));
+    let mut command = Command::new(program);
     command.args(["service", "start", "--control", control]);
     command
         .arg("--inbox")
@@ -588,7 +619,12 @@ fn unix_upgrade_keeps_a_live_service_and_its_sessions() {
     fixture.adopt();
     let mut guard = spawn_service(&fixture.exe, &fixture);
     let control = guard.control.clone();
-    let session = start_session(&control, &fixture.root, "first");
+    let session = start_session(
+        Path::new(env!("CARGO_BIN_EXE_baton")),
+        &control,
+        &fixture.root,
+        "first",
+    );
     // `service start` returns before serve opens its mailbox; let the
     // layout settle so the comparison sees only upgrade-time changes.
     let mailboxes = fixture.root.join("mailboxes");
@@ -625,7 +661,12 @@ fn unix_upgrade_keeps_a_live_service_and_its_sessions() {
     assert!(guard.run.as_mut().unwrap().try_wait().unwrap().is_none());
 
     // The resident service launches the replaced file for a new session.
-    let second = start_session(&control, &fixture.root, "second");
+    let second = start_session(
+        Path::new(env!("CARGO_BIN_EXE_baton")),
+        &control,
+        &fixture.root,
+        "second",
+    );
     wait_for_file(&fixture.marker());
     assert!(session_live(&control, &second));
 }
@@ -666,7 +707,7 @@ fn windows_live_session_without_service_defers() {
     fixture.adopt();
     let mut guard = spawn_service(&fixture.exe, &fixture);
     let control = guard.control.clone();
-    let session = start_session(&control, &fixture.root, "held");
+    let session = start_session(&fixture.exe, &control, &fixture.root, "held");
     let mut run = guard.run.take().unwrap();
     run.kill().expect("stop service run");
     run.wait().unwrap();
@@ -674,6 +715,13 @@ fn windows_live_session_without_service_defers() {
     assert!(
         session_live(&control, &session),
         "session outlives service run"
+    );
+    assert!(
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&fixture.exe)
+            .is_err(),
+        "the session's serve process holds the installed image"
     );
     let before = fixture.tree();
 
