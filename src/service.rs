@@ -162,6 +162,16 @@ pub enum ServiceCommand {
         /// `--session <id>`; `None` reports every known session.
         session: Option<String>,
     },
+    /// Print one session's serve outcome summary as JSON: worker health
+    /// (last outcome, error streak, identical-error count) read from the
+    /// session's inbox, never from the outbox archive (#391).
+    Outcome {
+        /// The optional `--control <dir>` root; `None` uses the per-user
+        /// default `BATON_HOME/service` or `home/.baton/service`.
+        control: Option<String>,
+        /// The `--session <id>` whose summary to print.
+        session: String,
+    },
     /// Stop one session: cooperative `serve --stop` first, then a bounded
     /// process-group escalation. Idempotent. `force` permits cleanup when
     /// process identity cannot be corroborated.
@@ -283,9 +293,10 @@ mod imp {
         take_task_start_response, wait_for_control_release_with_timeout,
     };
     use super::control::{
-        POLL_INTERVAL_MS, acquire_admission_lock, current_baton_exe, execute_status, execute_stop,
-        execute_task_cancel, execute_task_status, execute_teardown, io_err, is_session_alive,
-        run_service, serve_argv, submit_start_request, submit_task_start_request,
+        POLL_INTERVAL_MS, acquire_admission_lock, current_baton_exe, execute_outcome,
+        execute_status, execute_stop, execute_task_cancel, execute_task_status, execute_teardown,
+        io_err, is_session_alive, run_service, serve_argv, submit_start_request,
+        submit_task_start_request,
     };
     #[cfg(all(test, target_os = "linux"))]
     use super::records::mark_task_start_ack;
@@ -647,6 +658,10 @@ mod imp {
             ServiceCommand::Status { control, session } => {
                 let control = crate::roles::resolve_control_dir(control)?;
                 execute_status(&control, session.as_deref(), pretty, out)
+            }
+            ServiceCommand::Outcome { control, session } => {
+                let control = crate::roles::resolve_control_dir(control)?;
+                execute_outcome(&control, &session, pretty, out)
             }
             ServiceCommand::Stop {
                 control,

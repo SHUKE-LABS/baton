@@ -34,6 +34,7 @@ pub mod mailbox;
 pub mod mat;
 pub mod message;
 pub mod model;
+pub mod outcome;
 pub mod participant;
 pub mod registry;
 pub mod roles;

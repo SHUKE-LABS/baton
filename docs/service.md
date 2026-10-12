@@ -99,6 +99,7 @@ baton service start [--control <dir>] --inbox <dir> --outbox <dir> [--poll-ms <n
                      [--agent-batch-max <n>] [--agent-input body|batch-json]]
                     [--role <name>] [--registry <path>]
 baton service status [--control <dir>] [--session <id>]
+baton service outcome [--control <dir>] --session <id>
 baton service stop [--control <dir>] --session <id> [--force]
 baton service teardown [--control <dir>] [--force]
 ```
@@ -186,6 +187,28 @@ baton service teardown [--control <dir>] [--force]
   invoking `ps`, so `lstart` remains comparable when the supervisor and
   client inherit different locale or time-zone settings. `lstart` is
   second-granular and is a BSD/procps extension rather than a POSIX interface.
+- **`service outcome --session <id>`** prints the session's serve outcome
+  summary as one JSON document (`"schema": "baton.serve-outcome/v1"`), so a
+  client learns worker health without re-parsing the outbox archive. The
+  serve child — direct or service-managed alike — rewrites
+  `<inbox>/serve-outcome.json` atomically as each invocation finishes and
+  resets it to the zeroed state on startup, so a restart starts a fresh
+  streak. The **invocation is the unit**: one `respond_batch` call is one
+  record, so a `--agent-batch-max` batch of N replies counts once, and the
+  invocation failed iff every member came back an error. When one invocation
+  yields multiple error bodies (a batch fan-out failure synthesizes one per
+  member), the **first** member's body supplies `last_error_hash` and
+  `last_error_diagnostic` (capped at 2048 bytes), and the invocation counts
+  as one error occurrence: `identical_error_count` is the number of
+  consecutive failed invocations whose error body hashes to the current
+  `last_error_hash` — the "same failure persists" signal for a client
+  deciding whether to stop submitting automatic wakes; a different body or a
+  success (which also clears every error field) restarts it. Reading the
+  summary is a fixed one-file read — the outbox is never scanned, so the cost
+  is the same with a 1-entry and a 1 000-entry archive, and a malformed old
+  outbox file cannot poison the answer. An unknown session and a known
+  session whose serve has not recorded any outcome yet are distinct errors;
+  both exit non-zero.
 - **`service stop --session <id>`** tries `serve`'s own cooperative stop
   against the session's inbox first. Unix then escalates with bounded
   `SIGTERM`/`SIGKILL` process-group signals; Windows escalates with

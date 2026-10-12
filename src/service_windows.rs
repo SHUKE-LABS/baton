@@ -7,9 +7,9 @@ use super::control::{
     rescan_owned_tasks, stop_session_record_with_wait, wait_for_control_release_with_timeout,
 };
 use super::control::{
-    POLL_INTERVAL_MS, acquire_admission_lock, current_baton_exe, execute_status, execute_stop,
-    execute_task_cancel, execute_task_status, execute_teardown, io_err, is_session_alive,
-    run_service, serve_argv, submit_start_request, submit_task_start_request,
+    POLL_INTERVAL_MS, acquire_admission_lock, current_baton_exe, execute_outcome, execute_status,
+    execute_stop, execute_task_cancel, execute_task_status, execute_teardown, io_err,
+    is_session_alive, run_service, serve_argv, submit_start_request, submit_task_start_request,
 };
 use super::records::{SessionRecord, read_task_record, write_task_record};
 #[cfg(test)]
@@ -544,6 +544,10 @@ pub(super) fn dispatch(cmd: ServiceCommand, pretty: bool, mut out: impl Write) -
         ServiceCommand::Status { control, session } => {
             let control = crate::roles::resolve_control_dir(control)?;
             execute_status(&control, session.as_deref(), pretty, out)
+        }
+        ServiceCommand::Outcome { control, session } => {
+            let control = crate::roles::resolve_control_dir(control)?;
+            execute_outcome(&control, &session, pretty, out)
         }
         ServiceCommand::Stop {
             control,

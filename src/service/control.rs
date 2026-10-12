@@ -1871,6 +1871,32 @@ pub(super) fn execute_status(
     writeln!(out, "{json}").map_err(io_err)
 }
 
+/// Prints one session's serve outcome summary as JSON (`service outcome`,
+/// #391). The summary lives in the session's own inbox, written by the serve
+/// child as each invocation finishes — the client never reads the outbox
+/// archive, so the read costs the same regardless of the archive's size.
+/// An unknown session and a known session whose serve has not recorded any
+/// outcome yet are distinct errors.
+pub(super) fn execute_outcome(
+    control: &Path,
+    session: &str,
+    pretty: bool,
+    mut out: impl Write,
+) -> Result<()> {
+    let record = read_session_record(control, session)?.ok_or_else(|| {
+        BatonError::Io(format!("no session {session:?} on {}", control.display()))
+    })?;
+    let inbox = std::path::Path::new(&record.spec.inbox);
+    let summary = crate::outcome::read(inbox)?.ok_or_else(|| {
+        BatonError::Io(format!(
+            "no outcome summary for session {session:?} at {:?}: the serve has not recorded any invocation",
+            inbox.join(crate::outcome::OUTCOME_FILE)
+        ))
+    })?;
+    let json = crate::cli::to_user_json(&summary, pretty, "service outcome")?;
+    writeln!(out, "{json}").map_err(io_err)
+}
+
 /// The operator-facing report line for one residue item.
 pub(super) fn cleanup_residue_line(item: &CleanupResidue) -> String {
     let liveness = match item.liveness {
@@ -2332,6 +2358,65 @@ pub(super) fn wait_for_control_release_with_timeout(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// A unique self-cleaning temp control dir for the read-only outcome
+    /// tests (the heavier liveness tests live in each platform's `imp`).
+    struct TempDir {
+        path: std::path::PathBuf,
+    }
+
+    impl TempDir {
+        fn new(tag: &str) -> Self {
+            static SEQ: AtomicU64 = AtomicU64::new(0);
+            let path = std::env::temp_dir().join(format!(
+                "baton-control-{}-{}-{tag}",
+                std::process::id(),
+                SEQ.fetch_add(1, Ordering::Relaxed),
+            ));
+            let _ = fs::remove_dir_all(&path);
+            fs::create_dir_all(&path).expect("create temp control dir");
+            Self { path }
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+
+    /// A session record whose inbox is `inbox`; the platform-specific tail
+    /// field is the only difference.
+    fn outcome_session_record(id: &str, inbox: &str) -> SessionRecord {
+        SessionRecord {
+            id: id.to_string(),
+            spec: SessionSpec {
+                schema: SESSION_SPEC_SCHEMA.to_string(),
+                inbox: inbox.to_string(),
+                outbox: format!("{inbox}/../outbox"),
+                poll_ms: None,
+                retention_ms: None,
+                agent_batch_max: None,
+                agent_input: None,
+                agent_cmd: None,
+                agent_args: Vec::new(),
+                agent_cwd: None,
+                agent_timeout_ms: None,
+                agent_output: None,
+                agent_result_key: None,
+                role: None,
+                registry: None,
+            },
+            pid: u32::MAX - 1,
+            started_at: None,
+            start_epoch_secs: None,
+            #[cfg(unix)]
+            stderr_path: String::new(),
+            #[cfg(windows)]
+            job: None,
+        }
+    }
 
     fn residue(disposition: CleanupDisposition) -> CleanupResidue {
         CleanupResidue {
@@ -2346,6 +2431,78 @@ mod tests {
 
     fn kept_error(count: usize) -> String {
         format!("{count} kept")
+    }
+
+    /// `service outcome` prints the summary the serve wrote into its inbox.
+    #[test]
+    fn execute_outcome_prints_the_recorded_summary() {
+        let dir = TempDir::new("outcome-print");
+        let inbox = dir.path.join("inbox");
+        fs::create_dir_all(&inbox).expect("inbox");
+        write_session_record(
+            &dir.path,
+            &outcome_session_record("svc-1", &inbox.to_string_lossy()),
+        )
+        .expect("write record");
+
+        let mut summary = crate::outcome::ServeOutcomeSummary::zeroed(0);
+        summary.record_invocation(
+            &[crate::message::MessageEnvelope::new(
+                "err-1".to_string(),
+                "conv".to_string(),
+                "svc".to_string(),
+                "role".to_string(),
+                crate::message::MessageKind::Error,
+                "missing credential".to_string(),
+                1_000,
+            )],
+            1_000,
+        );
+        crate::outcome::write(&inbox, &summary).expect("write summary");
+
+        let mut out = Vec::new();
+        execute_outcome(&dir.path, "svc-1", false, &mut out).expect("outcome");
+        let json: serde_json::Value = serde_json::from_slice(&out).expect("json");
+        assert_eq!(json["schema"], crate::outcome::OUTCOME_SCHEMA);
+        assert_eq!(json["last_outcome"], "error");
+        assert_eq!(json["error_streak"], 1);
+        assert_eq!(json["identical_error_count"], 1);
+        assert_eq!(json["last_error_diagnostic"], "missing credential");
+        assert!(
+            json["last_error_hash"]
+                .as_str()
+                .unwrap()
+                .starts_with("sha256:")
+        );
+    }
+
+    /// A session with no recorded outcome yet is a distinct error from an
+    /// unknown session: the record exists, the summary file does not.
+    #[test]
+    fn execute_outcome_distinguishes_unknown_session_from_missing_summary() {
+        let dir = TempDir::new("outcome-errors");
+        let inbox = dir.path.join("inbox");
+        fs::create_dir_all(&inbox).expect("inbox");
+        write_session_record(
+            &dir.path,
+            &outcome_session_record("svc-1", &inbox.to_string_lossy()),
+        )
+        .expect("write record");
+
+        let mut out = Vec::new();
+        let err =
+            execute_outcome(&dir.path, "svc-1", false, &mut out).expect_err("missing summary");
+        assert!(
+            err.to_string().contains("no outcome summary"),
+            "missing-summary error names the cause: {err}"
+        );
+
+        let err = execute_outcome(&dir.path, "svc-unknown", false, &mut Vec::new())
+            .expect_err("unknown session");
+        assert!(
+            err.to_string().contains("no session"),
+            "unknown-session error names the session: {err}"
+        );
     }
 
     #[test]
