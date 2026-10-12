@@ -226,6 +226,38 @@ pub fn execute_task(cmd: TaskCommand, _pretty: bool, _out: impl Write) -> Result
     ))
 }
 
+/// What `baton upgrade` must know about a control plane before replacing the
+/// binary: whether `service run` holds its lock, and which managed sessions
+/// are live or unresolved (an unproven identity counts as active).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct ServiceSnapshot {
+    /// A live `service run` holds `service.lock`.
+    pub live: bool,
+    /// Ids of session records whose process is live or unresolved.
+    pub active_sessions: Vec<String>,
+}
+
+/// Probes `control` without signalling or changing any record.
+#[cfg(any(unix, windows))]
+pub fn service_snapshot(control: &Path) -> Result<ServiceSnapshot> {
+    let live = control::probe_control(control)? == control::ControlLiveness::Live;
+    let active_sessions = records::list_session_records(control)?
+        .into_iter()
+        .filter(|record| control::is_session_alive(record) != task_tick::Liveness::Dead)
+        .map(|record| record.id)
+        .collect();
+    Ok(ServiceSnapshot {
+        live,
+        active_sessions,
+    })
+}
+
+/// No service can run on this host, so there is nothing to coordinate with.
+#[cfg(not(any(unix, windows)))]
+pub fn service_snapshot(_control: &std::path::Path) -> Result<ServiceSnapshot> {
+    Ok(ServiceSnapshot::default())
+}
+
 #[cfg(any(unix, windows))]
 mod admission;
 #[cfg(any(unix, windows))]

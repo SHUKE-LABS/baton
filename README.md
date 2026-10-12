@@ -166,6 +166,44 @@ is still live is safe on Unix — see
 [Upgrading the `baton` binary under a live service](docs/service.md#upgrading-the-baton-binary-under-a-live-service-unix)
 in `docs/service.md`.
 
+### Upgrading a release-archive install
+
+`baton upgrade` replaces a standalone release-archive install with another
+GitHub Release. It downloads only the selected archive and its `SHA256SUMS`
+with the system `curl` and `tar`, and verifies the checksum before it touches
+the installed binary.
+
+```bash
+baton upgrade --check              # report only (JSON); never asks, changes nothing
+baton upgrade --adopt              # once: verify this binary, record its receipt
+baton upgrade                      # upgrade to the latest release
+baton upgrade --version <version>  # or to a given release, older ones included
+```
+
+- **Adoption.** Only an adopted binary is ever replaced. `--adopt` requires the
+  installed file to be byte-identical to the binary in its own version's
+  checksummed archive. It writes a receipt to
+  `<baton home>/upgrade/receipt-<key>.json` that binds the canonical path,
+  version, archive digest, and executable digest. If any of them stops
+  matching (another installer replaced the file, say), upgrades stop until you
+  re-adopt.
+- **Managed installs.** Cargo (`~/.cargo/bin`, `$CARGO_HOME/bin`), npm
+  (`node_modules`), and OS-package-manager paths (Homebrew, Nix, snap,
+  `/usr/bin`, Scoop, Chocolatey, WinGet) are never adopted or overwritten.
+  Upgrade them with their owner:
+  `cargo install --git https://github.com/shukebeta/baton --tag v<version> --locked`,
+  `npm update -g @shukelabs/baton` (then `baton install` on Unix), or the
+  package manager.
+- **Confirmation.** `--adopt` and upgrades ask first; pass `--yes` when stdin
+  is not a terminal.
+- **Recovery.** A failed download, checksum, replacement, or post-install
+  `--version` check restores the previous binary and receipt and says so. If
+  the restore itself fails, the error prints the exact `mv` to run. After a
+  successful upgrade, `baton upgrade --version <previous> --yes` goes back.
+- **Live services.** Unix keeps a live `service run` and its sessions running;
+  Windows defers. See
+  [`baton upgrade` and a live service](docs/service.md#baton-upgrade-and-a-live-service).
+
 The automated release calculation and its no-retagging baseline are documented
 in [docs/versioning.md](docs/versioning.md).
 
