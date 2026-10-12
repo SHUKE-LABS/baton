@@ -10,6 +10,11 @@ versioning.
 
 _Generated from release tags with `bash scripts/release.sh generate-changelog`._
 
+## v0.18.0 (2026-10-12)
+
+### Features
+- feat(cli): add `baton upgrade` coordinated self-upgrade (#337) (#390)
+
 ## v0.17.2 … v0.17.1 (2026-10-11)
 
 ### Fixes
