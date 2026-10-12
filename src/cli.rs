@@ -58,6 +58,7 @@ use crate::task::{self, TaskCallback, TaskSpec};
 use crate::transport::Transport;
 #[cfg(feature = "local")]
 use crate::transport::claude::ClaudeClient;
+use crate::upgrade::{self, UpgradeCommand};
 
 /// Environment variable naming the JSONL event-log file. Unset or blank ⇒
 /// recording is disabled.
@@ -138,7 +139,12 @@ pub const USAGE: &str = concat!(
     "baton task status [--control <dir>] [--task <id>]\n",
     "    Report a task's status.\n",
     "baton task cancel [--control <dir>] --task <id>\n",
-    "    Cancel a running task."
+    "    Cancel a running task.\n",
+    "\n",
+    "baton upgrade --check [--version <version>] [--control <dir>]\n",
+    "baton upgrade --adopt [--yes]\n",
+    "baton upgrade [--version <version>] [--yes] [--control <dir>]\n",
+    "    Upgrade a standalone release-archive install from GitHub Releases, verified against SHA256SUMS. `--check` only reports; `--adopt` verifies the installed binary and records the receipt a normal upgrade requires."
 );
 
 /// Default `baton serve` inbox poll interval, in milliseconds, when `--poll-ms`
@@ -386,6 +392,8 @@ enum Command {
     /// A `baton task` asynchronous-job invocation, owned and reaped by a
     /// `baton service` session's `Run` loop — see [`crate::task`].
     Task(task::TaskCommand),
+    /// A `baton upgrade` self-upgrade invocation — see [`crate::upgrade`].
+    Upgrade(UpgradeCommand),
 }
 
 /// Selects the session trail to rehydrate for `baton session --resume`.
@@ -1028,6 +1036,10 @@ pub fn run() -> Result<()> {
         Command::Task(cmd) => {
             let stdout = std::io::stdout();
             service::execute_task(cmd, pretty, stdout.lock())
+        }
+        Command::Upgrade(cmd) => {
+            let stdout = std::io::stdout();
+            upgrade::execute(cmd, pretty, stdout.lock())
         }
     }
 }
@@ -2647,6 +2659,7 @@ fn parse_args(args: &[String]) -> Result<Command> {
         "role" => parse_role(iter),
         "service" => parse_service(iter),
         "task" => parse_task(iter),
+        "upgrade" => parse_upgrade(iter),
         other => Err(usage(&format!("unknown command {other:?}"))),
     }
 }
@@ -4359,6 +4372,75 @@ fn parse_agent_timeout_ms(raw: &str, flag: &str) -> Result<u64> {
     })
 }
 
+/// Parses `baton upgrade [--check | --adopt] [--version <version>] [--yes]
+/// [--control <dir>]`, plus the hidden Windows-helper form `--finish <plan>
+/// --wait-pid <pid>`.
+fn parse_upgrade<'a>(mut iter: impl Iterator<Item = &'a String>) -> Result<Command> {
+    let (mut check, mut adopt, mut yes) = (false, false, false);
+    let mut version: Option<String> = None;
+    let mut control: Option<String> = None;
+    let mut finish: Option<String> = None;
+    let mut wait_pid: Option<String> = None;
+    while let Some(arg) = iter.next() {
+        let mut take = |flag: &str| -> Result<String> {
+            iter.next()
+                .cloned()
+                .ok_or_else(|| usage(&format!("{flag} requires a value")))
+        };
+        match arg.as_str() {
+            "--check" => check = true,
+            "--adopt" => adopt = true,
+            "--yes" => yes = true,
+            "--version" => version = Some(take("--version")?),
+            other if other.starts_with("--version=") => {
+                version = Some(other["--version=".len()..].to_string());
+            }
+            "--control" => control = Some(take("--control")?),
+            other if other.starts_with("--control=") => {
+                control = Some(other["--control=".len()..].to_string());
+            }
+            "--finish" => finish = Some(take("--finish")?),
+            "--wait-pid" => wait_pid = Some(take("--wait-pid")?),
+            other => return Err(usage(&format!("unexpected argument {other:?}"))),
+        }
+    }
+    if let Some(plan) = finish {
+        let wait_pid = require_value(wait_pid, "--wait-pid")?
+            .parse()
+            .map_err(|_| usage("--wait-pid must be a process id"))?;
+        if check || adopt || yes || version.is_some() || control.is_some() {
+            return Err(usage("--finish takes only --wait-pid"));
+        }
+        return Ok(Command::Upgrade(UpgradeCommand::Finish { plan, wait_pid }));
+    }
+    if wait_pid.is_some() {
+        return Err(usage("--wait-pid requires --finish"));
+    }
+    let version = version
+        .map(|raw| upgrade::normalize_version(&raw).map_err(|err| usage(&err)))
+        .transpose()?;
+    let control = optional_dir(control, "--control")?;
+    if check {
+        if adopt || yes {
+            return Err(usage("--check takes neither --adopt nor --yes"));
+        }
+        return Ok(Command::Upgrade(UpgradeCommand::Check { version, control }));
+    }
+    if adopt {
+        if version.is_some() || control.is_some() {
+            return Err(usage(
+                "--adopt takes neither --version nor --control: it adopts the installed version",
+            ));
+        }
+        return Ok(Command::Upgrade(UpgradeCommand::Adopt { yes }));
+    }
+    Ok(Command::Upgrade(UpgradeCommand::Upgrade {
+        version,
+        yes,
+        control,
+    }))
+}
+
 /// Requires a non-blank directory value for `flag`.
 fn require_dir(value: Option<String>, flag: &str) -> Result<String> {
     match value {
@@ -4508,6 +4590,7 @@ mod tests {
             "baton serve --stop --inbox <dir>",
             "baton service teardown [--control <dir>] [--force]",
             "baton task cancel [--control <dir>] --task <id>",
+            "baton upgrade --adopt [--yes]",
         ] {
             assert!(help.contains(header), "help documents {header}: {help}");
         }
@@ -4569,6 +4652,68 @@ mod tests {
             parse_args(&argv(&["ask", "-p", "hi", "extra"])).unwrap_err(),
             BatonError::Usage(_)
         ));
+    }
+
+    #[test]
+    fn parses_upgrade_forms() {
+        let parse = |args: &[&str]| parse_args(&argv(args));
+        assert_eq!(
+            parse(&[
+                "upgrade",
+                "--check",
+                "--version",
+                "v1.2.3",
+                "--control",
+                "ctl"
+            ])
+            .unwrap(),
+            Command::Upgrade(UpgradeCommand::Check {
+                version: Some("1.2.3".to_string()),
+                control: Some("ctl".to_string()),
+            })
+        );
+        assert_eq!(
+            parse(&["upgrade", "--adopt", "--yes"]).unwrap(),
+            Command::Upgrade(UpgradeCommand::Adopt { yes: true })
+        );
+        assert_eq!(
+            parse(&["upgrade", "--version=2.0.0"]).unwrap(),
+            Command::Upgrade(UpgradeCommand::Upgrade {
+                version: Some("2.0.0".to_string()),
+                yes: false,
+                control: None,
+            })
+        );
+        assert_eq!(
+            parse(&["upgrade", "--finish", "plan.json", "--wait-pid", "42"]).unwrap(),
+            Command::Upgrade(UpgradeCommand::Finish {
+                plan: "plan.json".to_string(),
+                wait_pid: 42,
+            })
+        );
+        for bad in [
+            &["upgrade", "--check", "--yes"][..],
+            &["upgrade", "--check", "--adopt"],
+            &["upgrade", "--adopt", "--version", "1.0.0"],
+            &["upgrade", "--adopt", "--control", "ctl"],
+            &["upgrade", "--version", "latest"],
+            &["upgrade", "--finish", "plan.json"],
+            &[
+                "upgrade",
+                "--finish",
+                "plan.json",
+                "--wait-pid",
+                "1",
+                "--yes",
+            ],
+            &["upgrade", "--wait-pid", "1"],
+            &["upgrade", "--force"],
+        ] {
+            assert!(
+                matches!(parse(bad), Err(BatonError::Usage(_))),
+                "{bad:?} must be a usage error"
+            );
+        }
     }
 
     /// A transport that returns a canned reply and records the conversation it

@@ -86,6 +86,14 @@ renders commits after the previous reachable tag. This is intentional: the
 workflow adds the generated `CHANGELOG.md` in a commit after the tag, so reading
 the tagged tree alone would otherwise return the previous release's changelog.
 
+`baton upgrade` consumes exactly these assets and is the supported
+self-upgrade source. It follows `releases/latest` to the newest tag (or takes
+`--version`) and downloads the host target's archive and `SHA256SUMS`. It
+installs only after the archive digest matches. Any x86_64 Windows build
+upgrades from the `x86_64-pc-windows-msvc` archive. npm and Cargo installs
+stay with their own installers. The receipt and adoption rules are in the
+README's [upgrade section](../README.md#upgrading-a-release-archive-install).
+
 ## Published npm packages
 
 The same `publish` job also publishes six npm packages per release:

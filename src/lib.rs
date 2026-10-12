@@ -19,6 +19,7 @@
 //! - [`session`] — the generic `baton.session/v1` manifest behind `send --session`.
 //! - [`service`] — the host-owned supervisor for `baton serve` sessions.
 //! - [`task`] — the service-owned asynchronous job contract.
+//! - [`upgrade`] — `baton upgrade`, the release-archive self-upgrade.
 //! - [`error`] — shared error and result types.
 //! - [`cli`] — the command-line entry surface.
 
@@ -43,3 +44,4 @@ pub mod task;
 mod test_support;
 #[cfg(feature = "local")]
 pub mod transport;
+pub mod upgrade;

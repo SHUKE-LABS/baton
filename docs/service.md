@@ -778,3 +778,39 @@ systemctl --user restart baton.service
 ```
 
 This recovery path is Unix-specific; the fallback does not run on Windows.
+
+## `baton upgrade` and a live service
+
+`baton upgrade` (see the README's
+[upgrade section](../README.md#upgrading-a-release-archive-install)) checks the
+selected control plane — `--control <dir>`, default `<baton home>/service` —
+before it replaces the binary.
+
+**Unix.** The upgrade renames the verified binary over the installed one,
+exactly as above. It never restarts `service run` or its OS supervisor:
+running sessions, their records, and their mailboxes are untouched, and the
+next `service start` launches the new binary. The command reports the service
+it found and re-probes it after the swap.
+
+**Windows.** A running image cannot be replaced, and Baton selects no Windows
+service manager, so the upgrade changes nothing and reports it as deferred
+when the control plane has a live `service run` (even with no sessions) or any
+live managed session. To upgrade:
+
+1. stop the service with the supervisor that runs `baton service run` (or
+   `baton service teardown --control <dir>`);
+2. rerun `baton upgrade`;
+3. start the service again with its supervisor.
+
+With neither running, the updater stages the verified binary beside the
+install as `<exe>.baton-upgrade-new` and exits. A detached helper (a copy of
+the current binary at `<baton home>/upgrade/helper-<key>.exe`) waits for it to
+exit, swaps the new binary in, checks its `--version`, and writes the receipt.
+Any failure restores the previous binary. The helper records its outcome and
+recovery steps in `<baton home>/upgrade/helper-<key>.json`, which
+`baton upgrade --check` reports along with any leftover
+`*.baton-upgrade-new`/`*.baton-upgrade-old` files. `--check` never deletes
+them; the next confirmed `--adopt` or upgrade does, once no helper is still
+running. A `.baton-upgrade-old` that may be the only copy of the previous
+binary (the install no longer matches its receipt) blocks both until the
+operator restores or deletes it.
