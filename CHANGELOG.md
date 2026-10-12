@@ -10,10 +10,13 @@ versioning.
 
 _Generated from release tags with `bash scripts/release.sh generate-changelog`._
 
-## v0.18.0 (2026-10-12)
+## v0.18.1 … v0.18.0 (2026-10-12)
 
 ### Features
 - feat(cli): add `baton upgrade` coordinated self-upgrade (#337) (#390)
+
+### Other Changes
+- ci(release): ship the mat adapter in published binaries (#388) (#392)
 
 ## v0.17.2 … v0.17.1 (2026-10-11)
 
