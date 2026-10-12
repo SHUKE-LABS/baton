@@ -5,6 +5,10 @@ Baton's core knows nothing about mat. The mat-specific mapping lives in
 it, and a build without the feature has no `baton mat` command. This document is
 the contract between the two sides, so mat and baton can change independently.
 
+Published release binaries include the adapter: the GitHub release archive for
+every target, and the npm packages built from those archives. A source build
+needs the feature explicitly; a default `cargo build` has no `baton mat`:
+
 ```
 cargo build --release --features mat
 ```
