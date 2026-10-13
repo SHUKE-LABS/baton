@@ -129,6 +129,8 @@ pub const USAGE: &str = concat!(
     "    `--registry <path>` (requires `--role`) is forwarded to the underlying `baton serve`, same as direct-serve reply routing.\n",
     "baton service status [--control <dir>] [--session <id>]\n",
     "    Report a service session's status.\n",
+    "baton service outcome [--control <dir>] --session <id>\n",
+    "    Print a session's serve outcome summary as JSON: last outcome, error streak, identical-error count, last error diagnostic.\n",
     "baton service stop [--control <dir>] --session <id> [--force]\n",
     "    Stop a service session.\n",
     "baton service teardown [--control <dir>] [--force]\n",
@@ -805,6 +807,18 @@ pub fn run() -> Result<()> {
             // cannot make this fresh start exit immediately.
             mailbox.poll_stop()?;
             mailbox.reclaim_stale()?;
+            // A restart starts a fresh streak: zero the outcome summary the
+            // previous lifetime left behind (#391), before the ready barrier
+            // so a client reading after the announcement never sees the old
+            // streak. A write failure is observability, not a startup
+            // blocker.
+            let mut outcome = match crate::outcome::reset(Path::new(&inbox), now_ms()) {
+                Ok(outcome) => outcome,
+                Err(err) => {
+                    eprintln!("warning: could not reset the serve outcome summary: {err}");
+                    crate::outcome::ServeOutcomeSummary::zeroed(now_ms())
+                }
+            };
             announce_serve_ready(io::stdout().lock())?;
             let outbox = Path::new(&outbox);
 
@@ -830,6 +844,7 @@ pub fn run() -> Result<()> {
                     own_inbox,
                     role.as_deref(),
                     batch_max,
+                    &mut outcome,
                 )? {
                     // Cooperative stop observed between messages ⇒ exit 0.
                     Drain::Stopped => break,
@@ -1471,7 +1486,10 @@ fn retention_pass(inbox: &Path, outbox: &Path, window: Duration, last: &mut Opti
 /// still runs (nothing distinguishes it from the outside) and the seat
 /// session still records, but nothing is written to `outbox` and nothing is
 /// pushed for that member — closing the unread-reply-file problem instead of
-/// relocating it one hop further. Parameterised over [`Participant`] /
+/// relocating it one hop further. Every pass also folds its one
+/// [`Participant::respond_batch`] call — the invocation — into `outcome`, the
+/// per-serve worker summary persisted to `own_inbox` (#391), before the
+/// per-member reply loop. Parameterised over [`Participant`] /
 /// [`EventSink`] so it is unit-testable with fakes and a tempdir mailbox, no
 /// network.
 #[allow(clippy::too_many_arguments)]
@@ -1486,6 +1504,7 @@ fn drain_mailbox(
     own_inbox: &Path,
     role: Option<&str>,
     agent_batch_max: usize,
+    outcome: &mut crate::outcome::ServeOutcomeSummary,
 ) -> Result<Drain> {
     let mut processed = 0;
     loop {
@@ -1520,6 +1539,12 @@ fn drain_mailbox(
             .map(|claimed| claimed.request.clone())
             .collect();
         let responses = participant.respond_batch(&requests);
+
+        // One summary update per invocation — the `respond_batch` call —
+        // before the per-member reply loop, so a batch of N replies still
+        // counts once (#391). The write is observability: it warns and never
+        // aborts the drain.
+        crate::outcome::record(own_inbox, outcome, &responses, now_ms());
 
         for (claimed, response) in batch.into_iter().zip(responses) {
             if let Some(wrapped) = &response.exchange {
@@ -3509,13 +3534,14 @@ fn parse_serve<'a>(mut iter: impl Iterator<Item = &'a String>) -> Result<Command
 /// each accepts an optional `--control <dir>` plus its own flags. An unknown subcommand
 /// is a usage error.
 fn parse_service<'a>(mut iter: impl Iterator<Item = &'a String>) -> Result<Command> {
-    let sub = iter
-        .next()
-        .ok_or_else(|| usage("service requires a subcommand: run|start|status|stop|teardown"))?;
+    let sub = iter.next().ok_or_else(|| {
+        usage("service requires a subcommand: run|start|status|outcome|stop|teardown")
+    })?;
     match sub.as_str() {
         "run" => parse_service_run(iter),
         "start" => parse_service_start(iter),
         "status" => parse_service_status(iter),
+        "outcome" => parse_service_outcome(iter),
         "stop" => parse_service_stop(iter),
         "teardown" => parse_service_teardown(iter),
         other => Err(usage(&format!("unknown service subcommand {other:?}"))),
@@ -3697,6 +3723,36 @@ fn parse_service_status<'a>(mut iter: impl Iterator<Item = &'a String>) -> Resul
     }
     let control = optional_dir(control, "--control")?;
     Ok(Command::Service(service::ServiceCommand::Status {
+        control,
+        session,
+    }))
+}
+
+/// Parses `baton service outcome [--control <dir>] --session <id>`.
+fn parse_service_outcome<'a>(mut iter: impl Iterator<Item = &'a String>) -> Result<Command> {
+    let mut control: Option<String> = None;
+    let mut session: Option<String> = None;
+    while let Some(arg) = iter.next() {
+        let mut take = |flag: &str| -> Result<String> {
+            iter.next()
+                .cloned()
+                .ok_or_else(|| usage(&format!("{flag} requires a value")))
+        };
+        match arg.as_str() {
+            "--control" => control = Some(take("--control")?),
+            other if other.starts_with("--control=") => {
+                control = Some(other["--control=".len()..].to_string());
+            }
+            "--session" => session = Some(take("--session")?),
+            other if other.starts_with("--session=") => {
+                session = Some(other["--session=".len()..].to_string());
+            }
+            other => return Err(usage(&format!("unexpected argument {other:?}"))),
+        }
+    }
+    let control = optional_dir(control, "--control")?;
+    let session = require_value(session, "--session")?;
+    Ok(Command::Service(service::ServiceCommand::Outcome {
         control,
         session,
     }))
@@ -7818,6 +7874,34 @@ mod tests {
     }
 
     #[test]
+    fn parse_service_outcome_requires_session() {
+        assert_eq!(
+            parse_args(&argv(&["service", "outcome", "--session", "svc-1"])).expect("parses"),
+            Command::Service(service::ServiceCommand::Outcome {
+                control: None,
+                session: "svc-1".to_string(),
+            })
+        );
+        assert_eq!(
+            parse_args(&argv(&[
+                "service",
+                "outcome",
+                "--control=/tmp/ctl",
+                "--session=svc-1"
+            ]))
+            .expect("parses"),
+            Command::Service(service::ServiceCommand::Outcome {
+                control: Some("/tmp/ctl".to_string()),
+                session: "svc-1".to_string(),
+            })
+        );
+        assert!(matches!(
+            parse_args(&argv(&["service", "outcome"])).unwrap_err(),
+            BatonError::Usage(_)
+        ));
+    }
+
+    #[test]
     fn parse_service_stop_requires_session() {
         assert!(matches!(
             parse_args(&argv(&["service", "stop", "--control", "/tmp/ctl"])).unwrap_err(),
@@ -8287,6 +8371,7 @@ mod tests {
         let participant = crate::participant::testing::ScriptedParticipant::new(["four"]);
         let mut sink = NoopSink;
 
+        let mut outcome = crate::outcome::ServeOutcomeSummary::zeroed(0);
         let drained = drain_mailbox(
             &mailbox,
             &outbox,
@@ -8298,6 +8383,7 @@ mod tests {
             &inbox,
             None,
             1,
+            &mut outcome,
         )
         .expect("drain");
         assert!(matches!(drained, Drain::Drained(1)), "one request drained");
@@ -8312,6 +8398,7 @@ mod tests {
         assert!(json_files(&inbox.join("pending")).is_empty());
 
         // Re-running is a no-op: the id is in `done/`.
+        let mut outcome = crate::outcome::ServeOutcomeSummary::zeroed(0);
         let drained2 = drain_mailbox(
             &mailbox,
             &outbox,
@@ -8323,6 +8410,7 @@ mod tests {
             &inbox,
             None,
             1,
+            &mut outcome,
         )
         .expect("second drain");
         assert!(
@@ -8348,6 +8436,7 @@ mod tests {
         let participant = crate::participant::testing::ScriptedParticipant::new(["four"]);
         let mut sink = NoopSink;
 
+        let mut outcome = crate::outcome::ServeOutcomeSummary::zeroed(0);
         let drained = drain_mailbox(
             &mailbox,
             &outbox,
@@ -8359,6 +8448,7 @@ mod tests {
             &inbox,
             None,
             1,
+            &mut outcome,
         )
         .expect("drain");
         assert!(matches!(drained, Drain::Stopped), "sentinel ⇒ Stopped");
@@ -8454,6 +8544,7 @@ mod tests {
         let participant = BatchSizeRecordingParticipant::new();
         let mut sink = NoopSink;
 
+        let mut outcome = crate::outcome::ServeOutcomeSummary::zeroed(0);
         let drained = drain_mailbox(
             &mailbox,
             &outbox,
@@ -8465,6 +8556,7 @@ mod tests {
             &inbox,
             None,
             3,
+            &mut outcome,
         )
         .expect("drain");
 
@@ -8508,6 +8600,7 @@ mod tests {
         let participant = BatchSizeRecordingParticipant::new();
         let mut sink = NoopSink;
 
+        let mut outcome = crate::outcome::ServeOutcomeSummary::zeroed(0);
         let drained = drain_mailbox(
             &mailbox,
             &outbox,
@@ -8519,6 +8612,7 @@ mod tests {
             &inbox,
             None,
             5,
+            &mut outcome,
         )
         .expect("drain");
 
@@ -8555,6 +8649,7 @@ mod tests {
         let participant = BatchSizeRecordingParticipant::new();
         let mut sink = NoopSink;
 
+        let mut outcome = crate::outcome::ServeOutcomeSummary::zeroed(0);
         let drained = drain_mailbox(
             &mailbox,
             &outbox,
@@ -8566,6 +8661,7 @@ mod tests {
             &inbox,
             None,
             2,
+            &mut outcome,
         )
         .expect("drain");
 
@@ -8600,6 +8696,7 @@ mod tests {
         let participant = BatchSizeRecordingParticipant::new();
         let mut sink = NoopSink;
 
+        let mut outcome = crate::outcome::ServeOutcomeSummary::zeroed(0);
         let drained = drain_mailbox(
             &mailbox,
             &outbox,
@@ -8611,6 +8708,7 @@ mod tests {
             &inbox,
             None,
             2,
+            &mut outcome,
         )
         .expect("drain");
 
@@ -8627,6 +8725,122 @@ mod tests {
         assert_eq!(json_files(&inbox.join("done")).len(), 2);
     }
 
+    /// The outcome summary moves once per invocation, not once per member
+    /// (#391 AC2): a 2-message batch answered by one failing `respond_batch`
+    /// call records `error_streak` 1 with the (single) error body as the
+    /// diagnostic; a second pass with the same summary accumulates; a later
+    /// successful invocation resets the streak to 0 (AC1). The drain also
+    /// persists every update, so a client reading the inbox sees the same
+    /// summary the drain holds.
+    #[test]
+    fn drain_mailbox_records_one_outcome_per_invocation() {
+        let root = TempRoot::new("outcome-summary");
+        let inbox = root.path.join("inbox");
+        let outbox = root.path.join("outbox");
+
+        let mailbox = Mailbox::open(&inbox).expect("open mailbox");
+        mailbox
+            .deliver(&request_with_id("m-1", "one"))
+            .expect("deliver 1");
+        mailbox
+            .deliver(&request_with_id("m-2", "two"))
+            .expect("deliver 2");
+
+        // An empty script answers every member with the same synthesized
+        // error — the batch fan-out failure shape.
+        let participant =
+            crate::participant::testing::ScriptedParticipant::new(Vec::<String>::new());
+        let mut sink = NoopSink;
+        let mut outcome = crate::outcome::ServeOutcomeSummary::zeroed(0);
+
+        drain_mailbox(
+            &mailbox,
+            &outbox,
+            &participant,
+            &mut sink,
+            &test_meta(),
+            None,
+            None,
+            &inbox,
+            None,
+            2,
+            &mut outcome,
+        )
+        .expect("drain");
+
+        assert_eq!(
+            outcome.error_streak, 1,
+            "one invocation, not one per member"
+        );
+        assert_eq!(outcome.identical_error_count, 1);
+        assert_eq!(
+            outcome.last_error_hash,
+            Some(crate::outcome::error_hash("no scripted reply")),
+            "the first member's body supplies the hash"
+        );
+        assert_eq!(
+            outcome.last_error_diagnostic,
+            Some("no scripted reply".to_string())
+        );
+        assert_eq!(
+            crate::outcome::read(&inbox)
+                .expect("read")
+                .expect("summary"),
+            outcome,
+            "the drain persisted the summary for clients"
+        );
+
+        // A second failing invocation on the same summary continues the run.
+        mailbox
+            .deliver(&request_with_id("m-3", "three"))
+            .expect("deliver 3");
+        drain_mailbox(
+            &mailbox,
+            &outbox,
+            &participant,
+            &mut sink,
+            &test_meta(),
+            None,
+            None,
+            &inbox,
+            None,
+            1,
+            &mut outcome,
+        )
+        .expect("second drain");
+        assert_eq!(outcome.error_streak, 2);
+        assert_eq!(outcome.identical_error_count, 2);
+
+        // One success resets the streak (AC1).
+        mailbox
+            .deliver(&request_with_id("m-4", "four"))
+            .expect("deliver 4");
+        let ok_participant = crate::participant::testing::ScriptedParticipant::new(["four"]);
+        drain_mailbox(
+            &mailbox,
+            &outbox,
+            &ok_participant,
+            &mut sink,
+            &test_meta(),
+            None,
+            None,
+            &inbox,
+            None,
+            1,
+            &mut outcome,
+        )
+        .expect("third drain");
+        assert_eq!(outcome.error_streak, 0);
+        assert_eq!(outcome.identical_error_count, 0);
+        assert_eq!(outcome.last_error_hash, None);
+        assert_eq!(
+            crate::outcome::read(&inbox)
+                .expect("read")
+                .expect("summary"),
+            outcome
+        );
+    }
+
     /// A reclaimed in-flight message re-drains to the *same* outbox filename —
     /// one file, overwritten, not two (the keyed-outbox guarantee end-to-end).
     #[test]
@@ -8641,6 +8855,7 @@ mod tests {
 
         // First delivery + drain writes one reply.
         mailbox.deliver(&request_envelope()).expect("deliver");
+        let mut outcome = crate::outcome::ServeOutcomeSummary::zeroed(0);
         drain_mailbox(
             &mailbox,
             &outbox,
@@ -8652,6 +8867,7 @@ mod tests {
             &inbox,
             None,
             1,
+            &mut outcome,
         )
         .expect("drain");
         assert_eq!(json_files(&outbox).len(), 1);
@@ -8661,6 +8877,7 @@ mod tests {
         // effect on the outbox key.) It must overwrite, not append.
         std::fs::remove_file(inbox.join("done").join("m-req-1.json")).expect("clear done");
         mailbox.deliver(&request_envelope()).expect("re-deliver");
+        let mut outcome = crate::outcome::ServeOutcomeSummary::zeroed(0);
         drain_mailbox(
             &mailbox,
             &outbox,
@@ -8672,6 +8889,7 @@ mod tests {
             &inbox,
             None,
             1,
+            &mut outcome,
         )
         .expect("re-drain");
         assert_eq!(
@@ -8731,6 +8949,7 @@ mod tests {
         let participant = crate::participant::testing::ScriptedParticipant::new(["four"]);
         let mut sink = RecordingSink::new();
 
+        let mut outcome = crate::outcome::ServeOutcomeSummary::zeroed(0);
         let drained = drain_mailbox(
             &mailbox,
             &outbox,
@@ -8742,6 +8961,7 @@ mod tests {
             &inbox,
             Some("alice"),
             1,
+            &mut outcome,
         )
         .expect("drain");
         assert!(matches!(drained, Drain::Drained(1)));
@@ -8785,6 +9005,7 @@ mod tests {
             crate::participant::testing::ScriptedParticipant::new(Vec::<String>::new());
         let mut sink = NoopSink;
 
+        let mut outcome = crate::outcome::ServeOutcomeSummary::zeroed(0);
         drain_mailbox(
             &mailbox,
             &outbox,
@@ -8796,6 +9017,7 @@ mod tests {
             &inbox,
             Some("alice"),
             1,
+            &mut outcome,
         )
         .expect("drain");
         assert!(json_files(&outbox).is_empty());
@@ -8824,6 +9046,7 @@ mod tests {
             let mailbox = Mailbox::open(&inbox).expect("open mailbox");
             mailbox.deliver(&request_envelope()).expect("deliver");
             let registry = routing_registry("no-reply-to", "bob", &peer_inbox);
+            let mut outcome = crate::outcome::ServeOutcomeSummary::zeroed(0);
             drain_mailbox(
                 &mailbox,
                 &outbox,
@@ -8835,6 +9058,7 @@ mod tests {
                 &inbox,
                 Some("alice"),
                 1,
+                &mut outcome,
             )
             .expect("drain");
             assert_eq!(json_files(&outbox), vec!["m-req-1.json".to_string()]);
@@ -8849,6 +9073,7 @@ mod tests {
             mailbox
                 .deliver(&routed_request_envelope("bob"))
                 .expect("deliver");
+            let mut outcome = crate::outcome::ServeOutcomeSummary::zeroed(0);
             drain_mailbox(
                 &mailbox,
                 &outbox,
@@ -8860,6 +9085,7 @@ mod tests {
                 &inbox,
                 Some("alice"),
                 1,
+                &mut outcome,
             )
             .expect("drain");
             assert_eq!(json_files(&outbox), vec!["m-req-1.json".to_string()]);
@@ -8875,6 +9101,7 @@ mod tests {
                 .deliver(&routed_request_envelope("carol"))
                 .expect("deliver");
             let registry = routing_registry("unresolved", "bob", &peer_inbox);
+            let mut outcome = crate::outcome::ServeOutcomeSummary::zeroed(0);
             drain_mailbox(
                 &mailbox,
                 &outbox,
@@ -8886,6 +9113,7 @@ mod tests {
                 &inbox,
                 Some("alice"),
                 1,
+                &mut outcome,
             )
             .expect("drain");
             assert_eq!(json_files(&outbox), vec!["m-req-1.json".to_string()]);
@@ -8900,6 +9128,7 @@ mod tests {
                 .deliver(&routed_request_envelope("alice"))
                 .expect("deliver");
             let registry = routing_registry("self", "alice", &inbox);
+            let mut outcome = crate::outcome::ServeOutcomeSummary::zeroed(0);
             drain_mailbox(
                 &mailbox,
                 &outbox,
@@ -8911,6 +9140,7 @@ mod tests {
                 &inbox,
                 Some("alice"),
                 1,
+                &mut outcome,
             )
             .expect("drain");
             assert_eq!(json_files(&outbox), vec!["m-req-1.json".to_string()]);
@@ -8935,6 +9165,7 @@ mod tests {
         control_mailbox
             .deliver(&request_envelope())
             .expect("deliver");
+        let mut outcome = crate::outcome::ServeOutcomeSummary::zeroed(0);
         drain_mailbox(
             &control_mailbox,
             &control_outbox,
@@ -8946,6 +9177,7 @@ mod tests {
             &control_inbox,
             None,
             1,
+            &mut outcome,
         )
         .expect("control drain");
         let golden = std::fs::read_to_string(control_outbox.join("m-req-1.json"))
@@ -8965,6 +9197,7 @@ mod tests {
         mailbox
             .deliver(&routed_request_envelope("bob"))
             .expect("deliver");
+        let mut outcome = crate::outcome::ServeOutcomeSummary::zeroed(0);
         drain_mailbox(
             &mailbox,
             &outbox,
@@ -8976,6 +9209,7 @@ mod tests {
             &inbox,
             Some("alice"),
             1,
+            &mut outcome,
         )
         .expect("drain");
 
@@ -9006,6 +9240,7 @@ mod tests {
         let participant = crate::participant::testing::ScriptedParticipant::new(["four"]);
         let mut sink = NoopSink;
 
+        let mut outcome = crate::outcome::ServeOutcomeSummary::zeroed(0);
         drain_mailbox(
             &mailbox,
             &outbox,
@@ -9017,6 +9252,7 @@ mod tests {
             &inbox,
             Some("a/b"),
             1,
+            &mut outcome,
         )
         .expect("drain");
         assert_eq!(json_files(&outbox), vec!["m-req-1.json".to_string()]);
@@ -9040,6 +9276,7 @@ mod tests {
         mailbox
             .deliver(&routed_request_envelope("bob"))
             .expect("deliver");
+        let mut outcome = crate::outcome::ServeOutcomeSummary::zeroed(0);
         drain_mailbox(
             &mailbox,
             &outbox,
@@ -9051,6 +9288,7 @@ mod tests {
             &inbox,
             Some("alice"),
             1,
+            &mut outcome,
         )
         .expect("drain");
         assert_eq!(json_files(&peer_inbox.join("pending")).len(), 1);
@@ -9059,6 +9297,7 @@ mod tests {
         mailbox
             .deliver(&routed_request_envelope("bob"))
             .expect("re-deliver");
+        let mut outcome = crate::outcome::ServeOutcomeSummary::zeroed(0);
         drain_mailbox(
             &mailbox,
             &outbox,
@@ -9070,6 +9309,7 @@ mod tests {
             &inbox,
             Some("alice"),
             1,
+            &mut outcome,
         )
         .expect("re-drain");
         assert_eq!(
@@ -9098,6 +9338,7 @@ mod tests {
                 .deliver(&routed_request_envelope("carol"))
                 .expect("deliver");
             let participant = crate::participant::testing::ScriptedParticipant::new(["reply"]);
+            let mut outcome = crate::outcome::ServeOutcomeSummary::zeroed(0);
             drain_mailbox(
                 &mailbox,
                 &outbox,
@@ -9109,6 +9350,7 @@ mod tests {
                 &inbox,
                 Some(role),
                 1,
+                &mut outcome,
             )
             .expect("drain");
         }
@@ -9142,6 +9384,7 @@ mod tests {
         let participant = crate::participant::testing::ScriptedParticipant::new(["four"]);
         let mut sink = NoopSink;
 
+        let mut outcome = crate::outcome::ServeOutcomeSummary::zeroed(0);
         let drained = drain_mailbox(
             &mailbox,
             &outbox,
@@ -9153,6 +9396,7 @@ mod tests {
             &inbox,
             Some("alice"),
             1,
+            &mut outcome,
         )
         .expect("drain");
         assert!(matches!(drained, Drain::Drained(1)));

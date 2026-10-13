@@ -9820,3 +9820,158 @@ fn exchange_pretty_round_trips_the_compact_form_normalized() {
         "the in-band exchange wrapper survives pretty-printing"
     );
 }
+
+/// `baton serve` zeroes a pre-seeded outcome summary **at the readiness
+/// barrier**: a launcher that observes the flushed `baton serve: ready` line
+/// can read `<inbox>/serve-outcome.json` and must see the fresh state, never
+/// the prior lifetime's streak (#391). The summary is captured while the
+/// daemon is still live, so the assertion pins the reset to startup —
+/// through the real serve path — and not to some later point before exit.
+/// Every assert runs after the daemon is reaped, so a failed assertion never
+/// leaks a live serve.
+#[test]
+fn serve_resets_a_seeded_outcome_summary_before_the_readiness_barrier() {
+    let root = std::env::temp_dir().join(format!(
+        "baton-serve-reset-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock is past the epoch")
+            .as_nanos(),
+    ));
+    let inbox = root.join("inbox");
+    let outbox = root.join("outbox");
+    std::fs::create_dir_all(&inbox).expect("create inbox");
+    std::fs::create_dir_all(&outbox).expect("create outbox");
+
+    // A prior lifetime's summary: streak 5 on one identical error.
+    let seeded = serde_json::json!({
+        "schema": "baton.serve-outcome/v1",
+        "last_outcome": "error",
+        "last_ts_ms": 1_000u64,
+        "error_streak": 5u64,
+        "last_error_hash": "sha256:seeded",
+        "identical_error_count": 5u64,
+        "last_error_diagnostic": "seeded failure",
+        "updated_at_ms": 1_000u64,
+    });
+    std::fs::write(inbox.join("serve-outcome.json"), seeded.to_string())
+        .expect("seed the prior lifetime's summary");
+
+    // The inbox holds no pending messages, so the drain idles: the agent
+    // command never runs, and the binary answering `--version` is a harmless
+    // stand-in for it.
+    let mut serve = Command::new(env!("CARGO_BIN_EXE_baton"));
+    serve.args([
+        "serve",
+        "--inbox",
+        inbox.to_str().expect("utf-8 inbox path"),
+        "--outbox",
+        outbox.to_str().expect("utf-8 outbox path"),
+        "--poll-ms",
+        "20",
+        "--agent-cmd",
+        env!("CARGO_BIN_EXE_baton"),
+        "--agent-arg",
+        "--version",
+    ]);
+    serve
+        .env_remove("ANTHROPIC_API_KEY")
+        .env_remove("ANTHROPIC_AUTH_TOKEN")
+        .env_remove("CLAUDE_CODE_OAUTH_TOKEN");
+    serve.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut serve_child = serve.spawn().expect("spawn baton serve");
+
+    // Read the daemon's stdout on a thread: `lines()` blocks, and the
+    // readiness wait below needs a deadline, not an unbounded read.
+    let stdout = serve_child.stdout.take().expect("piped serve stdout");
+    let (line_tx, line_rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for line in std::io::BufRead::lines(std::io::BufReader::new(stdout))
+            .map_while(std::result::Result::ok)
+        {
+            if line_tx.send(line).is_err() {
+                break; // the test gave up on readiness; nothing left to feed
+            }
+        }
+    });
+
+    // Wait out the readiness barrier the way a launcher does: the flushed
+    // `baton serve: ready` line.
+    let deadline = std::time::Instant::now() + integration_test_deadline_duration(None);
+    let mut reached_barrier = false;
+    while std::time::Instant::now() < deadline {
+        if let Some(status) = serve_child.try_wait().expect("probe serve liveness") {
+            panic!("serve exited before reaching readiness: {status}");
+        }
+        match line_rx.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now())) {
+            Ok(line) if line.contains("baton serve: ready") => {
+                reached_barrier = true;
+                break;
+            }
+            Ok(_) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => break,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+
+    // Capture the summary while the daemon is still live, so what gets
+    // asserted is the state at the barrier.
+    let at_barrier = if reached_barrier {
+        Some(
+            std::fs::read_to_string(inbox.join("serve-outcome.json"))
+                .expect("read the summary at the readiness barrier"),
+        )
+    } else {
+        None
+    };
+
+    // Cooperative teardown, reaped before asserting on any capture, so a
+    // failed assertion cannot leave a live serve behind.
+    let stop = Command::new(env!("CARGO_BIN_EXE_baton"))
+        .args(["serve", "--stop", "--inbox", inbox.to_str().unwrap()])
+        .output()
+        .expect("run baton serve --stop");
+    let stop_ok = stop.status.success();
+    let served = serve_child.wait_with_output().expect("reap baton serve");
+    let stderr = String::from_utf8_lossy(&served.stderr);
+
+    assert!(
+        reached_barrier,
+        "serve never announced readiness within the deadline"
+    );
+    assert!(
+        stop_ok,
+        "cooperative stop succeeds; stderr: {}",
+        String::from_utf8_lossy(&stop.stderr)
+    );
+    assert!(
+        served.status.success(),
+        "serve exits 0 on cooperative stop; stderr: {stderr}"
+    );
+    assert!(
+        !stderr.contains("could not reset the serve outcome summary"),
+        "a clean startup emits no reset warning; stderr: {stderr}"
+    );
+
+    // The barrier-time capture: the seeded streak is already gone from disk.
+    let reset: serde_json::Value = serde_json::from_str(
+        at_barrier
+            .as_deref()
+            .expect("read the summary at the barrier"),
+    )
+    .expect("the reset summary is JSON");
+    assert_eq!(reset["schema"], "baton.serve-outcome/v1");
+    assert_eq!(reset["last_outcome"], serde_json::Value::Null);
+    assert_eq!(reset["last_ts_ms"], serde_json::Value::Null);
+    assert_eq!(reset["error_streak"], 0);
+    assert_eq!(reset["identical_error_count"], 0);
+    assert_eq!(reset["last_error_hash"], serde_json::Value::Null);
+    assert_eq!(reset["last_error_diagnostic"], serde_json::Value::Null);
+    assert!(
+        reset["updated_at_ms"].as_u64().expect("updated_at_ms") > 1_000,
+        "the reset write is stamped with the fresh startup time"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
