@@ -173,6 +173,59 @@ fn wait_for_task_request(control: &Path) -> PathBuf {
     }
 }
 
+/// Reads and parses a u32 PID file with bounded retries. PowerShell's
+/// `Set-Content` truncates before close, so a concurrent reader can hit a
+/// sharing violation (os error 32) or read an empty/partial buffer while the
+/// agent is still writing. Tolerate read failure and not-yet-parseable
+/// content; surface the last read error in the deadline assert.
+fn read_pid_bounded(path: &Path) -> u32 {
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    #[allow(unused_assignments)]
+    let mut last_err = String::new();
+    loop {
+        match fs::read_to_string(path) {
+            Ok(contents) => match contents.trim().parse::<u32>() {
+                Ok(pid) => return pid,
+                Err(err) => last_err = format!("parse: {err}"),
+            },
+            Err(err) => last_err = format!("read: {err}"),
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "agent pid file {path:?} was not readable as a u32 within deadline (last error: {last_err})"
+        );
+        thread::sleep(Duration::from_millis(25));
+    }
+}
+
+/// Runs `baton task start` with bounded retries while admission rejects the
+/// start as not naming a live managed session. The supervisor's admission
+/// gate probes session liveness once per start; on Windows a single transient
+/// probe failure under parallel CI load can map to `Unresolved` and reject a
+/// fresh, healthy session. The rejection fires before task-id / log-dir
+/// creation, so re-issuing the command is safe.
+fn start_task_bounded(control: &str, args: &[&str]) -> std::process::Output {
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        let mut cmd_args = vec!["task", "start", "--control", control];
+        cmd_args.extend_from_slice(args);
+        let output = baton(&cmd_args);
+        if output.status.success() {
+            return output;
+        }
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if !stderr.contains("does not name a live managed session") {
+            return output;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "task start kept reporting a dead session within deadline; last stderr: {}",
+            stderr
+        );
+        thread::sleep(Duration::from_millis(250));
+    }
+}
+
 /// Starts a live managed session the task tests can own tasks under. The
 /// session's serve child stays alive polling its (empty) inbox.
 fn start_session(guard: &ServiceGuard) -> String {
@@ -418,26 +471,25 @@ fn windows_rehydrated_tasks_remain_live_and_controllable() {
     let callback = guard.root.join("callback");
     let command = "cmd.exe";
 
-    let cancel_task = baton(&[
-        "task",
-        "start",
-        "--control",
+    let cancel_task = start_task_bounded(
         &control,
-        "--session",
-        &session,
-        "--command",
-        command,
-        "--arg",
-        "/D",
-        "--arg",
-        "/C",
-        "--arg",
-        "ping -n 60 127.0.0.1 > NUL",
-        "--max-duration-ms",
-        "60000",
-        "--callback-inbox",
-        callback.to_str().unwrap(),
-    ]);
+        &[
+            "--session",
+            &session,
+            "--command",
+            command,
+            "--arg",
+            "/D",
+            "--arg",
+            "/C",
+            "--arg",
+            "ping -n 60 127.0.0.1 > NUL",
+            "--max-duration-ms",
+            "60000",
+            "--callback-inbox",
+            callback.to_str().unwrap(),
+        ],
+    );
     assert!(
         cancel_task.status.success(),
         "cancel task start failed: {}",
@@ -448,26 +500,25 @@ fn windows_rehydrated_tasks_remain_live_and_controllable() {
         .to_string();
     assert!(!cancel_task_id.is_empty(), "cancel task returned an id");
 
-    let timeout_task = baton(&[
-        "task",
-        "start",
-        "--control",
+    let timeout_task = start_task_bounded(
         &control,
-        "--session",
-        &session,
-        "--command",
-        command,
-        "--arg",
-        "/D",
-        "--arg",
-        "/C",
-        "--arg",
-        "ping -n 60 127.0.0.1 > NUL",
-        "--max-duration-ms",
-        "1000",
-        "--callback-inbox",
-        callback.to_str().unwrap(),
-    ]);
+        &[
+            "--session",
+            &session,
+            "--command",
+            command,
+            "--arg",
+            "/D",
+            "--arg",
+            "/C",
+            "--arg",
+            "ping -n 60 127.0.0.1 > NUL",
+            "--max-duration-ms",
+            "1000",
+            "--callback-inbox",
+            callback.to_str().unwrap(),
+        ],
+    );
     assert!(
         timeout_task.status.success(),
         "timeout task start failed: {}",
@@ -1439,11 +1490,7 @@ fn windows_service_stop_reaps_a_no_deadline_in_flight_agent_tree() {
         "the no-deadline turn ended before the stop: {:?}",
         delivered.iter().map(|e| e.path()).collect::<Vec<_>>()
     );
-    let agent_pid: u32 = fs::read_to_string(&agent_pid_file)
-        .expect("read agent pid file")
-        .trim()
-        .parse()
-        .expect("agent pid is a number");
+    let agent_pid: u32 = read_pid_bounded(&agent_pid_file);
 
     let status = baton(&[
         "service",
