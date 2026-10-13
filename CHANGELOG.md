@@ -10,10 +10,13 @@ versioning.
 
 _Generated from release tags with `bash scripts/release.sh generate-changelog`._
 
-## v0.19.0 (2026-10-13)
+## v0.19.1 … v0.19.0 (2026-10-13)
 
 ### Features
 - feat(serve): per-serve worker outcome summary exposed via service outcome (#393)
+
+### Other Changes
+- test(windows): deflake windows_service_task via bounded-retry helpers (#394) (#395)
 
 ## v0.18.1 … v0.18.0 (2026-10-12)
 
