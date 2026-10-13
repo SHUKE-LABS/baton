@@ -263,14 +263,18 @@ fn start_session(guard: &ServiceGuard) -> String {
 /// Polls `task status` until the task leaves `running`, returning its
 /// terminal state, exit code, and elapsed milliseconds.
 fn wait_for_terminal_task(control: &str, task_id: &str) -> (String, Option<i64>, Option<u64>) {
+    let mut last_status = String::new();
     for _ in 0..200 {
         let status = baton(&["task", "status", "--control", control, "--task", task_id]);
+        last_status = String::from_utf8_lossy(&status.stdout).into_owned();
         if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&status.stdout) {
             let state = json["tasks"][0]["state"]
                 .as_str()
                 .unwrap_or_default()
                 .to_string();
-            if state != "running" {
+            // An empty state means the record was not listed on this read
+            // (e.g. mid-rewrite by the supervisor), not that it is terminal.
+            if !state.is_empty() && state != "running" {
                 return (
                     state,
                     json["tasks"][0]["exit_code"].as_i64(),
@@ -280,7 +284,7 @@ fn wait_for_terminal_task(control: &str, task_id: &str) -> (String, Option<i64>,
         }
         thread::sleep(Duration::from_millis(100));
     }
-    panic!("task {task_id} did not reach a terminal state in time");
+    panic!("task {task_id} did not reach a terminal state in time; last status: {last_status}");
 }
 
 /// #386: `task start --env` never persists a credential value. The client
@@ -969,10 +973,16 @@ fn windows_task_start_rolls_back_prepared_record_after_supervisor_loss() {
         !task_record_path.exists(),
         "rollback removes the prepared Windows task record"
     );
-    assert!(
-        !rollback_path.exists(),
-        "rollback cleanup removes the marker after the record is gone"
-    );
+    // Cleanup removes the marker only after the record, so `task status` can
+    // already report no tasks while the marker removal is still pending.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while rollback_path.exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "rollback cleanup removes the marker after the record is gone"
+        );
+        thread::sleep(Duration::from_millis(25));
+    }
     wait_for_process_gone(task_pid);
 
     let teardown = baton(&["service", "teardown", "--control", &control, "--force"]);
@@ -1192,10 +1202,16 @@ fn windows_task_start_response_write_failure_retries_committed_record() {
         .control
         .join("task-responses")
         .join(format!("{request_id}.json"));
-    assert!(
-        !failure_marker.exists(),
-        "response failure marker is consumed"
-    );
+    // The record is committed before the response write consumes the
+    // failure marker, so the committed record can be observed first.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while failure_marker.exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "response failure marker is consumed"
+        );
+        thread::sleep(Duration::from_millis(25));
+    }
     assert!(!response_path.exists(), "failed response is not published");
 
     let mut old_run = guard.run.take().expect("initial service supervisor");
@@ -1357,11 +1373,18 @@ fn windows_task_start_claim_ack_cleanup_survives_client_loss() {
     restarted.stderr(Stdio::null());
     guard.run = Some(restarted.spawn().expect("spawn restarted service"));
     wait_for_service(&control);
-    assert!(
-        !ack_path.exists(),
-        "restart cleans the durable acknowledgement"
-    );
-    assert!(!claim_path.exists(), "restart cleans the private claim");
+    // `service_running` flips once the control lock is held, before the
+    // startup admission reconcile that removes these files has run.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while ack_path.exists() || claim_path.exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "restart cleans the durable acknowledgement (ack: {}) and private claim (claim: {})",
+            ack_path.exists(),
+            claim_path.exists()
+        );
+        thread::sleep(Duration::from_millis(25));
+    }
     assert!(
         !response_path.exists(),
         "restart does not recreate the consumed response"
