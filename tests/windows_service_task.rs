@@ -173,6 +173,59 @@ fn wait_for_task_request(control: &Path) -> PathBuf {
     }
 }
 
+/// Reads and parses a u32 PID file with bounded retries. PowerShell's
+/// `Set-Content` truncates before close, so a concurrent reader can hit a
+/// sharing violation (os error 32) or read an empty/partial buffer while the
+/// agent is still writing. Tolerate read failure and not-yet-parseable
+/// content; surface the last read error in the deadline assert.
+fn read_pid_bounded(path: &Path) -> u32 {
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    #[allow(unused_assignments)]
+    let mut last_err = String::new();
+    loop {
+        match fs::read_to_string(path) {
+            Ok(contents) => match contents.trim().parse::<u32>() {
+                Ok(pid) => return pid,
+                Err(err) => last_err = format!("parse: {err}"),
+            },
+            Err(err) => last_err = format!("read: {err}"),
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "agent pid file {path:?} was not readable as a u32 within deadline (last error: {last_err})"
+        );
+        thread::sleep(Duration::from_millis(25));
+    }
+}
+
+/// Runs `baton task start` with bounded retries while admission rejects the
+/// start as not naming a live managed session. The supervisor's admission
+/// gate probes session liveness once per start; on Windows a single transient
+/// probe failure under parallel CI load can map to `Unresolved` and reject a
+/// fresh, healthy session. The rejection fires before task-id / log-dir
+/// creation, so re-issuing the command is safe.
+fn start_task_bounded(control: &str, args: &[&str]) -> std::process::Output {
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        let mut cmd_args = vec!["task", "start", "--control", control];
+        cmd_args.extend_from_slice(args);
+        let output = baton(&cmd_args);
+        if output.status.success() {
+            return output;
+        }
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if !stderr.contains("does not name a live managed session") {
+            return output;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "task start kept reporting a dead session within deadline; last stderr: {}",
+            stderr
+        );
+        thread::sleep(Duration::from_millis(250));
+    }
+}
+
 /// Starts a live managed session the task tests can own tasks under. The
 /// session's serve child stays alive polling its (empty) inbox.
 fn start_session(guard: &ServiceGuard) -> String {
@@ -210,14 +263,18 @@ fn start_session(guard: &ServiceGuard) -> String {
 /// Polls `task status` until the task leaves `running`, returning its
 /// terminal state, exit code, and elapsed milliseconds.
 fn wait_for_terminal_task(control: &str, task_id: &str) -> (String, Option<i64>, Option<u64>) {
+    let mut last_status = String::new();
     for _ in 0..200 {
         let status = baton(&["task", "status", "--control", control, "--task", task_id]);
+        last_status = String::from_utf8_lossy(&status.stdout).into_owned();
         if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&status.stdout) {
             let state = json["tasks"][0]["state"]
                 .as_str()
                 .unwrap_or_default()
                 .to_string();
-            if state != "running" {
+            // An empty state means the record was not listed on this read
+            // (e.g. mid-rewrite by the supervisor), not that it is terminal.
+            if !state.is_empty() && state != "running" {
                 return (
                     state,
                     json["tasks"][0]["exit_code"].as_i64(),
@@ -227,7 +284,7 @@ fn wait_for_terminal_task(control: &str, task_id: &str) -> (String, Option<i64>,
         }
         thread::sleep(Duration::from_millis(100));
     }
-    panic!("task {task_id} did not reach a terminal state in time");
+    panic!("task {task_id} did not reach a terminal state in time; last status: {last_status}");
 }
 
 /// #386: `task start --env` never persists a credential value. The client
@@ -418,26 +475,25 @@ fn windows_rehydrated_tasks_remain_live_and_controllable() {
     let callback = guard.root.join("callback");
     let command = "cmd.exe";
 
-    let cancel_task = baton(&[
-        "task",
-        "start",
-        "--control",
+    let cancel_task = start_task_bounded(
         &control,
-        "--session",
-        &session,
-        "--command",
-        command,
-        "--arg",
-        "/D",
-        "--arg",
-        "/C",
-        "--arg",
-        "ping -n 60 127.0.0.1 > NUL",
-        "--max-duration-ms",
-        "60000",
-        "--callback-inbox",
-        callback.to_str().unwrap(),
-    ]);
+        &[
+            "--session",
+            &session,
+            "--command",
+            command,
+            "--arg",
+            "/D",
+            "--arg",
+            "/C",
+            "--arg",
+            "ping -n 60 127.0.0.1 > NUL",
+            "--max-duration-ms",
+            "60000",
+            "--callback-inbox",
+            callback.to_str().unwrap(),
+        ],
+    );
     assert!(
         cancel_task.status.success(),
         "cancel task start failed: {}",
@@ -448,26 +504,25 @@ fn windows_rehydrated_tasks_remain_live_and_controllable() {
         .to_string();
     assert!(!cancel_task_id.is_empty(), "cancel task returned an id");
 
-    let timeout_task = baton(&[
-        "task",
-        "start",
-        "--control",
+    let timeout_task = start_task_bounded(
         &control,
-        "--session",
-        &session,
-        "--command",
-        command,
-        "--arg",
-        "/D",
-        "--arg",
-        "/C",
-        "--arg",
-        "ping -n 60 127.0.0.1 > NUL",
-        "--max-duration-ms",
-        "1000",
-        "--callback-inbox",
-        callback.to_str().unwrap(),
-    ]);
+        &[
+            "--session",
+            &session,
+            "--command",
+            command,
+            "--arg",
+            "/D",
+            "--arg",
+            "/C",
+            "--arg",
+            "ping -n 60 127.0.0.1 > NUL",
+            "--max-duration-ms",
+            "1000",
+            "--callback-inbox",
+            callback.to_str().unwrap(),
+        ],
+    );
     assert!(
         timeout_task.status.success(),
         "timeout task start failed: {}",
@@ -918,10 +973,16 @@ fn windows_task_start_rolls_back_prepared_record_after_supervisor_loss() {
         !task_record_path.exists(),
         "rollback removes the prepared Windows task record"
     );
-    assert!(
-        !rollback_path.exists(),
-        "rollback cleanup removes the marker after the record is gone"
-    );
+    // Cleanup removes the marker only after the record, so `task status` can
+    // already report no tasks while the marker removal is still pending.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while rollback_path.exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "rollback cleanup removes the marker after the record is gone"
+        );
+        thread::sleep(Duration::from_millis(25));
+    }
     wait_for_process_gone(task_pid);
 
     let teardown = baton(&["service", "teardown", "--control", &control, "--force"]);
@@ -1141,10 +1202,16 @@ fn windows_task_start_response_write_failure_retries_committed_record() {
         .control
         .join("task-responses")
         .join(format!("{request_id}.json"));
-    assert!(
-        !failure_marker.exists(),
-        "response failure marker is consumed"
-    );
+    // The record is committed before the response write consumes the
+    // failure marker, so the committed record can be observed first.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while failure_marker.exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "response failure marker is consumed"
+        );
+        thread::sleep(Duration::from_millis(25));
+    }
     assert!(!response_path.exists(), "failed response is not published");
 
     let mut old_run = guard.run.take().expect("initial service supervisor");
@@ -1306,11 +1373,18 @@ fn windows_task_start_claim_ack_cleanup_survives_client_loss() {
     restarted.stderr(Stdio::null());
     guard.run = Some(restarted.spawn().expect("spawn restarted service"));
     wait_for_service(&control);
-    assert!(
-        !ack_path.exists(),
-        "restart cleans the durable acknowledgement"
-    );
-    assert!(!claim_path.exists(), "restart cleans the private claim");
+    // `service_running` flips once the control lock is held, before the
+    // startup admission reconcile that removes these files has run.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while ack_path.exists() || claim_path.exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "restart cleans the durable acknowledgement (ack: {}) and private claim (claim: {})",
+            ack_path.exists(),
+            claim_path.exists()
+        );
+        thread::sleep(Duration::from_millis(25));
+    }
     assert!(
         !response_path.exists(),
         "restart does not recreate the consumed response"
@@ -1439,11 +1513,7 @@ fn windows_service_stop_reaps_a_no_deadline_in_flight_agent_tree() {
         "the no-deadline turn ended before the stop: {:?}",
         delivered.iter().map(|e| e.path()).collect::<Vec<_>>()
     );
-    let agent_pid: u32 = fs::read_to_string(&agent_pid_file)
-        .expect("read agent pid file")
-        .trim()
-        .parse()
-        .expect("agent pid is a number");
+    let agent_pid: u32 = read_pid_bounded(&agent_pid_file);
 
     let status = baton(&[
         "service",
