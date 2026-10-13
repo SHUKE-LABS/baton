@@ -9820,3 +9820,95 @@ fn exchange_pretty_round_trips_the_compact_form_normalized() {
         "the in-band exchange wrapper survives pretty-printing"
     );
 }
+
+/// `baton serve` startup resets a pre-seeded outcome summary before it
+/// announces readiness (#391): a restart starts a fresh streak, so the prior
+/// lifetime's streak never survives the restart. This drives the real
+/// `serve --once` startup path — the same code a launcher runs — not just a
+/// reset helper.
+#[test]
+fn serve_once_resets_a_seeded_outcome_summary_on_startup() {
+    let root = std::env::temp_dir().join(format!(
+        "baton-serve-reset-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock is past the epoch")
+            .as_nanos(),
+    ));
+    let inbox = root.join("inbox");
+    let outbox = root.join("outbox");
+    std::fs::create_dir_all(&inbox).expect("create inbox");
+    std::fs::create_dir_all(&outbox).expect("create outbox");
+
+    // A prior lifetime's summary: streak 5 on one identical error.
+    let seeded = serde_json::json!({
+        "schema": "baton.serve-outcome/v1",
+        "last_outcome": "error",
+        "last_ts_ms": 1_000u64,
+        "error_streak": 5u64,
+        "last_error_hash": "sha256:seeded",
+        "identical_error_count": 5u64,
+        "last_error_diagnostic": "seeded failure",
+        "updated_at_ms": 1_000u64,
+    });
+    std::fs::write(inbox.join("serve-outcome.json"), seeded.to_string())
+        .expect("seed the prior lifetime's summary");
+
+    // The inbox holds no pending messages, so the drain finds nothing and
+    // `--once` exits after the first pass: the agent command never runs, and
+    // the binary answering `--version` is a harmless stand-in for it.
+    let out = Command::new(env!("CARGO_BIN_EXE_baton"))
+        .args([
+            "serve",
+            "--once",
+            "--inbox",
+            inbox.to_str().expect("utf-8 inbox path"),
+            "--outbox",
+            outbox.to_str().expect("utf-8 outbox path"),
+            "--agent-cmd",
+            env!("CARGO_BIN_EXE_baton"),
+            "--agent-arg",
+            "--version",
+        ])
+        .env_remove("ANTHROPIC_API_KEY")
+        .env_remove("ANTHROPIC_AUTH_TOKEN")
+        .env_remove("CLAUDE_CODE_OAUTH_TOKEN")
+        .output()
+        .expect("run baton serve --once");
+
+    assert!(
+        out.status.success(),
+        "serve --once exits 0; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).is_empty(),
+        "a clean startup emits no reset warning; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("baton serve: ready"),
+        "startup reached the readiness barrier: {stdout}"
+    );
+
+    let reset: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(inbox.join("serve-outcome.json"))
+            .expect("read the summary after the restart"),
+    )
+    .expect("the reset summary is JSON");
+    assert_eq!(reset["schema"], "baton.serve-outcome/v1");
+    assert_eq!(reset["last_outcome"], serde_json::Value::Null);
+    assert_eq!(reset["last_ts_ms"], serde_json::Value::Null);
+    assert_eq!(reset["error_streak"], 0);
+    assert_eq!(reset["identical_error_count"], 0);
+    assert_eq!(reset["last_error_hash"], serde_json::Value::Null);
+    assert_eq!(reset["last_error_diagnostic"], serde_json::Value::Null);
+    assert!(
+        reset["updated_at_ms"].as_u64().expect("updated_at_ms") > 1_000,
+        "the reset write is stamped with the fresh startup time"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
